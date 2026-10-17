@@ -19,7 +19,9 @@ workspace = true
 
 [dependencies]
 dbn = { version = "0.71", default-features = false }
+serde.workspace = true
 serde_json.workspace = true
+toml = "0.8"
 sha2 = "0.10.9"
 signal-hook = { version = "=0.3.18", default-features = false, features = ["iterator"] }
 tungstenite = { version = "=0.28.0", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

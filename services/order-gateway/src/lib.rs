@@ -12,6 +12,7 @@ pub mod client;
 mod intent;
 mod journal;
 mod protocol;
+pub mod rules;
 mod safety;
 mod server;
 mod session;
