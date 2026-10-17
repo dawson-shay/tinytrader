@@ -10,6 +10,7 @@ publish = false
 workspace = true
 
 [dependencies]
+serde.workspace = true
 sha2 = "0.10"
 tinytrader-fleet.workspace = true
 axum.workspace = true

@@ -979,6 +979,23 @@ a.doc-card { text-decoration: none; }
 .pf-day b { font-weight: 600; white-space: nowrap; } .pf-day small { font-size: 10px; color: var(--fg-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
 .pf-day.l3, .pf-day.l4 { color: #fff; } .pf-day.l3 .n, .pf-day.l4 .n, .pf-day.l3 small, .pf-day.l4 small { color: rgba(255, 255, 255, .85); }
 @container (max-width: 480px) { .pf-day { min-height: 40px; } .pf-day small { display: none; } .pf-cell { width: 48px; height: 34px; } }
+/* The journal, in the Performance view. */
+.pf-day.noted { box-shadow: inset 0 0 0 1px var(--accent-mark); }
+.pf-dot { margin-top: auto; align-self: flex-end; font: 600 10px var(--mono); font-style: normal; padding: 0 5px; border-radius: 8px; background: var(--accent-mark); color: var(--bg); }
+.pf-jtitle { margin: 0; font: 600 13px var(--ui); }
+.pf-nform { display: flex; flex-direction: column; gap: 6px; }
+.pf-nform textarea { width: 100%; font: 13px var(--ui); resize: vertical; box-sizing: border-box; }
+.pf-tags { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.pf-nrow, .pf-jfilter-bar { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; font-size: 12px; }
+.pf-nrow .btn { margin-left: auto; }
+.pf-note-row { border-top: 1px solid var(--line-soft); padding: 6px 0; }
+.pf-note-head { display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline; font-size: 12px; }
+.pf-note-act { margin-left: auto; }
+.pf-note-text { white-space: pre-wrap; margin: 2px 0 0; font-size: 13px; }
+.pf-stars { color: var(--accent-mark); letter-spacing: 1px; }
+.pf-tagrow { margin-top: 2px; }
+.pf-tag { display: inline-block; font-size: 11px; border: 1px solid var(--line-soft); border-radius: 10px; padding: 0 6px; margin: 0 4px 2px 0; }
+.pf-err { color: var(--down); font-size: 12px; }
 .cal i.d2, .cal-legend i.d2 { background: var(--ok); }
 .cal-legend i.has { background: var(--accent-mark); } .cal-legend i.has.d2 { background: var(--ok); }
 .cal-legend i.l1 { opacity: .35; } .cal-legend i.l2 { opacity: .55; } .cal-legend i.l3 { opacity: .78; }

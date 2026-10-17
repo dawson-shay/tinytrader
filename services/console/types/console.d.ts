@@ -265,4 +265,22 @@ interface Channels {
   focus: string | null;
   /** The account picked for trading, kept in this browser. */
   account: string;
+  /** The New York day picked in the Performance view, for other widgets to follow. */
+  day: string | null;
+}
+
+/** A trading journal entry (services/console/src/journal.rs). */
+interface JournalEntry {
+  id: string;
+  /** The New York day it is about, `YYYY-MM-DD`. */
+  day: string;
+  /** When it was written, in milliseconds since the epoch. */
+  at: number;
+  /** The account it refers to; null for all accounts. */
+  account: string | null;
+  text: string;
+  tags: string[];
+  /** Discipline, 1 to 5. */
+  rating: number | null;
+  updated: number;
 }

@@ -37,6 +37,12 @@ export function stream(service, name, query = {}) {
   return `/api/stream/${encodeURIComponent(service)}/${name}${[...q].length ? `?${q}` : ''}`;
 }
 
+/** Drops what's kept (and asked for) at URLs starting with `prefix`: after a write to them. @param {string} prefix */
+export function forget(prefix) {
+  for (const k of [...mem.keys()]) if (k.startsWith(prefix)) mem.delete(k);
+  for (const k of [...flying.keys()]) if (k.startsWith(prefix)) flying.delete(k);
+}
+
 /** What's kept for `url`, however old (`{ at, v }`), or null: for drawing at once. */
 export function peek(url) {
   const m = mem.get(url);

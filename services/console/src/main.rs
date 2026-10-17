@@ -79,10 +79,14 @@
 //!   console edits (`/api/reminders`); it may be a file in a git checkout,
 //!   and is read again when it changes on disk. `CONSOLE_REMINDERS_SEED`: a
 //!   Markdown roadmap to start it from when there is no file (optional).
+//! - `CONSOLE_JOURNAL`: the trading journal's JSON file (`/api/journal`), by
+//!   default `journal.json` beside `CONSOLE_REMINDERS`. Writes are refused
+//!   while the file can't be read (it is left as it is).
 
 mod collections;
 mod delta;
 mod gateways;
+mod journal;
 mod notify;
 mod prefs;
 mod profiles;
@@ -121,6 +125,8 @@ struct App {
     /// Settings that follow the user between devices (`/api/prefs`).
     prefs: Option<prefs::Prefs>,
     reminders: Option<reminders::Reminders>,
+    /// The trading journal (`/api/journal`), if its file can be read.
+    journal: Option<journal::Journal>,
     /// Profile-mode recordings uploaded by pages, if a directory is configured.
     profiles: Option<profiles::Profiles>,
     /// Order gateways by account, for Flatten and Resume.
@@ -218,6 +224,24 @@ async fn main() {
                     .filter(|s| !s.is_empty());
                 prefs::Prefs::open(p, defaults.as_deref().map(std::path::Path::new))
             }),
+        journal: std::env::var("CONSOLE_JOURNAL")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| {
+                journal::default_path(
+                    std::env::var("CONSOLE_REMINDERS")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from)
+                        .as_deref(),
+                )
+            })
+            .and_then(|p| {
+                journal::Journal::open(p)
+                    .map_err(|e| eprintln!("console: journal off: {e}"))
+                    .ok()
+            }),
         reminders: std::env::var("CONSOLE_REMINDERS")
             .ok()
             .filter(|s| !s.is_empty())
@@ -281,6 +305,11 @@ async fn main() {
         )
         .route("/api/reminders", get(reminders_get).post(reminders_post))
         .route("/api/prefs", get(prefs_get))
+        .route("/api/journal", get(journal_get).post(journal_post))
+        .route(
+            "/api/journal/{id}",
+            axum::routing::put(journal_put).delete(journal_delete),
+        )
         .route("/api/prefs/{key}", axum::routing::put(prefs_put))
         .route(
             "/api/profiles",
@@ -582,6 +611,70 @@ async fn prefs_put(
         Err(prefs::Refused::Bad(e)) => {
             (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": e }))).into_response()
         }
+    }
+}
+
+/// The entries whose day is in `from..=to`, newest first.
+async fn journal_get(
+    AxumState(app): AxumState<Arc<App>>,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> Response {
+    let Some(j) = &app.journal else {
+        return (StatusCode::NOT_FOUND, "no journal configured").into_response();
+    };
+    let entries = j.list(
+        q.get("from").map(String::as_str),
+        q.get("to").map(String::as_str),
+    );
+    no_store(axum::Json(json!({ "entries": entries })))
+}
+
+/// Journal writes answer with the entry, or the error.
+fn journal_answer(r: Result<journal::Entry, journal::Refused>) -> Response {
+    match r {
+        Ok(e) => no_store(axum::Json(e)),
+        Err(journal::Refused::NotFound) => (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({ "error": "no such entry" })),
+        )
+            .into_response(),
+        Err(journal::Refused::Bad(e)) => {
+            (StatusCode::BAD_REQUEST, axum::Json(json!({ "error": e }))).into_response()
+        }
+    }
+}
+
+async fn journal_post(
+    AxumState(app): AxumState<Arc<App>>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    match &app.journal {
+        Some(j) => journal_answer(j.create(&body)),
+        None => (StatusCode::NOT_FOUND, "no journal configured").into_response(),
+    }
+}
+
+async fn journal_put(
+    AxumState(app): AxumState<Arc<App>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    match &app.journal {
+        Some(j) => journal_answer(j.update(&id, &body)),
+        None => (StatusCode::NOT_FOUND, "no journal configured").into_response(),
+    }
+}
+
+async fn journal_delete(
+    AxumState(app): AxumState<Arc<App>>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    match &app.journal {
+        Some(j) => match j.delete(&id) {
+            Ok(()) => no_store(axum::Json(json!({ "ok": true }))),
+            Err(e) => journal_answer(Err(e)),
+        },
+        None => (StatusCode::NOT_FOUND, "no journal configured").into_response(),
     }
 }
 
