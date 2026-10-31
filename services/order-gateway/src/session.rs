@@ -267,6 +267,8 @@ struct Pending {
     /// When its outcome became unknown, ns on the rate clock.
     start: u64,
     next: usize,
+    /// When its last lookup ran, ns on the rate clock.
+    last: Option<u64>,
 }
 
 /// One broker call of a reconcile, run in order.
@@ -1608,6 +1610,7 @@ impl<B: Broker> Session<B> {
                     cid: cid.clone(),
                     start: self.rate_now(),
                     next: 0,
+                    last: None,
                 });
                 outcome("unknown")
                     .s("reason", reason)
@@ -2182,6 +2185,7 @@ impl<B: Broker> Session<B> {
                         cid,
                         start: self.rate_now(),
                         next: 0,
+                        last: None,
                     });
                 }
                 Phase::Unknown => {
@@ -2191,6 +2195,7 @@ impl<B: Broker> Session<B> {
                             cid,
                             start,
                             next: 0,
+                            last: None,
                         });
                     }
                 }
@@ -2504,7 +2509,16 @@ impl<B: Broker> Session<B> {
         let mut i = 0;
         while i < self.pending.len() {
             let k = self.pending[i].next;
-            if self.pending[i].start.saturating_add(ns(offsets[k])) > now {
+            let mut due = self.pending[i].start.saturating_add(ns(offsets[k]));
+            // Under a session the market clock can jump (overnight, a sparse step):
+            // the lookups keep their spacing after the last one, so a jump doesn't
+            // run them all at once and write the order off within one step.
+            if self.b.session_clocked()
+                && let (Some(last), Some(prev)) = (self.pending[i].last, k.checked_sub(1))
+            {
+                due = due.max(last.saturating_add(ns(offsets[k].saturating_sub(offsets[prev]))));
+            }
+            if due > now {
                 i += 1;
                 continue;
             }
@@ -2547,6 +2561,7 @@ impl<B: Broker> Session<B> {
                 }
                 Lookup::NotFound | Lookup::Failed => {
                     self.pending[i].next += 1;
+                    self.pending[i].last = Some(now);
                 }
             }
             // One blocking lookup per tick: the others are due and run on later ticks.
@@ -3240,6 +3255,7 @@ mod tests {
             cid: "wse-pending".into(),
             start: s.rate_now() - 3_600_000_000_000,
             next: 0,
+            last: None,
         });
         poll(&mut s);
         assert_eq!(*calls.borrow(), vec!["account"]);
