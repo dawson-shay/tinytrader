@@ -237,6 +237,8 @@ impl Session {
                 underlyings: v.underlyings.clone(),
                 equities: v.equities.clone(),
                 allow_short: v.allow_short,
+                futures: v.futures.clone(),
+                max_future_qty: v.max_future_qty.unwrap_or(d.max_future_qty),
                 max_open: v.max_open.unwrap_or(d.max_open),
                 max_notional_cents: v.max_notional.map_or(d.max_notional_cents, |x| x * 100),
                 ..d

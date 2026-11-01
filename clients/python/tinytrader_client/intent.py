@@ -22,7 +22,11 @@ def _price(p: float | str | Decimal) -> str:
 
 
 def _instrument(symbol: str) -> dict:
+    from .book import future
+
     s = symbol.replace(" ", "")
+    if future(s) is not None:
+        return {"class": "future", "symbol": s}
     is_option = len(s) > 15 and s[-9] in "CP" and s[-8:].isdigit()
     return {"class": "option" if is_option else "equity", "symbol": s}
 

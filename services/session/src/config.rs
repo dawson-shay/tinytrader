@@ -29,6 +29,8 @@
 //! quotes = ["opra"]              # the sources whose records it fills against
 //! underlyings = ["SPY"]
 //! equities = []
+//! futures = []                   # futures roots allowed: "ES", "MES", ...
+//! max_future_qty = 1             # contracts per opening futures order
 //! max_notional = 2500            # dollars per order
 //! [venues.sim]                   # the simulator's profile (order-gateway.md §10)
 //! latency_ms = 5
@@ -174,6 +176,12 @@ pub struct Venue {
     /// Short stock sales allowed.
     #[serde(default)]
     pub allow_short: bool,
+    /// Futures roots allowed (`ES`, `MES`, ...).
+    #[serde(default)]
+    pub futures: Vec<String>,
+    /// The most futures contracts one opening order may trade (1 by default).
+    #[serde(default)]
+    pub max_future_qty: Option<u32>,
     /// The simulator's profile: the `--sim-script` keys (latency, fees, size cap,
     /// calendar, account).
     #[serde(default)]
@@ -237,6 +245,16 @@ impl Config {
                     "venue {}: the strategy's latency is the session's strategy_latency_ms",
                     v.name
                 ));
+            }
+            if let Some(bad) = v
+                .futures
+                .iter()
+                .find(|r| order_gateway::future_multiplier(r).is_none())
+            {
+                return Err(format!("venue {}: {bad:?} isn't a known futures root", v.name));
+            }
+            if v.max_future_qty == Some(0) {
+                return Err(format!("venue {}: max_future_qty is at least 1", v.name));
             }
             for q in &v.quotes {
                 if !c.sources.iter().any(|s| &s.name == q) {

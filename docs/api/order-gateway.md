@@ -422,6 +422,16 @@ All three are in the pin with the seed. From `tinytrader-sim/6`, runs with settl
 
 The settings are in the pin.
 
+**Futures** (CME equity index outrights, `class: "future"`; the simulator reports `futures: true` in its capabilities). Quotes come from Globex records (`bbo-1m`, `mbp-1`, ...) mapped by symbol (`ESZ6`); fills follow the fill model below, per point.
+- **Hours.** In New York time, from 18:00 to 17:00 the next day, with a daily halt from 17:00 to 18:00, closed from Friday 17:00 to Sunday 18:00. A session from 18:00 belongs to the next day, its trade date, which must be a trading day of the venue's calendar, so the calendar's holidays close futures too (CME's own early halts aren't modelled). An order outside the hours is refused with `sim_market_closed`. A day order expires at its trade date's 17:00. Futures books stay across the New York midnight that clears the options books.
+- **Cash** moves by fees (`fee_per_future`, per contract per side; 0 by default) and realized profit and loss: a fill pays no notional. Opening adds to the position at its price; reducing it realizes (price − average) × contracts × the multiplier.
+- **Margin.** `futures_margin = {"ES": "20000.00"}` is the initial margin per contract by root. An opening order is refused (`sim_insufficient_margin`) unless the cash, less what the venue's options rules hold, covers the margin of the root's held and working contracts with it. Buying power is net of the margin held, and options orders see it too. A root without a margin isn't checked.
+- **Caps.** An opening order is refused (`sim_future_position`) when the root's held and working contracts with it would exceed `futures_max_position` (10 by default). The count is gross: a long in one month and a short in another both count. A limit order (open or close) must be within `futures_price_band` (a fraction of the mid, 0.05 by default) of the last fresh mid (`sim_price_band`); with no quote within `expiry.quote_max_age_s`, it's refused with `sim_no_quote`.
+- **Expiry.** A contract trades until 09:30 on its third Friday, when what is held settles in cash at the final settlement price. That price is the settlement file's `AM-SOQ` row for the future's root, else for its index (SPX for ES and MES, NDX for NQ and MNQ, RUT for RTY and M2K), else, with `expiry.from_quote`, its own last fresh mid. With none of these the run stops, naming what's missing. Each settlement is a `SETTLE` activity (`symbol`, `qty`, `price`, `net_amount`); working orders on the contract expire, and later orders are refused with `sim_expired_instrument`. The year digit is read as the first matching year from last year on.
+- Not modelled: daily variation margin (cash moves only on realization; positions are marked at their entry), maintenance margin and margin calls, cross-margin with options, calendar spreads (`ESZ6-ESH7` is quoted, not tradeable) and the roll, which is the strategy's.
+
+All of these are in the pin (`fee_per_future`, `futures`).
+
 **Fill model.**
 - *When an order may fill:* with `fill_on = "book"` (the default), an order is evaluated against the book standing when it activates, then after each instant that touches it. With `fill_on = "next_quote"`, it waits for the first quote after it activates. That suits bar data (`cbbo-1m`): a bar's quotes are what the strategy decided on, already in the past when the order arrives, so the fill comes from the next bar.
 - *Single buy limit L:* fillable when the ask is present and ask ≤ L. It fills at the **ask**, which is the price improvement up to the touch.
@@ -452,7 +462,7 @@ The settings are in the pin.
 
 **Reproducibility pin.** `pins` contains:
 - the quote source and its manifest sha256 or relay stream id
-- the simulator model version (`tinytrader-sim/7`; `/7` adds the queue model; `/6` adds report latency and seeded jitter; `/5` adds the venue rules; `/4` settles expiries and charges stock its own fee; `/2` brought definitions from symbol mappings, `cbbo`, `bbo` and `tcbbo` books, one book per instant and the strategy's latency; `/3` forgets expired contracts and reused instrument ids)
+- the simulator model version (`tinytrader-sim/8`; `/8` adds futures; `/7` adds the queue model; `/6` adds report latency and seeded jitter; `/5` adds the venue rules; `/4` settles expiries and charges stock its own fee; `/2` brought definitions from symbol mappings, `cbbo`, `bbo` and `tcbbo` books, one book per instant and the strategy's latency; `/3` forgets expired contracts and reused instrument ids)
 - the latencies
 - the fee profile
 - `size_cap`

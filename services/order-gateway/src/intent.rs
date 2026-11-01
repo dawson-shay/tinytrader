@@ -194,6 +194,36 @@ pub fn future(symbol: &str) -> Option<(&str, u32, u32)> {
     Some((root, month, year.parse().ok()?))
 }
 
+/// A futures symbol's expiry (days since the epoch): the third Friday of its month, in
+/// the year whose last digits match, from the year before `today`'s (days since the
+/// epoch) on. CME lists equity index futures up to a few years out, and a contract
+/// just expired is still named in the days after it.
+#[must_use]
+pub fn future_expiry(symbol: &str, today: i64) -> Option<i64> {
+    let (_, month, digits) = future(symbol)?;
+    let width = symbol.bytes().rev().take_while(u8::is_ascii_digit).count();
+    let modulus = if width == 2 { 100 } else { 10 };
+    let (this_year, _, _) = crate::safety::civil_from_days(today);
+    let year = (this_year - 1..this_year - 1 + modulus)
+        .find(|y| y.rem_euclid(modulus) == i64::from(digits))?;
+    // Days since the epoch are 0 on a Thursday: the month's first Friday, then two
+    // weeks on.
+    let first = days_from_civil(year, month, 1);
+    let to_friday = (1 - first).rem_euclid(7);
+    Some(first + to_friday + 14)
+}
+
+/// The index whose opening quotation a futures root settles to, where it has one.
+#[must_use]
+pub fn future_index(root: &str) -> Option<&'static str> {
+    match root {
+        "ES" | "MES" => Some("SPX"),
+        "NQ" | "MNQ" => Some("NDX"),
+        "RTY" | "M2K" => Some("RUT"),
+        _ => None,
+    }
+}
+
 /// `(symbol, class)`.
 fn instrument(f: &mut Fields) -> Result<(String, Class), Invalid> {
     let mut i = Fields::new(f.req("instrument")?, &f.at("instrument"))?;
@@ -1151,5 +1181,34 @@ mod tests {
             {"instrument":{"class":"future","symbol":"ESH7"},"ratio":1,"side":"sell","effect":"open"}],
             "qty":1,"type":"limit","limit_price":"10.00","time_in_force":"day"});
         assert!(Intent::parse(combo).is_err(), "futures combos are refused");
+    }
+
+    #[test]
+    fn futures_expire_on_the_third_friday() {
+        use super::future_expiry;
+        use crate::safety::days_from_civil;
+        let oct30 = days_from_civil(2026, 10, 30);
+        assert_eq!(
+            future_expiry("ESZ6", oct30),
+            Some(days_from_civil(2026, 12, 18))
+        );
+        assert_eq!(
+            future_expiry("ESH7", oct30),
+            Some(days_from_civil(2027, 3, 19))
+        );
+        // Four years out, and one just expired (named in the new year).
+        assert_eq!(
+            future_expiry("ESH0", oct30),
+            Some(days_from_civil(2030, 3, 15))
+        );
+        let jan2 = days_from_civil(2027, 1, 2);
+        assert_eq!(
+            future_expiry("ESZ6", jan2),
+            Some(days_from_civil(2026, 12, 18))
+        );
+        assert_eq!(
+            future_expiry("MESH27", oct30),
+            Some(days_from_civil(2027, 3, 19))
+        );
     }
 }

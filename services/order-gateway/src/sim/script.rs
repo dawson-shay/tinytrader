@@ -71,6 +71,14 @@ pub(crate) struct Script {
     pub(crate) fee_cents: i64,
     /// Per share of stock, nanodollars.
     pub(crate) fee_share: i64,
+    /// Per futures contract per side, nanodollars.
+    pub(crate) fee_future: i64,
+    /// Initial margin per contract by futures root, nanodollars.
+    pub(crate) futures_margin: BTreeMap<String, i128>,
+    /// Most contracts of a futures root held and working at once, gross.
+    pub(crate) futures_max_position: u64,
+    /// How far a futures limit may be from the mid, in thousandths of it.
+    pub(crate) futures_band_permille: u64,
     pub(crate) expiry: super::expiry::Expiry,
     pub(crate) venue: super::rules::VenueRules,
     pub(crate) latency_ms: u64,
@@ -197,6 +205,10 @@ impl Script {
             drop_after: None,
             fee_cents: 2,
             fee_share: 0,
+            fee_future: 0,
+            futures_margin: BTreeMap::new(),
+            futures_max_position: 10,
+            futures_band_permille: 50,
             venue: super::rules::VenueRules::default(),
             expiry: super::expiry::Expiry {
                 settle: true,
@@ -333,6 +345,37 @@ impl Script {
                 .and_then(super::expiry::nanos)
                 .filter(|n| *n >= 0)
                 .ok_or_else(|| invalid("fee_per_share", "a decimal dollar amount"))?;
+        }
+        let dollars = |v: &Value, k: &str| {
+            v.as_str()
+                .and_then(super::expiry::nanos)
+                .filter(|n| *n >= 0)
+                .ok_or_else(|| invalid(k, "a decimal dollar amount"))
+        };
+        if let Some(v) = f.take("fee_per_future") {
+            s.fee_future = dollars(&v, "fee_per_future")?;
+        }
+        if let Some(Value::Object(m)) = f.take("futures_margin") {
+            for (root, v) in m {
+                if crate::intent::future_multiplier(&root).is_none() {
+                    return Err(invalid("futures_margin", "keys are known futures roots"));
+                }
+                let n = dollars(&v, &format!("futures_margin.{root}"))?;
+                s.futures_margin.insert(root, i128::from(n));
+            }
+        }
+        if let Some(n) = f.opt_int("futures_max_position")? {
+            s.futures_max_position = n;
+        }
+        if let Some(v) = f.take("futures_price_band") {
+            let n = dollars(&v, "futures_price_band")?;
+            if n % 1_000_000 != 0 || n == 0 {
+                return Err(invalid(
+                    "futures_price_band",
+                    "a fraction above 0 of at most three places, such as 0.05",
+                ));
+            }
+            s.futures_band_permille = u64::try_from(n / 1_000_000).unwrap_or(50);
         }
         if let Some(e) = f.take("expiry") {
             parse_expiry(&mut s.expiry, e)?;
