@@ -172,7 +172,9 @@ impl SimBroker {
 
     /// Cash less the worst expiry loss of the option positions held.
     pub(super) fn buying_power(&self) -> i128 {
-        (self.buying_power_ex_futures() - self.futures_margin_held(None)).max(0)
+        (self.buying_power_ex_futures() + self.futures_unrealized()
+            - self.futures_margin_held(None))
+        .max(0)
     }
 
     /// Buying power before the futures margin.

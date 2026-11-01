@@ -720,6 +720,14 @@ impl Broker for SimBroker {
             },
             _ => {}
         }
+        // Futures need the venue's quotes for their checks (hours, band, margin).
+        if intent.is_future() && self.market.is_none() {
+            return SubmitResult::Rejected(error(
+                422,
+                "sim_futures_need_quotes",
+                "futures trade only against market data (--sim-quotes or a session)",
+            ));
+        }
         if let Some(m) = &self.market {
             let today = et_day(self.now);
             if intent.legs.iter().any(|l| self.expired(&l.symbol, today)) {
@@ -1346,12 +1354,15 @@ impl SimBroker {
         } else if self.s.futures_margin.is_empty() {
             cash.clone()
         } else {
-            fmt_nanos((self.cash - self.futures_margin_held(None)).max(0))
+            fmt_nanos(
+                (self.cash + self.futures_unrealized() - self.futures_margin_held(None)).max(0),
+            )
         };
         let raw = Obj::new()
             .s("status", &self.s.status)
             .n("options_trading_level", self.s.level)
             .s("cash", &cash)
+            .s("equity", &fmt_nanos(self.net_liquidation()))
             .s("buying_power", &power)
             .b("trading_blocked", self.s.trading_blocked)
             .raw(

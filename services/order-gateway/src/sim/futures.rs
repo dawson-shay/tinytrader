@@ -10,25 +10,34 @@
 //! - **Cash** moves by fees and realized profit and loss only: a fill doesn't pay its
 //!   notional. Opening adds to the position at its price; reducing it realizes
 //!   (price − average) × contracts × the multiplier.
-//! - **Margin.** With `futures_margin = {"ES": "20000.00"}` (initial margin per
-//!   contract), an opening order is refused (`sim_insufficient_margin`) unless the
-//!   cash covers the margin of the root's held and working contracts with it, besides
-//!   what the venue's options rules hold. Buying power is net of the margin held.
-//! - **Caps.** An opening order is refused (`sim_future_position`) when the root's held
-//!   and working contracts with it would exceed `futures_max_position` (10 by default),
-//!   counted gross: a long in one month and a short in another both count. A limit order
+//! - **Margin.** `futures_margin = {"ES": "20000.00"}` is the initial margin per
+//!   contract, required for every root traded (an opening without it is refused,
+//!   `sim_no_margin`). An opening is refused (`sim_insufficient_margin`) unless cash
+//!   and the futures' unrealized profit or loss cover the margin of the root's held
+//!   and working contracts with it, besides what the venue's options rules hold.
+//!   Buying power is net of the margin held. The account reports its net liquidation
+//!   value as `equity`.
+//! - **Caps.** An opening order is refused (`sim_future_position`) when the root's
+//!   contracts at stake with it would exceed `futures_max_position` (10 by default):
+//!   for each contract the larger position its working orders could leave (all buys
+//!   filled, or all sells), summed over the root's contracts, so a long in one month
+//!   and a short in another both count, and a sale that flips a long counts for the
+//!   short it leaves. A limit order
 //!   must be within `futures_price_band` (0.05 by default) of the last fresh mid
-//!   (`sim_price_band`; with no fresh quote, `sim_no_quote`).
-//! - **Expiry.** A contract trades until 09:30 on its third Friday, when what is held
+//!   (`sim_price_band`); an opening with no fresh quote is refused (`sim_no_quote`), a
+//!   close isn't.
+//! - **Expiry.** A contract trades until 09:30 on its third Friday (the trading day
+//!   before, when that Friday is a holiday of the calendar), when what is held
 //!   settles in cash at the final settlement price: the settlement file's `AM-SOQ` for
 //!   the future's root, else for its index (SPX for ES and MES, NDX for NQ and MNQ, RUT
-//!   for RTY and M2K), else (with `expiry.from_quote`) its own last fresh mid. Each
+//!   for RTY and M2K; YM has none here), else (with `expiry.from_quote`) its own last
+//!   fresh mid. Each
 //!   settlement is a `SETTLE` activity; working orders on the contract expire.
 use super::{CENT, SimBroker, fmt_nanos};
 use crate::broker::Update;
 use crate::intent::{Intent, future, future_expiry, future_index, future_multiplier};
 use crate::protocol::Obj;
-use crate::safety::{date_string, et_day, et_ns};
+use crate::safety::{date_string, et_day, et_minutes, et_ns};
 
 /// The daily halt and the reopening, minutes after midnight New York.
 const HALT: i64 = 17 * 60;
@@ -53,10 +62,9 @@ pub(super) fn multiplier(symbol: &str) -> i128 {
         .map_or(1, i128::from)
 }
 
-/// Minutes after midnight New York of `t`.
+/// Minutes after midnight New York of `t`, on the local clock.
 fn minutes(t: u64) -> i64 {
-    let midnight = et_ns(et_day(t), 0);
-    i64::try_from(t.saturating_sub(midnight) / 60_000_000_000).unwrap_or(0)
+    et_minutes(t)
 }
 
 impl SimBroker {
@@ -84,44 +92,112 @@ impl SimBroker {
     /// Whether a futures contract has stopped trading by ET day `day`, at the market
     /// time: after 09:30 on its expiry day, or any day after.
     pub(super) fn future_expired(&self, symbol: &str, day: i64) -> bool {
-        future_expiry(symbol, day)
+        self.future_expiry_day(symbol, day)
             .is_some_and(|e| e < day || (e == day && self.now >= et_ns(e, SETTLE)))
     }
 
-    /// Contracts of `root` held and working (opening orders' remaining quantity), and
-    /// `extra` more: gross.
-    fn future_contracts(&self, root_of: &str, extra: u64) -> u64 {
-        let held: u64 = self
-            .pos
-            .iter()
-            .filter(|(s, _)| root(s) == Some(root_of))
-            .map(|(_, p)| p.0.unsigned_abs())
-            .sum();
-        let working: u64 = self
-            .orders
-            .iter()
-            .enumerate()
-            .filter(|(i, o)| {
-                self.open(*i)
-                    && o.legs
-                        .iter()
-                        .any(|l| l.open && root(&l.symbol) == Some(root_of))
-            })
-            .map(|(_, o)| o.qty - o.filled)
-            .sum();
-        held + working + extra
+    /// A contract's expiry day: its third Friday, or the trading day before it when
+    /// the calendar has no session that Friday (a holiday).
+    pub(super) fn future_expiry_day(&self, symbol: &str, day: i64) -> Option<i64> {
+        let friday = future_expiry(symbol, day)?;
+        Some(
+            (friday - 7..=friday)
+                .rev()
+                .find(|d| self.session(*d).is_some())
+                .unwrap_or(friday),
+        )
     }
 
-    /// Initial margin held for futures, nanodollars, with `extra` contracts of
-    /// `root_of` more.
-    pub(super) fn futures_margin_held(&self, extra: Option<(&str, u64)>) -> i128 {
+    /// Unrealized profit or loss of the futures held, at their fresh mids (a contract
+    /// with no fresh quote counts for nothing), nanodollars.
+    pub(super) fn futures_unrealized(&self) -> i128 {
+        self.pos
+            .iter()
+            .filter(|(s, p)| p.0 != 0 && is_future(s))
+            .filter_map(|(s, p)| {
+                let mid = self.fresh(s, self.now).and_then(|q| q.bid.zip(q.ask))?;
+                let mid = (i128::from(mid.0) + i128::from(mid.1)) / 2;
+                Some(mid * i128::from(p.0) * multiplier(s) - p.1 * multiplier(s))
+            })
+            .sum()
+    }
+
+    /// Net liquidation value, nanodollars: cash, plus each position at its fresh mid
+    /// (an option's at 100 shares, a future's as what it would realize), or at its
+    /// entry price without one.
+    pub(super) fn net_liquidation(&self) -> i128 {
+        let marked: i128 = self
+            .pos
+            .iter()
+            .filter(|(s, p)| p.0 != 0 && !is_future(s))
+            .map(|(s, p)| {
+                let shares = if crate::intent::occ(s).is_some() {
+                    100
+                } else {
+                    1
+                };
+                let mid = self
+                    .fresh(s, self.now)
+                    .and_then(|q| q.bid.zip(q.ask))
+                    .map(|(b, a)| (i128::from(b) + i128::from(a)) / 2);
+                mid.map_or(p.1, |m| m * i128::from(p.0)) * shares
+            })
+            .sum();
+        self.cash + marked + self.futures_unrealized()
+    }
+
+    /// Contracts of `root_of` at stake, with `extra` (a symbol and signed contracts)
+    /// working too: for each contract, the larger position the working orders could
+    /// leave, all buys filled or all sells; summed over the root's contracts. A sale
+    /// that flattens and flips a long counts for the short it leaves.
+    fn future_contracts(&self, root_of: &str, extra: Option<(&str, i64)>) -> u64 {
+        let mut by: std::collections::BTreeMap<&str, (i64, i64, i64)> =
+            std::collections::BTreeMap::new();
+        for (s, p) in &self.pos {
+            if root(s) == Some(root_of) {
+                by.entry(s.as_str()).or_default().0 += p.0;
+            }
+        }
+        for (i, o) in self.orders.iter().enumerate() {
+            if !self.open(i) {
+                continue;
+            }
+            let left = i64::try_from(o.qty - o.filled).unwrap_or(0);
+            for l in &o.legs {
+                if root(&l.symbol) == Some(root_of) {
+                    let e = by.entry(l.symbol.as_str()).or_default();
+                    if l.buy {
+                        e.1 += left;
+                    } else {
+                        e.2 += left;
+                    }
+                }
+            }
+        }
+        if let Some((s, q)) = extra.filter(|(s, _)| root(s) == Some(root_of)) {
+            let e = by.entry(s).or_default();
+            if q > 0 {
+                e.1 += q;
+            } else {
+                e.2 -= q;
+            }
+        }
+        by.values()
+            .map(|(held, buys, sells)| {
+                (held + buys)
+                    .unsigned_abs()
+                    .max((held - sells).unsigned_abs())
+            })
+            .sum()
+    }
+
+    /// Initial margin held for futures, nanodollars, with `extra` (a symbol and
+    /// signed contracts) working too.
+    pub(super) fn futures_margin_held(&self, extra: Option<(&str, i64)>) -> i128 {
         self.s
             .futures_margin
             .iter()
-            .map(|(r, m)| {
-                let more = extra.filter(|(e, _)| e == r).map_or(0, |(_, n)| n);
-                m * i128::from(self.future_contracts(r, more))
-            })
+            .map(|(r, m)| m * i128::from(self.future_contracts(r, extra)))
             .sum()
     }
 
@@ -138,11 +214,16 @@ impl SimBroker {
             return Some(("sim_market_closed", "futures are halted or closed".into()));
         }
         if !intent.market {
-            let Some(mid) = self
+            let mid = self
                 .fresh(symbol, self.now)
                 .and_then(|q| q.bid.zip(q.ask))
-                .map(|(b, a)| (i128::from(b) + i128::from(a)) / 2)
-            else {
+                .map(|(b, a)| (i128::from(b) + i128::from(a)) / 2);
+            // A close is never kept from closing for want of a quote: it's banded
+            // only against a fresh one.
+            let Some(mid) = mid else {
+                if !leg.open {
+                    return None;
+                }
                 return Some(("sim_no_quote", format!("no fresh quote for {symbol}")));
             };
             let limit = i128::from(intent.limit_cents) * i128::from(CENT);
@@ -162,8 +243,8 @@ impl SimBroker {
         if !leg.open {
             return None;
         }
-        let qty = u64::from(intent.qty);
-        let after = self.future_contracts(root_of, qty);
+        let signed = i64::from(intent.qty) * if leg.buy { 1 } else { -1 };
+        let after = self.future_contracts(root_of, Some((symbol, signed)));
         if after > self.s.futures_max_position {
             return Some((
                 "sim_future_position",
@@ -173,23 +254,29 @@ impl SimBroker {
                 ),
             ));
         }
-        if self.s.futures_margin.contains_key(root_of) {
-            let others = if self.s.venue.defined_risk {
-                self.cash - self.buying_power_ex_futures()
-            } else {
-                0
-            };
-            let need = self.futures_margin_held(Some((root_of, qty)));
-            if self.cash - others < need {
-                return Some((
-                    "sim_insufficient_margin",
-                    format!(
-                        "initial margin {} for {after} {root_of} contracts, with {} available",
-                        fmt_nanos(need),
-                        fmt_nanos(self.cash - others)
-                    ),
-                ));
-            }
+        if !self.s.futures_margin.contains_key(root_of) {
+            return Some((
+                "sim_no_margin",
+                format!("no futures_margin for {root_of} in the profile"),
+            ));
+        }
+        let others = if self.s.venue.defined_risk {
+            self.cash - self.buying_power_ex_futures()
+        } else {
+            0
+        };
+        // Cash with the futures' unrealized profit or loss, less the options' hold.
+        let available = self.cash + self.futures_unrealized() - others;
+        let need = self.futures_margin_held(Some((symbol, signed)));
+        if available < need {
+            return Some((
+                "sim_insufficient_margin",
+                format!(
+                    "initial margin {} for {after} {root_of} contracts, with {} available",
+                    fmt_nanos(need),
+                    fmt_nanos(available)
+                ),
+            ));
         }
         None
     }
@@ -210,11 +297,22 @@ impl SimBroker {
     /// The next futures settlement due: 09:30 on the expiry day of a held contract.
     pub(super) fn next_future_settlement(&self) -> Option<u64> {
         let day = et_day(self.now.max(1));
-        self.pos
+        let held = self
+            .pos
             .iter()
             .filter(|(s, p)| p.0 != 0 && is_future(s))
-            .filter_map(|(s, _)| future_expiry(s, day))
+            .map(|(s, _)| s.as_str());
+        let working = self
+            .orders
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| self.open(*i))
+            .flat_map(|(_, o)| o.legs.iter().map(|l| l.symbol.as_str()))
+            .filter(|s| is_future(s));
+        held.chain(working)
+            .filter_map(|s| self.future_expiry_day(s, day))
             .map(|e| et_ns(e, SETTLE))
+            .filter(|t| *t >= self.now)
             .min()
     }
 
@@ -222,24 +320,32 @@ impl SimBroker {
     /// contract in cash at its final settlement price; working orders on it expire.
     pub(super) fn settle_futures(&mut self, ts: u64) -> Result<(), String> {
         let day = et_day(ts);
+        let due_at = |me: &Self, s: &str| {
+            me.future_expiry_day(s, day)
+                .is_some_and(|e| et_ns(e, SETTLE) <= ts)
+        };
         let due: Vec<(String, i64, i128)> = self
             .pos
             .iter()
-            .filter(|(s, p)| {
-                p.0 != 0 && future_expiry(s, day).is_some_and(|e| et_ns(e, SETTLE) <= ts)
-            })
+            .filter(|(s, p)| p.0 != 0 && is_future(s) && due_at(self, s))
             .map(|(s, p)| (s.clone(), p.0, p.1))
             .collect();
+        // Working orders on an expiring contract expire, held or not.
+        for i in 0..self.orders.len() {
+            if self.open(i)
+                && self.orders[i]
+                    .legs
+                    .iter()
+                    .any(|l| is_future(&l.symbol) && due_at(self, &l.symbol))
+            {
+                self.set_status(i, "expired");
+            }
+        }
         for (symbol, qty, cost) in due {
             let price = self.final_settlement(&symbol, ts)?;
             let pnl = Self::realized(&symbol, (qty, cost), -qty, price);
             self.cash += pnl;
             self.pos.remove(&symbol);
-            for i in 0..self.orders.len() {
-                if self.open(i) && self.orders[i].legs.iter().any(|l| l.symbol == symbol) {
-                    self.set_status(i, "expired");
-                }
-            }
             self.acts += 1;
             let raw = Obj::new()
                 .s("activity_type", "SETTLE")
@@ -284,5 +390,45 @@ impl SimBroker {
              of 09:30",
             future_index(root_of).map_or(String::new(), |i| format!(" or {i}"))
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SimBroker;
+
+    const PT: i64 = 1_000_000_000;
+
+    /// What a fill realizes, from the position before it.
+    #[test]
+    fn realized_profit_and_loss() {
+        let long2 = (2, 2 * 7743 * i128::from(PT));
+        // Adding to a position, or opening, realizes nothing.
+        assert_eq!(SimBroker::realized("ESZ6", long2, 1, 7750 * PT), 0);
+        assert_eq!(SimBroker::realized("ESZ6", (0, 0), -1, 7750 * PT), 0);
+        // Selling one of two at 7753: 10 points × 50.
+        assert_eq!(
+            SimBroker::realized("ESZ6", long2, -1, 7753 * PT),
+            500 * i128::from(PT)
+        );
+        // Selling three: only the two held realize.
+        assert_eq!(
+            SimBroker::realized("ESZ6", long2, -3, 7753 * PT),
+            1000 * i128::from(PT)
+        );
+        // A short covered higher loses; MES and NQ have their own multipliers.
+        let short1 = (-1, -7743 * i128::from(PT));
+        assert_eq!(
+            SimBroker::realized("ESZ6", short1, 1, 7753 * PT),
+            -500 * i128::from(PT)
+        );
+        assert_eq!(
+            SimBroker::realized("MESZ6", short1, 1, 7753 * PT),
+            -50 * i128::from(PT)
+        );
+        assert_eq!(
+            SimBroker::realized("NQZ6", short1, 1, 7753 * PT),
+            -200 * i128::from(PT)
+        );
     }
 }
