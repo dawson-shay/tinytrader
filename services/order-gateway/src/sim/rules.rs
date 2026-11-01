@@ -90,7 +90,8 @@ impl SimBroker {
                 ));
             }
         }
-        if r.defined_risk && intent.legs.iter().any(|l| l.open) {
+        // A future is held to its margin (`futures`), not to options buying power.
+        if r.defined_risk && !intent.is_future() && intent.legs.iter().any(|l| l.open) {
             return self.short_of_buying_power(intent);
         }
         None
@@ -133,7 +134,12 @@ impl SimBroker {
                 ));
             }
         };
-        let left = self.cash - premium - required;
+        // The futures' initial margin is held from the same cash, and their unrealized
+        // loss counts against it (a gain doesn't pay for options).
+        let left = self.cash + self.futures_unrealized().min(0)
+            - premium
+            - required
+            - self.futures_margin_held(None);
         (left < 0).then(|| {
             (
                 "sim_insufficient_buying_power",
@@ -170,6 +176,13 @@ impl SimBroker {
 
     /// Cash less the worst expiry loss of the option positions held.
     pub(super) fn buying_power(&self) -> i128 {
+        (self.buying_power_ex_futures() + self.futures_unrealized()
+            - self.futures_margin_held(None))
+        .max(0)
+    }
+
+    /// Buying power before the futures margin.
+    pub(super) fn buying_power_ex_futures(&self) -> i128 {
         self.required(&self.working_legs())
             .map_or(0, |r| (self.cash - self.working_debits() - r).max(0))
     }
@@ -185,7 +198,7 @@ impl SimBroker {
             }
             let left = i64::try_from(o.qty - o.filled).unwrap_or(0);
             for l in &o.legs {
-                if !l.open {
+                if !l.open || super::futures::is_future(&l.symbol) {
                     continue;
                 }
                 let sign = if l.buy { 1 } else { -1 };
@@ -203,7 +216,9 @@ impl SimBroker {
         self.orders
             .iter()
             .enumerate()
-            .filter(|(i, _)| self.open(*i))
+            .filter(|(i, o)| {
+                self.open(*i) && !o.legs.iter().any(|l| super::futures::is_future(&l.symbol))
+            })
             .map(|(_, o)| {
                 let left = i128::from(o.qty - o.filled);
                 let debit = if o.combo || o.legs[0].buy {

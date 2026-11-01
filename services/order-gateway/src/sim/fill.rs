@@ -134,20 +134,28 @@ impl SimBroker {
             let sign: i64 = if buy { 1 } else { -1 };
             net += i128::from(sign) * i128::from(ratio) * i128::from(px);
             let qty = i64::try_from(n).unwrap_or(0);
+            let before = self.pos.get(&symbol).copied().unwrap_or((0, 0));
             position = Some(self.book_position(&symbol, sign * qty, px));
-            // An option contract is 100 shares; a stock leg is one.
-            let multiplier = if crate::intent::occ(&symbol).is_some() {
-                100
+            if super::futures::is_future(&symbol) {
+                // A future pays no notional: cash moves by what it realizes, and its fee.
+                let fee = i128::from(self.s.fee_future) * i128::from(n);
+                fees += fee;
+                self.cash += Self::realized(&symbol, before, sign * qty, px) - fee;
             } else {
-                1
-            };
-            let fee = if multiplier == 100 {
-                option_fee
-            } else {
-                share_fee
-            } * i128::from(n);
-            fees += fee;
-            self.cash -= i128::from(sign * qty) * i128::from(px) * multiplier + fee;
+                // An option contract is 100 shares; a stock leg is one.
+                let multiplier = if crate::intent::occ(&symbol).is_some() {
+                    100
+                } else {
+                    1
+                };
+                let fee = if multiplier == 100 {
+                    option_fee
+                } else {
+                    share_fee
+                } * i128::from(n);
+                fees += fee;
+                self.cash -= i128::from(sign * qty) * i128::from(px) * multiplier + fee;
+            }
             let l = &mut self.orders[i].legs[k];
             l.filled += n;
             l.cost += i128::from(n) * i128::from(px);

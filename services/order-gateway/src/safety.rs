@@ -254,6 +254,13 @@ fn ns_secs(ts: u64) -> i64 {
     i64::try_from(ts / 1_000_000_000).unwrap_or(i64::MAX)
 }
 
+/// Minutes after midnight New York at `ts` (ns), on the local clock: right on the
+/// days daylight saving time starts and ends.
+pub(crate) fn et_minutes(ts: u64) -> i64 {
+    let s = ns_secs(ts);
+    (s + et_offset(s)).rem_euclid(86_400) / 60
+}
+
 /// The `America/New_York` calendar day (days since the epoch) at `ts` (ns).
 pub(crate) fn et_day(ts: u64) -> i64 {
     let s = ns_secs(ts);

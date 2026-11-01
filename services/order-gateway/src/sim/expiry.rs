@@ -227,6 +227,9 @@ impl SimBroker {
 
     /// Whether `symbol` is an option past its last trading day on ET day `day`.
     pub(crate) fn expired(&self, symbol: &str, day: i64) -> bool {
+        if super::futures::is_future(symbol) {
+            return self.future_expired(symbol, day);
+        }
         self.last_trading_day(symbol).is_some_and(|last| last < day)
     }
 

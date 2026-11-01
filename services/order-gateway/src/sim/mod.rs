@@ -3,6 +3,7 @@
 //! client-clocked market time. Its cash, positions and activities are broker state.
 mod expiry;
 mod fill;
+mod futures;
 mod market;
 mod queue;
 mod rules;
@@ -25,7 +26,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 /// The simulator's model version, in every pin.
-pub const MODEL: &str = "tinytrader-sim/7";
+pub const MODEL: &str = "tinytrader-sim/8";
 
 /// Nanodollars per cent.
 const CENT: i64 = 10_000_000;
@@ -562,8 +563,7 @@ impl Broker for SimBroker {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             combo: true,
-            // Until the simulator models futures (margin, hours, settlement).
-            futures: false,
+            futures: true,
             max_legs: 4,
             client_order_id_max: 128,
             idempotency: "broker_client_id",
@@ -617,6 +617,30 @@ impl Broker for SimBroker {
             .n("seed", self.s.seed)
             .s("fee_per_contract", &fmt_cents(self.s.fee_cents))
             .s("fee_per_share", &fmt_nanos(i128::from(self.s.fee_share)))
+            .s("fee_per_future", &fmt_nanos(i128::from(self.s.fee_future)))
+            .raw(
+                "futures",
+                &Obj::new()
+                    .raw(
+                        "margin",
+                        &self
+                            .s
+                            .futures_margin
+                            .iter()
+                            .fold(Obj::new(), |o, (r, m)| o.s(r, &fmt_nanos(*m)))
+                            .done(),
+                    )
+                    .n("max_position", self.s.futures_max_position)
+                    .s(
+                        "price_band",
+                        &format!(
+                            "{}.{:03}",
+                            self.s.futures_band_permille / 1000,
+                            self.s.futures_band_permille % 1000
+                        ),
+                    )
+                    .done(),
+            )
             .raw("expiry", &self.expiry_pin())
             .raw("venue_rules", &self.rules_pin())
             .raw(
@@ -696,6 +720,14 @@ impl Broker for SimBroker {
             },
             _ => {}
         }
+        // Futures need the venue's quotes for their checks (hours, band, margin).
+        if intent.is_future() && self.market.is_none() {
+            return SubmitResult::Rejected(error(
+                422,
+                "sim_futures_need_quotes",
+                "futures trade only against market data (--sim-quotes or a session)",
+            ));
+        }
         if let Some(m) = &self.market {
             let today = et_day(self.now);
             if intent.legs.iter().any(|l| self.expired(&l.symbol, today)) {
@@ -712,9 +744,11 @@ impl Broker for SimBroker {
                     "no definition seen",
                 ));
             }
-            if !self
-                .session(et_day(self.now))
-                .is_some_and(|(o, c)| (o..c).contains(&self.now))
+            // Futures keep their own hours (checked with the rest of their rules).
+            if !intent.is_future()
+                && !self
+                    .session(et_day(self.now))
+                    .is_some_and(|(o, c)| (o..c).contains(&self.now))
             {
                 return SubmitResult::Rejected(error(
                     422,
@@ -724,6 +758,14 @@ impl Broker for SimBroker {
             }
             if let Some((code, message)) = self.refuse(intent) {
                 return SubmitResult::Rejected(error(403, code, &message));
+            }
+            if let Some((code, message)) = self.refuse_future(intent) {
+                let status = if code == "sim_market_closed" {
+                    422
+                } else {
+                    403
+                };
+                return SubmitResult::Rejected(error(status, code, &message));
             }
         }
         let legs = intent
@@ -1011,6 +1053,18 @@ impl SimBroker {
                     continue;
                 }
             }
+            // Futures expiring settle at 09:30 of their expiry day, in the same order.
+            let due = self.next_future_settlement().filter(|c| *c <= to);
+            let Some(m) = &mut self.market else { break };
+            if let Some(c) = due {
+                let rec = m.src.peek_ts()?.filter(|t| *t <= c);
+                let act = m.actions.iter().any(|a| a.0 <= c);
+                if rec.is_none() && !act {
+                    self.now = self.now.max(c);
+                    self.settle_futures(c)?;
+                    continue;
+                }
+            }
             let Some(m) = &mut self.market else { break };
             // A session's close settles that day's expiries: after every record and
             // order action at or before it, before anything after it.
@@ -1095,8 +1149,11 @@ impl SimBroker {
             return;
         }
         if m.day != 0 {
-            m.book.clear();
-            m.quoted.clear();
+            // Futures trade through midnight: their books stay.
+            let names = &m.names;
+            let kept = |iid: &u32| names.get(iid).is_some_and(|s| futures::is_future(s));
+            m.book.retain(|iid, _| kept(iid));
+            m.quoted.retain(|iid| kept(iid));
         }
         m.day = today;
         let symbols: Vec<String> = m.ids.keys().cloned().collect();
@@ -1237,7 +1294,16 @@ impl SimBroker {
         match a {
             Action::Activate(i) if self.open(i) => {
                 self.orders[i].active = true;
-                if let Some((_, close)) = self.session(et_day(self.now)) {
+                let close = if self.orders[i]
+                    .legs
+                    .iter()
+                    .any(|l| futures::is_future(&l.symbol))
+                {
+                    self.futures_close(self.now)
+                } else {
+                    self.session(et_day(self.now)).map(|(_, c)| c)
+                };
+                if let Some(close) = close {
                     self.schedule(close.max(self.now), Action::Expire(i));
                 }
                 // fill_on = "next_quote": wait for the first quote after activation, as
@@ -1283,15 +1349,22 @@ impl SimBroker {
 
     fn account_now(&mut self) -> Query<AccountInfo> {
         let cash = fmt_nanos(self.cash);
+        let (equity, stale) = self.net_liquidation();
         let power = if self.s.venue.defined_risk {
             fmt_nanos(self.buying_power())
-        } else {
+        } else if self.s.futures_margin.is_empty() {
             cash.clone()
+        } else {
+            fmt_nanos(
+                (self.cash + self.futures_unrealized() - self.futures_margin_held(None)).max(0),
+            )
         };
         let raw = Obj::new()
             .s("status", &self.s.status)
             .n("options_trading_level", self.s.level)
             .s("cash", &cash)
+            .s("equity", &fmt_nanos(equity))
+            .raw("equity_stale", &arr(stale.iter().map(|x| quote(x))))
             .s("buying_power", &power)
             .b("trading_blocked", self.s.trading_blocked)
             .raw(

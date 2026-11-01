@@ -53,6 +53,26 @@ def compact(symbol: str) -> str:
     return symbol.replace(" ", "")
 
 
+# Futures roots the gateway knows (order-gateway.md, section 6), dollars per point.
+FUTURES = {"ES": 50, "MES": 5, "NQ": 20, "MNQ": 2, "RTY": 50, "M2K": 5, "YM": 5}
+
+
+def future(symbol: str) -> tuple[str, int, int] | None:
+    """Root, month and year digits of a futures outright of a known root
+    (``ESZ6``, ``MESH27``), else None."""
+    if not 3 <= len(symbol) <= 8 or not all(c.isascii() and (c.isupper() or c.isdigit()) for c in symbol):
+        return None
+    digits = len(symbol) - len(symbol.rstrip("0123456789"))
+    if digits not in (1, 2) or len(symbol) < digits + 2:
+        return None
+    head, year = symbol[:-digits], symbol[-digits:]
+    root, code = head[:-1], head[-1]
+    month = {"H": 3, "M": 6, "U": 9, "Z": 12}.get(code)
+    if month is None or root not in FUTURES:
+        return None
+    return root, month, int(year)
+
+
 @lru_cache(maxsize=1 << 16)
 def occ(symbol: str) -> tuple[str, dt.date, str, float] | None:
     """Root, expiry, ``C``/``P`` and strike of a compact OCC symbol, else None."""
@@ -94,11 +114,12 @@ class Book:
     def set_now(self, ns: int) -> None:
         """The session's time. At a new New York day every quote is cleared, as in the
         simulator, so nothing is served from yesterday's book; and expired contracts
-        drop out."""
+        drop out. Futures trade through midnight: their quotes stay."""
         today = dt.datetime.fromtimestamp(ns / 1e9, NEW_YORK).date()
         if self.today is not None and today > self.today:
-            self._quotes.clear()
-            self._quoted.clear()
+            keep = {i for i, s in self.symbols.items() if future(s) is not None}
+            self._quotes = {i: q for i, q in self._quotes.items() if i in keep}
+            self._quoted &= keep
         self.today = today
 
     def apply(self, rec) -> None:

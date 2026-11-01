@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace as NS
 
 from tinytrader_client import combo, single
-from tinytrader_client.book import CBBO_1M, SYMBOL_MAPPING, Book, Quote, compact, occ
+from tinytrader_client.book import CBBO_1M, SYMBOL_MAPPING, Book, Quote, compact, future, occ
 
 
 class Units(unittest.TestCase):
@@ -32,6 +32,11 @@ class Units(unittest.TestCase):
             single("SPY", "buy", "open", 1, 1.234)
         with self.assertRaises(ValueError):
             combo([("SPY261027P00570000", 1, "sell", "open")], 1, -0.004)
+        f = single("ESZ6", "sell", "open", 1, "7743.25")
+        self.assertEqual(f["instrument"], {"class": "future", "symbol": "ESZ6"})
+        self.assertEqual(future("MESH27"), ("MES", 3, 27))
+        for bad in ["ESZ6-ESH7", "ESF6", "XXZ6", "Eé6", "ESZ", "SPY"]:
+            self.assertIsNone(future(bad), bad)
 
 
 class BookTests(unittest.TestCase):
@@ -71,6 +76,17 @@ class BookTests(unittest.TestCase):
         # A contract given a new id loses the old id's quote.
         b.apply(self.mapping(3, "SPY   261030C00754000"))
         self.assertIsNone(b.quote("SPY261030C00754000"))
+
+    def test_a_futures_quote_stays_across_midnight(self):
+        b = Book()
+        b.set_now(self.D27 + 3 * 3_600_000_000_000)  # 23:00 New York, the 26th
+        b.apply(self.mapping(20, "ESZ6"))
+        b.apply(self.mapping(1, "SPY   261027C00749000"))
+        b.apply(self.quote(20, self.D27, 7743.50))
+        b.apply(self.quote(1, self.D27, 1.25))
+        b.set_now(self.D27 + 5 * 3_600_000_000_000)  # 01:00, the 27th
+        self.assertAlmostEqual(b.quote("ESZ6").ask, 7743.50)
+        self.assertIsNone(b.quote("SPY261027C00749000"))
 
 
 if __name__ == "__main__":
