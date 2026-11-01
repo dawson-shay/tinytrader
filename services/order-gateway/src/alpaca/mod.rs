@@ -298,6 +298,18 @@ impl Broker for AlpacaPaper {
     }
 
     fn submit(&mut self, intent: &Intent) -> SubmitResult {
+        // Alpaca trades no futures, and its gateway refuses them before here; were one
+        // to arrive, it is refused here too, with nothing sent.
+        if intent
+            .legs
+            .iter()
+            .any(|l| l.class == crate::intent::Class::Future)
+        {
+            return SubmitResult::Rejected(BrokerError::local(
+                "unsupported",
+                "Alpaca trades no futures",
+            ));
+        }
         let legs: Vec<LegSpec<'_>> = intent
             .legs
             .iter()

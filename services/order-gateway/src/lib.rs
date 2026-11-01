@@ -19,7 +19,7 @@ mod session;
 mod sim;
 
 pub use alpaca::{AlpacaOptions, AlpacaPaper, load_credentials, trading};
-pub use intent::{Intent, Leg, MaxLoss, max_loss};
+pub use intent::{Class, Intent, Leg, MaxLoss, future_multiplier, max_loss};
 pub use protocol::{KillLevel, MAX_LINE, SCHEMA};
 pub use safety::Profile;
 pub use server::{

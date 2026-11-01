@@ -169,6 +169,14 @@ pub fn future_multiplier(root: &str) -> Option<u64> {
 /// as CME lists them (`ESZ6`, `MESH27`). Spreads (`ESZ6-ESH7`) are not outrights.
 #[must_use]
 pub fn future(symbol: &str) -> Option<(&str, u32, u32)> {
+    // ASCII letters and digits only, so every slice below is on a char boundary.
+    if !(3..=8).contains(&symbol.len())
+        || !symbol
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
     let digits = symbol.bytes().rev().take_while(u8::is_ascii_digit).count();
     if !(1..=2).contains(&digits) || symbol.len() < digits + 2 {
         return None;
@@ -1096,7 +1104,24 @@ mod tests {
         assert_eq!(future("MESH27"), Some(("MES", 3, 27)));
         assert_eq!(future("M2KU6"), Some(("M2K", 9, 6)));
         // Not quarterly, a spread, an unknown root, no year.
-        for bad in ["ESF6", "ESZ6-ESH7", "XXZ6", "ESZ", "ESZ123", "Z6"] {
+        for bad in [
+            "",
+            "6",
+            "Z6",
+            "ESZ",
+            "ESF6",
+            "ESZ6-ESH7",
+            "XXZ6",
+            "ESZ123",
+            "Eé6",
+            "ÉSZ6",
+            "ESé6",
+            "esz6",
+            "ES Z6",
+            "ESZ6\n",
+            "MESZ6MESZ6",
+            "\u{0}SZ6",
+        ] {
             assert_eq!(future(bad), None, "{bad}");
         }
         assert_eq!(future_multiplier("ES"), Some(50));

@@ -1031,3 +1031,37 @@ fn a_cleared_id_stays_reserved_and_stays_cleared_across_a_restart() {
         .count();
     assert_eq!(cleared, 1);
 }
+
+/// Alpaca trades no futures: with ES allowed, a futures order (open or close) is
+/// refused before anything is sent. The welcome lists the futures roots, and a
+/// held ES position isn't foreign at reconcile while an NQ one (not allowed) is.
+#[test]
+fn alpaca_refuses_futures_and_reconciles_allowed_roots() {
+    let fake = Fake::start();
+    fake.hold(&[("ESZ6", 1), ("NQZ6", -1)]);
+    let r = boot(fake, root("alpaca-futures"), 1, |p| {
+        p.futures = vec!["ES".into()];
+        p.max_future_qty = 2;
+    });
+    let mut c = ready(&r.gw, "reactor");
+    let welcome: Value = serde_json::from_str(&c.lines[0]).unwrap();
+    assert_eq!(welcome["limits"]["futures"][0], "ES", "{welcome}");
+    let foreign: Vec<String> = c
+        .lines
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["kind"] == "foreign")
+        .filter_map(|v| v["symbol"].as_str().map(String::from))
+        .collect();
+    assert_eq!(foreign, vec!["NQZ6".to_owned()]);
+    for (rid, effect) in [("r1", "open"), ("r2", "close")] {
+        let intent = format!(
+            r#"{{"client_order_id":"wse-es-{effect}","shape":"single","instrument":{{"class":"future","symbol":"ESZ6"}},"side":"sell","effect":"{effect}","qty":1,"type":"limit","limit_price":"7743.25","time_in_force":"day"}}"#
+        );
+        let v = c.submit(rid, &intent);
+        assert_eq!(v["outcome"], "not_sent", "{v}");
+        assert_eq!(v["detail"]["class"], "future", "{v}");
+    }
+    assert!(posts(&r.fake).is_empty());
+    r.gw.stop().unwrap();
+}

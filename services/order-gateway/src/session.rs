@@ -2159,8 +2159,9 @@ impl<B: Broker> Session<B> {
                     .filter(|p| {
                         occ(&p.symbol).is_none()
                             && !equities.contains(&p.symbol)
-                            && !crate::intent::future(&p.symbol)
-                                .is_some_and(|(root, _, _)| futures.iter().any(|f| f == root))
+                            && (futures.is_empty()
+                                || !crate::intent::future(&p.symbol)
+                                    .is_some_and(|(root, _, _)| futures.iter().any(|f| f == root)))
                     })
                     .map(|p| {
                         let f = Obj::new()

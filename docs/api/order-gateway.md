@@ -236,7 +236,7 @@ FUTURE = ROOT [HMUZ] \d{1,2}         (an outright of a known root, e.g. ESZ6, ME
 - underlyings (`--underlyings ROOT,...`, default **none**: a gateway started without it refuses every option order, except from an `--any-underlying-client`), class `option`
 - clients allowed options on any underlying (`--any-underlying-client NAME`, repeatable, default none): for a manual trading client such as the console's. Only the underlying check is skipped, and only for that client's orders; every cap and the kill switch still apply, and other clients on the account keep the list. The name must be a `trade` client. The profile in `welcome` lists them as `any_underlying_clients` when there are any.
 - stocks (`--equities`, default none), and whether short sales are allowed (`--allow-short`, default no)
-- futures roots (`--futures ES,...`, default none), class `future`; the profile in `welcome` lists them, with `max_future_qty`, only when there are any
+- futures roots (`--futures ES,...`, default none; each must be a known root), class `future`; the profile in `welcome` lists them, with `max_future_qty`, only when there are any
 - shapes and maximum legs
 - the caps in [section 8](#8-rate-budget-and-caps)
 
