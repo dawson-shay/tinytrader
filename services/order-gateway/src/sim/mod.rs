@@ -562,6 +562,8 @@ impl Broker for SimBroker {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             combo: true,
+            // Until the simulator models futures (margin, hours, settlement).
+            futures: false,
             max_legs: 4,
             client_order_id_max: 128,
             idempotency: "broker_client_id",

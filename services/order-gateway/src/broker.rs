@@ -8,6 +8,8 @@ pub use crate::protocol::OrderRef;
 #[derive(Clone, Debug)]
 pub struct Capabilities {
     pub combo: bool,
+    /// Whether it trades futures.
+    pub futures: bool,
     pub max_legs: usize,
     pub client_order_id_max: usize,
     pub idempotency: &'static str,

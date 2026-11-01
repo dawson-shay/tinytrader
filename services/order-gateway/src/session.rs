@@ -1406,7 +1406,24 @@ impl<B: Broker> Session<B> {
         let caps = self.b.capabilities();
         for l in &intent.legs {
             let p = &self.cfg.profile;
-            if l.equity {
+            if l.class == crate::intent::Class::Future {
+                let root = crate::intent::future(&l.symbol).map_or("", |(r, _, _)| r);
+                if !caps.futures {
+                    return Some(not_sent(
+                        "unsupported",
+                        &Obj::new()
+                            .s("broker", self.b.kind())
+                            .s("class", "future")
+                            .done(),
+                    ));
+                }
+                if !p.futures.iter().any(|f| f == root) {
+                    let detail = Obj::new().s("future", root).done();
+                    return Some(not_sent("unsupported", &detail));
+                }
+                continue;
+            }
+            if l.class == crate::intent::Class::Equity {
                 if !p.equities.contains(&l.symbol) {
                     let detail = Obj::new().s("equity", &l.symbol).done();
                     return Some(not_sent("unsupported", &detail));
@@ -1474,8 +1491,13 @@ impl<B: Broker> Session<B> {
         if opening && intent.market {
             return Some(not_sent("market_opening_refused", "null"));
         }
+        // An opening future is capped at its contract count: its loss isn't bounded
+        // by its price.
+        if opening && intent.is_future() && intent.qty > p.max_future_qty {
+            return Some(cap("future_qty"));
+        }
         // An opening intent is capped at what it can lose; a close is never checked.
-        let loss = if opening {
+        let loss = if opening && !intent.is_future() {
             max_loss(intent).map(|m| m.cents)
         } else {
             Ok(0)
@@ -2130,10 +2152,16 @@ impl<B: Broker> Session<B> {
                 // Positions outside the allowlist: options are the account's own business,
                 // and so are allowlisted stocks.
                 let equities = &self.cfg.profile.equities;
+                let futures = &self.cfg.profile.futures;
                 let theirs: Vec<(String, String)> = r
                     .value
                     .iter()
-                    .filter(|p| occ(&p.symbol).is_none() && !equities.contains(&p.symbol))
+                    .filter(|p| {
+                        occ(&p.symbol).is_none()
+                            && !equities.contains(&p.symbol)
+                            && !crate::intent::future(&p.symbol)
+                                .is_some_and(|(root, _, _)| futures.iter().any(|f| f == root))
+                    })
                     .map(|p| {
                         let f = Obj::new()
                             .s("symbol", &p.symbol)
@@ -2803,6 +2831,8 @@ mod tests {
         order_429: Option<u64>,
         /// What the open listing returns.
         listing: Vec<BrokerOrder>,
+        /// Whether it says it trades futures.
+        futures: bool,
         /// What a by-id lookup finds; any other client id is a 404.
         found: Vec<BrokerOrder>,
         /// What the next drain delivers.
@@ -2833,6 +2863,7 @@ mod tests {
         fn capabilities(&self) -> Capabilities {
             Capabilities {
                 combo: true,
+                futures: self.futures,
                 max_legs: 4,
                 client_order_id_max: 128,
                 idempotency: "client_order_id",
@@ -2978,6 +3009,7 @@ mod tests {
             account_ok: false,
             order_429: None,
             listing: Vec::new(),
+            futures: false,
             found: Vec::new(),
             updates: Vec::new(),
         };
@@ -3467,5 +3499,40 @@ mod tests {
         ))
         .unwrap();
         Intent::parse(v).unwrap_or_else(|_| panic!("close intent"))
+    }
+
+    /// A future is admitted only by a broker that trades futures, on an allowed root,
+    /// and up to the contract cap; it skips the max-loss cap.
+    #[test]
+    fn futures_admission() {
+        let (mut s, _) = session("futures-admission", None);
+        let es = |cid: &str, qty: u32| {
+            Intent::parse(serde_json::json!({"client_order_id":cid,"shape":"single",
+                "instrument":{"class":"future","symbol":"ESZ6"},"side":"sell","effect":"open",
+                "qty":qty,"type":"limit","limit_price":"7743.25","time_in_force":"day"}))
+            .unwrap()
+        };
+        let reason = |r: Option<String>| -> serde_json::Value {
+            r.map_or(serde_json::Value::Null, |t| {
+                serde_json::from_str(&t).unwrap()
+            })
+        };
+        // A broker without futures (Alpaca's, say), even with the root allowed.
+        s.cfg.profile.futures = vec!["ES".into()];
+        let r = reason(s.refusal("alice", "wse-", &es("wse-f1", 1)));
+        assert_eq!(r["reason"], "unsupported", "{r}");
+        assert_eq!(r["detail"]["class"], "future", "{r}");
+        // A broker with futures, the root not allowed.
+        s.b.futures = true;
+        s.cfg.profile.futures = vec!["NQ".into()];
+        let r = reason(s.refusal("alice", "wse-", &es("wse-f2", 1)));
+        assert_eq!(r["detail"]["future"], "ES", "{r}");
+        // Allowed: over the contract cap, then within it (a short, which a loss cap
+        // would call unbounded).
+        s.cfg.profile.futures = vec!["ES".into()];
+        s.cfg.profile.max_future_qty = 2;
+        let r = reason(s.refusal("alice", "wse-", &es("wse-f3", 3)));
+        assert_eq!(r["detail"]["cap"], "future_qty", "{r}");
+        assert_eq!(s.refusal("alice", "wse-", &es("wse-f4", 2)), None);
     }
 }

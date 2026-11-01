@@ -20,6 +20,7 @@ const HELP: &str = "order-gateway --account NAME --broker sim|alpaca-paper|alpac
     [--environment paper] [--credentials-file FILE | --credentials env] [--listen-any] [--allow-live]
     [--sim-script FILE] [--sim-quotes DBN_FILE|tcp:HOST:PORT|relay:HOST:PORT]
     [--underlyings ROOT,..] [--any-underlying-client NAME ...] [--equities AAPL,..] [--allow-short]
+    [--futures ES,MES,..] [--max-future-qty N]
     [--max-open N] [--max-legs N] [--max-notional DOLLARS]
     [--submits-per-min N] [--submits-per-day N] [--closes-per-min N] [--max-rejects N] [--budget N] [--min-options-level N]
     [--resolve-ms 1000,2000,4000] [--forbid-state-under DIR ...] [--test-stall-after-admitted]
@@ -190,6 +191,14 @@ fn parse(args: &[String]) -> Result<(Config, [Option<String>; 3]), String> {
             s.split(',').map(String::from).collect()
         }),
         allow_short,
+        futures: take("--futures").map_or(d.futures.clone(), |s| {
+            s.split(',').map(String::from).collect()
+        }),
+        max_future_qty: n32(
+            take("--max-future-qty"),
+            "--max-future-qty",
+            d.max_future_qty,
+        )?,
         max_legs: n(take("--max-legs"), "--max-legs", d.max_legs)?,
         max_open: n(take("--max-open"), "--max-open", d.max_open)?,
         max_notional_cents: i64::try_from(

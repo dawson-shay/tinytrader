@@ -276,6 +276,7 @@ impl Broker for AlpacaPaper {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             combo: true,
+            futures: false,
             max_legs: 4,
             client_order_id_max: 128,
             idempotency: "broker_client_id",
@@ -305,7 +306,7 @@ impl Broker for AlpacaPaper {
                 ratio: l.ratio,
                 buy: l.buy,
                 open: l.open,
-                equity: l.equity,
+                equity: l.class == crate::intent::Class::Equity,
             })
             .collect();
         let price = fmt_cents(intent.limit_cents);
