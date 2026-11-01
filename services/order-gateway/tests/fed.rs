@@ -1138,3 +1138,43 @@ fn rate_limits_count_market_minutes() {
     assert_eq!(c.submit("r4", &rest("wse-rate-4"))["outcome"], "accepted");
     gw.stop().unwrap();
 }
+
+/// Under a session, the lookups of an order whose outcome is unknown keep their
+/// spacing on the market clock: after a jump (an hour, in one step) real time can
+/// run on, and the order isn't written off until the market time has covered the
+/// remaining gaps.
+#[test]
+fn resolve_lookups_keep_their_spacing_after_a_jump() {
+    let (gw, feed, clock) = gateway(
+        "fed-resolve-jump",
+        r#"{"rules":[{"nth":1,"submit":"error_before_send"}],"expiry":{"settle":false}}"#,
+    );
+    let mut c = Conn::open(&gw, "reactor", None);
+    mappings(&feed);
+    cbbo(&feed, 3, T0, 50, 52);
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    let r = c.submit("r1", &single("wse-jump", PUT_B, "buy", "open", 1, "0.01"));
+    assert_eq!(r["outcome"], "unknown", "{r}");
+    let jump = T0 + 3600 * S;
+    clock.advance("reactor", 1, jump, WAIT).unwrap();
+    // Real time runs on; the market clock doesn't.
+    std::thread::sleep(Duration::from_millis(400));
+    let a = clock.advance("reactor", 0, jump, WAIT).unwrap();
+    let seen = c.until(|v| v["seq"].as_u64() == Some(a.last_seq));
+    assert!(
+        !seen.iter().any(|v| v["kind"] == "resolution"),
+        "written off within one step: {seen:?}"
+    );
+    // Then the market covers the gaps (20 ms, then 40 ms): it settles as absent.
+    let ms = 1_000_000;
+    for t in [jump + 25 * ms, jump + 70 * ms] {
+        clock.advance("reactor", 0, t, WAIT).unwrap();
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    let a = clock.advance("reactor", 0, jump + 70 * ms, WAIT).unwrap();
+    let seen = c.until(|v| v["seq"].as_u64() == Some(a.last_seq));
+    let res: Vec<_> = seen.iter().filter(|v| v["kind"] == "resolution").collect();
+    assert_eq!(res.len(), 1, "{seen:?}");
+    assert_eq!(res[0]["outcome"], "absent_after", "{seen:?}");
+    gw.stop().unwrap();
+}
