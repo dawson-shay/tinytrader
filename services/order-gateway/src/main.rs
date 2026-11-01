@@ -20,6 +20,7 @@ const HELP: &str = "order-gateway --account NAME --broker sim|alpaca-paper|alpac
     [--environment paper] [--credentials-file FILE | --credentials env] [--listen-any] [--allow-live]
     [--sim-script FILE] [--sim-quotes DBN_FILE|tcp:HOST:PORT|relay:HOST:PORT]
     [--underlyings ROOT,..] [--any-underlying-client NAME ...] [--equities AAPL,..] [--allow-short]
+    [--futures ES,MES,..] [--max-future-qty N]
     [--max-open N] [--max-legs N] [--max-notional DOLLARS]
     [--submits-per-min N] [--submits-per-day N] [--closes-per-min N] [--max-rejects N] [--budget N] [--min-options-level N]
     [--resolve-ms 1000,2000,4000] [--forbid-state-under DIR ...] [--test-stall-after-admitted]
@@ -190,6 +191,29 @@ fn parse(args: &[String]) -> Result<(Config, [Option<String>; 3]), String> {
             s.split(',').map(String::from).collect()
         }),
         allow_short,
+        futures: match take("--futures") {
+            None => d.futures.clone(),
+            Some(s) => {
+                let roots: Vec<String> = s.split(',').map(String::from).collect();
+                if let Some(bad) = roots
+                    .iter()
+                    .find(|r| order_gateway::future_multiplier(r).is_none())
+                {
+                    return Err(format!(
+                        "--futures: {bad:?} isn't a known futures root (ES, MES, NQ, MNQ, RTY, M2K, YM)"
+                    ));
+                }
+                roots
+            }
+        },
+        max_future_qty: match n32(
+            take("--max-future-qty"),
+            "--max-future-qty",
+            d.max_future_qty,
+        )? {
+            0 => return Err("--max-future-qty: at least 1".into()),
+            n => n,
+        },
         max_legs: n(take("--max-legs"), "--max-legs", d.max_legs)?,
         max_open: n(take("--max-open"), "--max-open", d.max_open)?,
         max_notional_cents: i64::try_from(
@@ -417,5 +441,16 @@ mod tests {
             !e.contains("allow-live") && !e.contains("doesn't match"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn futures_flags_take_known_roots_and_a_positive_cap() {
+        let sim = ["--broker", "alpaca-paper"];
+        let with = |more: &[&str]| refusal(&[&sim[..], more].concat());
+        let e = with(&["--futures", "es"]);
+        assert!(e.contains("isn't a known futures root"), "{e}");
+        assert!(with(&["--futures", "ES,ESZ6"]).contains("\"ESZ6\""));
+        assert!(with(&["--max-future-qty", "0"]).contains("at least 1"));
+        assert!(!with(&["--futures", "ES,MES", "--max-future-qty", "2"]).contains("futures"));
     }
 }

@@ -4,13 +4,34 @@ use crate::safety::days_from_civil;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+/// What a leg trades.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Class {
+    /// An option contract (compact OCC symbol).
+    Option,
+    /// Shares (a ticker; single orders only).
+    Equity,
+    /// A futures contract (an outright such as `ESZ6`; single orders only).
+    Future,
+}
+
+impl Class {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Option => "option",
+            Self::Equity => "equity",
+            Self::Future => "future",
+        }
+    }
+}
+
 /// One leg; a single order is one leg with ratio 1.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Leg {
-    /// Compact OCC symbol, or a stock's ticker when `equity`.
+    /// Compact OCC symbol, a stock's ticker, or a future's outright symbol.
     pub symbol: String,
-    /// `class: equity` (shares; single orders only); otherwise `option`.
-    pub equity: bool,
+    /// What it trades.
+    pub class: Class,
     /// Ratio per parent unit (1 for a single).
     pub ratio: u32,
     /// `side: buy`.
@@ -124,29 +145,80 @@ pub(crate) fn ticker(symbol: &str) -> bool {
         && class.bytes().all(|b| b.is_ascii_uppercase())
 }
 
-/// `(symbol, equity)`.
-fn instrument(f: &mut Fields) -> Result<(String, bool), Invalid> {
+/// The futures roots the gateway knows, with their multipliers (dollars per point):
+/// the CME equity index futures, which expire quarterly (March, June, September,
+/// December) on the third Friday.
+const FUTURES: [(&str, u64); 7] = [
+    ("ES", 50),
+    ("MES", 5),
+    ("NQ", 20),
+    ("MNQ", 2),
+    ("RTY", 50),
+    ("M2K", 5),
+    ("YM", 5),
+];
+
+/// A known futures root's multiplier.
+#[must_use]
+pub fn future_multiplier(root: &str) -> Option<u64> {
+    FUTURES.iter().find(|(r, _)| *r == root).map(|(_, m)| *m)
+}
+
+/// The root, month (1 to 12) and year digits of an outright futures symbol of a known
+/// root: the root, a quarterly month code (H, M, U, Z) and one or two digits of year,
+/// as CME lists them (`ESZ6`, `MESH27`). Spreads (`ESZ6-ESH7`) are not outrights.
+#[must_use]
+pub fn future(symbol: &str) -> Option<(&str, u32, u32)> {
+    // ASCII letters and digits only, so every slice below is on a char boundary.
+    if !(3..=8).contains(&symbol.len())
+        || !symbol
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
+    {
+        return None;
+    }
+    let digits = symbol.bytes().rev().take_while(u8::is_ascii_digit).count();
+    if !(1..=2).contains(&digits) || symbol.len() < digits + 2 {
+        return None;
+    }
+    let (head, year) = symbol.split_at(symbol.len() - digits);
+    let (root, code) = head.split_at(head.len() - 1);
+    let month = match code {
+        "H" => 3,
+        "M" => 6,
+        "U" => 9,
+        "Z" => 12,
+        _ => return None,
+    };
+    future_multiplier(root)?;
+    Some((root, month, year.parse().ok()?))
+}
+
+/// `(symbol, class)`.
+fn instrument(f: &mut Fields) -> Result<(String, Class), Invalid> {
     let mut i = Fields::new(f.req("instrument")?, &f.at("instrument"))?;
-    let equity = match i.string("class")?.as_str() {
-        "option" => false,
-        "equity" => true,
-        _ => return Err(invalid(&i.at("class"), "option or equity")),
+    let class = match i.string("class")?.as_str() {
+        "option" => Class::Option,
+        "equity" => Class::Equity,
+        "future" => Class::Future,
+        _ => return Err(invalid(&i.at("class"), "option, equity or future")),
     };
     let symbol = i.string("symbol")?;
-    if equity && !ticker(&symbol) {
-        return Err(invalid(
-            &i.at("symbol"),
-            "a stock ticker such as AAPL or BRK.B",
-        ));
-    }
-    if !equity && occ(&symbol).is_none() {
-        return Err(invalid(
-            &i.at("symbol"),
-            "compact OCC symbol with a valid date",
-        ));
+    let valid = match class {
+        Class::Equity => ticker(&symbol),
+        Class::Option => occ(&symbol).is_some(),
+        Class::Future => future(&symbol).is_some(),
+    };
+    if !valid {
+        let want = match class {
+            Class::Equity => "a stock ticker such as AAPL or BRK.B",
+            Class::Option => "compact OCC symbol with a valid date",
+            Class::Future => "an outright of a known futures root, such as ESZ6",
+        };
+        return Err(invalid(&i.at("symbol"), want));
     }
     i.finish()?;
-    Ok((symbol, equity))
+    Ok((symbol, class))
 }
 
 fn side_effect(f: &mut Fields) -> Result<(bool, bool), Invalid> {
@@ -188,8 +260,8 @@ impl Intent {
             let mut legs = Vec::new();
             for (n, v) in raw.into_iter().enumerate() {
                 let mut l = Fields::new(v, &format!("{path}[{n}]"))?;
-                let (symbol, equity) = instrument(&mut l)?;
-                if equity {
+                let (symbol, class) = instrument(&mut l)?;
+                if class != Class::Option {
                     return Err(invalid(&format!("{path}[{n}]"), "combos are options only"));
                 }
                 let ratio = u32::try_from(l.int("ratio", 1, 10_000)?).unwrap_or(1);
@@ -200,7 +272,7 @@ impl Intent {
                 }
                 legs.push(Leg {
                     symbol,
-                    equity,
+                    class,
                     ratio,
                     buy,
                     open,
@@ -211,11 +283,11 @@ impl Intent {
             }
             legs
         } else {
-            let (symbol, equity) = instrument(&mut f)?;
+            let (symbol, class) = instrument(&mut f)?;
             let (buy, open) = side_effect(&mut f)?;
             vec![Leg {
                 symbol,
-                equity,
+                class,
                 ratio: 1,
                 buy,
                 open,
@@ -240,7 +312,7 @@ impl Intent {
             })?;
         let on_close = match f.string("time_in_force")?.as_str() {
             "day" => false,
-            "cls" if !combo && legs[0].equity && !market => true,
+            "cls" if !combo && legs[0].class == Class::Equity && !market => true,
             _ => {
                 return Err(invalid(
                     &f.at("time_in_force"),
@@ -263,13 +335,28 @@ impl Intent {
     /// Whether this is a stock order (a single equity leg).
     #[must_use]
     pub fn is_equity(&self) -> bool {
-        !self.combo && self.legs[0].equity
+        !self.combo && self.legs[0].class == Class::Equity
     }
 
-    /// Dollars per unit of price: 100 for an option contract, 1 for a share.
+    /// Whether this is a futures order (a single futures leg).
+    #[must_use]
+    pub fn is_future(&self) -> bool {
+        !self.combo && self.legs[0].class == Class::Future
+    }
+
+    /// Dollars per unit of price: 100 for an option contract, 1 for a share, the root's
+    /// for a future (50 for ES).
     #[must_use]
     pub fn multiplier(&self) -> u64 {
-        if self.is_equity() { 1 } else { 100 }
+        if self.is_equity() {
+            1
+        } else if self.is_future() {
+            future(&self.legs[0].symbol)
+                .and_then(|(root, _, _)| future_multiplier(root))
+                .unwrap_or(1)
+        } else {
+            100
+        }
     }
 
     /// Whether any leg opens a position.
@@ -283,7 +370,7 @@ impl Intent {
     pub fn canonical(&self) -> String {
         let instrument = |l: &Leg| {
             Obj::new()
-                .s("class", if l.equity { "equity" } else { "option" })
+                .s("class", l.class.name())
                 .s("symbol", &l.symbol)
                 .done()
         };
@@ -378,10 +465,14 @@ fn single_loss(leg: &Leg, limit: i128) -> Result<i128, &'static str> {
     if !leg.open {
         return Err("max_loss_unknown");
     }
+    // A future's risk is capped by its contract count, not a loss bound.
+    if leg.class == Class::Future {
+        return Err("max_loss_future");
+    }
     if leg.buy {
         return Ok(limit);
     }
-    if leg.equity {
+    if leg.class == Class::Equity {
         return Err("max_loss_unbounded");
     }
     match contract(&leg.symbol) {
@@ -522,7 +613,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Intent, Leg, MaxLoss, max_loss};
+    use super::{Class, Intent, Leg, MaxLoss, max_loss};
 
     fn max_loss_cents(o: &Intent) -> Result<u64, &'static str> {
         max_loss(o).map(|m| m.cents)
@@ -542,7 +633,7 @@ mod tests {
     fn leg(symbol: &str, buy: bool, open: bool) -> Leg {
         Leg {
             symbol: symbol.into(),
-            equity: false,
+            class: Class::Option,
             ratio: 1,
             buy,
             open,
@@ -559,7 +650,7 @@ mod tests {
     fn share(buy: bool, open: bool) -> Leg {
         Leg {
             symbol: "AAPL".into(),
-            equity: true,
+            class: Class::Equity,
             ratio: 1,
             buy,
             open,
@@ -1004,5 +1095,61 @@ mod tests {
         // A naked short call next to a long put is unbounded above the call strike.
         let mixed = order(vec![leg(C580, false, true), leg(P570, true, true)], -100, 1);
         assert_eq!(max_loss_cents(&mixed), Err("max_loss_unbounded"));
+    }
+
+    #[test]
+    fn futures_symbols() {
+        use super::{future, future_multiplier};
+        assert_eq!(future("ESZ6"), Some(("ES", 12, 6)));
+        assert_eq!(future("MESH27"), Some(("MES", 3, 27)));
+        assert_eq!(future("M2KU6"), Some(("M2K", 9, 6)));
+        // Not quarterly, a spread, an unknown root, no year.
+        for bad in [
+            "",
+            "6",
+            "Z6",
+            "ESZ",
+            "ESF6",
+            "ESZ6-ESH7",
+            "XXZ6",
+            "ESZ123",
+            "Eé6",
+            "ÉSZ6",
+            "ESé6",
+            "esz6",
+            "ES Z6",
+            "ESZ6\n",
+            "MESZ6MESZ6",
+            "\u{0}SZ6",
+        ] {
+            assert_eq!(future(bad), None, "{bad}");
+        }
+        assert_eq!(future_multiplier("ES"), Some(50));
+        assert_eq!(future_multiplier("MNQ"), Some(2));
+    }
+
+    #[test]
+    fn a_future_is_a_single_and_its_risk_is_its_contracts() {
+        let v = |class: &str, symbol: &str, side: &str| {
+            serde_json::json!({"client_order_id":"f-1","shape":"single",
+                "instrument":{"class":class,"symbol":symbol},"side":side,"effect":"open",
+                "qty":2,"type":"limit","limit_price":"7743.25","time_in_force":"day"})
+        };
+        let o = Intent::parse(v("future", "ESZ6", "sell")).unwrap();
+        assert_eq!(o.legs[0].class, Class::Future);
+        assert!(o.is_future() && !o.is_equity());
+        assert_eq!(o.multiplier(), 50);
+        assert_eq!(max_loss_cents(&o), Err("max_loss_future"));
+        assert!(
+            o.canonical()
+                .contains(r#""class":"future","symbol":"ESZ6""#)
+        );
+        assert!(Intent::parse(v("future", "AAPL", "buy")).is_err());
+        assert!(Intent::parse(v("future", "ESZ6-ESH7", "buy")).is_err());
+        let combo = serde_json::json!({"client_order_id":"f-2","shape":"combo","legs":[
+            {"instrument":{"class":"future","symbol":"ESZ6"},"ratio":1,"side":"buy","effect":"open"},
+            {"instrument":{"class":"future","symbol":"ESH7"},"ratio":1,"side":"sell","effect":"open"}],
+            "qty":1,"type":"limit","limit_price":"10.00","time_in_force":"day"});
+        assert!(Intent::parse(combo).is_err(), "futures combos are refused");
     }
 }

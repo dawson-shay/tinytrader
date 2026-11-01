@@ -18,6 +18,11 @@ pub struct Profile {
     pub equities: Vec<String>,
     /// Whether a stock may be sold to open (a short sale).
     pub allow_short: bool,
+    /// Allowed futures roots (outrights, single orders); none by default.
+    pub futures: Vec<String>,
+    /// The most futures contracts one opening order may trade. A future's loss
+    /// isn't bounded by its price, so this, not the notional cap, bounds it.
+    pub max_future_qty: u32,
     /// Maximum combo legs.
     pub max_legs: usize,
     /// Working orders, including unknown outcomes.
@@ -46,6 +51,8 @@ impl Default for Profile {
             any_underlying_clients: Vec::new(),
             equities: Vec::new(),
             allow_short: false,
+            futures: Vec::new(),
+            max_future_qty: 1,
             max_legs: 4,
             max_open: 4,
             max_notional_cents: 250_000,
@@ -72,8 +79,15 @@ impl Profile {
             );
             o = o.raw("any_underlying_clients", &a);
         }
-        o.raw("equities", &e)
-            .s("allow_short", if self.allow_short { "yes" } else { "no" })
+        o = o.raw("equities", &e);
+        // Only where futures are allowed, so a profile without them pins as before.
+        if !self.futures.is_empty() {
+            let f = crate::protocol::arr(self.futures.iter().map(|s| crate::protocol::quote(s)));
+            o = o
+                .raw("futures", &f)
+                .n("max_future_qty", self.max_future_qty);
+        }
+        o.s("allow_short", if self.allow_short { "yes" } else { "no" })
             .n("max_legs", self.max_legs)
             .n("max_open", self.max_open)
             .s("max_notional", &fmt_cents(self.max_notional_cents))

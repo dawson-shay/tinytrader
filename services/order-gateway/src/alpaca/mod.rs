@@ -276,6 +276,7 @@ impl Broker for AlpacaPaper {
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             combo: true,
+            futures: false,
             max_legs: 4,
             client_order_id_max: 128,
             idempotency: "broker_client_id",
@@ -297,6 +298,18 @@ impl Broker for AlpacaPaper {
     }
 
     fn submit(&mut self, intent: &Intent) -> SubmitResult {
+        // Alpaca trades no futures, and its gateway refuses them before here; were one
+        // to arrive, it is refused here too, with nothing sent.
+        if intent
+            .legs
+            .iter()
+            .any(|l| l.class == crate::intent::Class::Future)
+        {
+            return SubmitResult::Rejected(BrokerError::local(
+                "unsupported",
+                "Alpaca trades no futures",
+            ));
+        }
         let legs: Vec<LegSpec<'_>> = intent
             .legs
             .iter()
@@ -305,7 +318,7 @@ impl Broker for AlpacaPaper {
                 ratio: l.ratio,
                 buy: l.buy,
                 open: l.open,
-                equity: l.equity,
+                equity: l.class == crate::intent::Class::Equity,
             })
             .collect();
         let price = fmt_cents(intent.limit_cents);

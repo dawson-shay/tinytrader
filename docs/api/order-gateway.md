@@ -204,7 +204,8 @@ intent = {
   client_order_id,
   shape: "single" | "combo",
   // single:
-  instrument: {class: "option", symbol: OCC} | {class: "equity", symbol: TICKER},
+  instrument: {class: "option", symbol: OCC} | {class: "equity", symbol: TICKER}
+            | {class: "future", symbol: FUTURE},
   side: "buy"|"sell",  effect: "open"|"close",
   // combo:
   legs: [{instrument, ratio: int ≥ 1, side, effect}]   // 2..=4 legs, distinct symbols, gcd(ratios) = 1
@@ -216,6 +217,7 @@ intent = {
 }
 OCC    = ^[A-Z]{1,6}\d{6}[CP]\d{8}$   (compact, spaces removed)
 TICKER = ^[A-Z]{1,5}(\.[A-Z])?$       (e.g. AAPL, BRK.B)
+FUTURE = ROOT [HMUZ] \d{1,2}         (an outright of a known root, e.g. ESZ6, MESH27)
 ```
 
 **Protocol validation** always runs:
@@ -226,12 +228,15 @@ TICKER = ^[A-Z]{1,5}(\.[A-Z])?$       (e.g. AAPL, BRK.B)
 - the leg rules hold
 - the id grammar and prefix are correct
 
+**Futures orders** are single outrights of a known root, with its multiplier: ES 50, MES 5, NQ 20, MNQ 2, RTY 50, M2K 5, YM 5 (dollars per point). These are the CME equity index futures, which expire quarterly. Spreads (`ESZ6-ESH7`) and combos with a `future` leg are invalid. A broker must say it trades futures (Alpaca doesn't, so its gateway refuses them with `not_sent{unsupported}`, `detail.class = "future"`). The root must be in the profile's `--futures` list. An opening future isn't held to the maximum-loss cap, since its loss isn't bounded by its price; `--max-future-qty` (1 by default) caps its contracts instead (`not_sent{cap}`, `future_qty`). The open-order and per-minute caps apply as to any order.
+
 **Stock orders** are single legs only: a combo with an `equity` leg is invalid. `side: sell` with `effect: open` is a short sale. Limit-on-close (`cls`) fills at the closing price if the close is within the limit; the limit keeps the per-order dollar cap meaningful and guards against a bad closing print.
 
 **The account allowlist** comes from the operator profile:
 - underlyings (`--underlyings ROOT,...`, default **none**: a gateway started without it refuses every option order, except from an `--any-underlying-client`), class `option`
 - clients allowed options on any underlying (`--any-underlying-client NAME`, repeatable, default none): for a manual trading client such as the console's. Only the underlying check is skipped, and only for that client's orders; every cap and the kill switch still apply, and other clients on the account keep the list. The name must be a `trade` client. The profile in `welcome` lists them as `any_underlying_clients` when there are any.
 - stocks (`--equities`, default none), and whether short sales are allowed (`--allow-short`, default no)
+- futures roots (`--futures ES,...`, default none; each must be a known root), class `future`; the profile in `welcome` lists them, with `max_future_qty`, only when there are any
 - shapes and maximum legs
 - the caps in [section 8](#8-rate-budget-and-caps)
 
@@ -326,6 +331,7 @@ Each event has the envelope `{type:"event", seq, ts_gateway, account, kind, …}
 | opening submits per minute | `--submits-per-min` | 60 |
 | opening submits per day (UTC) | `--submits-per-day` | 500 |
 | closes per minute (counted apart from the opens; `not_sent{cap}`, `closes_per_minute`) | `--closes-per-min` | 30 |
+| contracts per opening future | `--max-future-qty` | 1 |
 | open orders | `--max-open` | 4 |
 | legs | `--max-legs` | 4 |
 | maximum loss per opening intent (see above). A market opening is refused before this cap (`market_opening_refused`), so it is checked for limit openings only: the cap is named `notional` | `--max-notional` | $2,500 |

@@ -105,7 +105,11 @@ impl SimBroker {
         } else {
             -intent.limit_cents
         };
-        let multiplier = if intent.legs.iter().all(|l| l.equity) {
+        let multiplier = if intent
+            .legs
+            .iter()
+            .all(|l| l.class == crate::intent::Class::Equity)
+        {
             1
         } else {
             100
