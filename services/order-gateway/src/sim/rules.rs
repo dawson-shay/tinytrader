@@ -134,8 +134,12 @@ impl SimBroker {
                 ));
             }
         };
-        // The futures' initial margin is held from the same cash.
-        let left = self.cash - premium - required - self.futures_margin_held(None);
+        // The futures' initial margin is held from the same cash, and their unrealized
+        // loss counts against it (a gain doesn't pay for options).
+        let left = self.cash + self.futures_unrealized().min(0)
+            - premium
+            - required
+            - self.futures_margin_held(None);
         (left < 0).then(|| {
             (
                 "sim_insufficient_buying_power",

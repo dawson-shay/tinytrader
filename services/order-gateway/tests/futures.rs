@@ -2,7 +2,7 @@
 //! cash by what they realize, margin, caps, Globex hours, and the quarterly
 //! settlement. Synthetic quotes, made here.
 mod support;
-use dbn::{BboMsg, RecordHeader, RecordRef, SType, Schema, SymbolMappingMsg, rtype};
+use dbn::{BboMsg, CbboMsg, RecordHeader, RecordRef, SType, Schema, SymbolMappingMsg, rtype};
 use order_gateway::{Clock, Feed, Gateway, SimBroker, start};
 use serde_json::Value;
 use std::time::Duration;
@@ -480,5 +480,114 @@ fn scripted_mode_refuses_futures() {
     let mut c = Conn::open(&gw, "reactor", None);
     let r = c.submit("r1", &es("wse-x1", "buy", "open", 1, "7744.00"));
     assert_eq!(r["code"], "sim_futures_need_quotes", "{r}");
+    gw.stop().unwrap();
+}
+
+/// An options order's buying power counts the futures' unrealized loss, as the
+/// account's buying power does.
+#[test]
+fn options_buying_power_counts_a_futures_loss() {
+    let (sim, feed) = SimBroker::fed(
+        r#"{"account":{"cash":"10000.00"},"futures_margin":{"ES":"2000.00"},"venue_rules":{"buying_power":"defined_risk"},"expiry":{"settle":false}}"#,
+        r#"{"source":"session","run":"test"}"#,
+    )
+    .unwrap();
+    let mut cfg = config(root("fut-options-bp"));
+    cfg.profile.futures = vec!["ES".into()];
+    cfg.profile.max_notional_cents = 1_000_000;
+    let gw = start(cfg, sim).unwrap();
+    let clock = gw.clock();
+    let mut c = Conn::open(&gw, "reactor", None);
+    mapping(&feed);
+    let m = SymbolMappingMsg::new(
+        1,
+        T0 - S,
+        SType::Parent,
+        "SPY.OPT",
+        SType::RawSymbol,
+        "SPY   261005C00580000",
+        0,
+        0,
+    )
+    .unwrap();
+    feed.push(T0 - S, RecordRef::from(&m)).unwrap();
+    bbo(&feed, T0, 774_325, 774_350);
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    c.submit("r1", &es("wse-short", "sell", "open", 1, "7743.00"));
+    clock.advance("reactor", 1, T0 + S, WAIT).unwrap();
+    fill(&mut c, "wse-short");
+    // Up 60 points against the short: about −3000 unrealized.
+    bbo(&feed, T0 + 60 * S, 780_325, 780_350);
+    let mut q = CbboMsg {
+        hd: RecordHeader::new::<CbboMsg>(rtype::CBBO_1M, 30, 1, u64::MAX),
+        ts_recv: T0 + 60 * S,
+        ..CbboMsg::default_for_schema(Schema::Cbbo1M)
+    };
+    q.levels[0].bid_px = px(7_400);
+    q.levels[0].ask_px = px(7_500);
+    q.levels[0].bid_sz = 10;
+    q.levels[0].ask_sz = 10;
+    feed.push(T0 + 60 * S, RecordRef::from(&q)).unwrap();
+    clock.advance("reactor", 0, T0 + 60 * S, WAIT).unwrap();
+    let bp = account(&mut c, "a1")["buying_power"].clone();
+    assert_eq!(
+        bp, "4993.75",
+        "cash 10000, margin 2000, unrealized −3006.25"
+    );
+    // A 75.00 debit on one contract, 7500: more than that, though less than the cash
+    // less the margin.
+    let r = c.submit("r2", &single("wse-call", CALL, "buy", "open", 1, "75.00"));
+    assert_eq!(r["code"], "sim_insufficient_buying_power", "{r}");
+    gw.stop().unwrap();
+}
+
+/// A sale that flips a long is checked against the cap by the short it leaves.
+#[test]
+fn a_flip_is_capped_by_what_it_leaves() {
+    let (gw, feed, clock) = gateway(
+        "fut-flip-cap",
+        r#"{"futures_max_position":1,"futures_margin":{"ES":"1.00"},"expiry":{"settle":false}}"#,
+    );
+    let mut c = Conn::open(&gw, "reactor", None);
+    mapping(&feed);
+    bbo(&feed, T0, 774_325, 774_350);
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    c.submit("r1", &es("wse-l1", "buy", "open", 1, "7744.00"));
+    clock.advance("reactor", 1, T0 + S, WAIT).unwrap();
+    fill(&mut c, "wse-l1");
+    // Long 1: selling 2 leaves a short of 1, within the cap; selling 3 leaves 2.
+    let r = c.submit("r2", &es("wse-s3", "sell", "open", 3, "7800.00"));
+    assert_eq!(r["code"], "sim_future_position", "{r}");
+    let r = c.submit("r3", &es("wse-s2", "sell", "open", 2, "7800.00"));
+    assert_eq!(r["outcome"], "accepted", "{r}");
+    gw.stop().unwrap();
+}
+
+/// A losing future whose quotes go stale keeps its last known loss (it frees no
+/// margin), and the account names it among the positions valued without a fresh mid.
+#[test]
+fn a_stale_future_keeps_its_last_known_loss() {
+    let (gw, feed, clock) = gateway(
+        "fut-stale-mark",
+        r#"{"account":{"cash":"100000.00"},"futures_margin":{"ES":"1.00"},"expiry":{"settle":false}}"#,
+    );
+    let mut c = Conn::open(&gw, "reactor", None);
+    mapping(&feed);
+    bbo(&feed, T0, 774_325, 774_350);
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    c.submit("r1", &es("wse-st", "buy", "open", 1, "7744.00"));
+    clock.advance("reactor", 1, T0 + S, WAIT).unwrap();
+    fill(&mut c, "wse-st");
+    // Down 10 points, then ten minutes without a quote.
+    bbo(&feed, T0 + 30 * S, 773_325, 773_350);
+    clock.advance("reactor", 0, T0 + 630 * S, WAIT).unwrap();
+    let (a, _) = c.req("account", "a1", "");
+    // Bought at 7743.50, last marked at 7733.375: −506.25.
+    assert_eq!(a["broker_raw"]["equity"], "99493.75", "{a}");
+    assert_eq!(
+        a["broker_raw"]["equity_stale"],
+        serde_json::json!(["ESZ6"]),
+        "{a}"
+    );
     gw.stop().unwrap();
 }

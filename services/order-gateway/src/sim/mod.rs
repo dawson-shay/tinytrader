@@ -1349,6 +1349,7 @@ impl SimBroker {
 
     fn account_now(&mut self) -> Query<AccountInfo> {
         let cash = fmt_nanos(self.cash);
+        let (equity, stale) = self.net_liquidation();
         let power = if self.s.venue.defined_risk {
             fmt_nanos(self.buying_power())
         } else if self.s.futures_margin.is_empty() {
@@ -1362,7 +1363,8 @@ impl SimBroker {
             .s("status", &self.s.status)
             .n("options_trading_level", self.s.level)
             .s("cash", &cash)
-            .s("equity", &fmt_nanos(self.net_liquidation()))
+            .s("equity", &fmt_nanos(equity))
+            .raw("equity_stale", &arr(stale.iter().map(|x| quote(x))))
             .s("buying_power", &power)
             .b("trading_blocked", self.s.trading_blocked)
             .raw(

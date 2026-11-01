@@ -108,42 +108,60 @@ impl SimBroker {
         )
     }
 
-    /// Unrealized profit or loss of the futures held, at their fresh mids (a contract
-    /// with no fresh quote counts for nothing), nanodollars.
+    /// The mid of `symbol`'s fresh quote, or else of its last one, and whether it's
+    /// fresh; `None` with no quote at all.
+    fn mid(&self, symbol: &str) -> Option<(i128, bool)> {
+        let two = |q: super::Quote| {
+            q.bid
+                .zip(q.ask)
+                .map(|(b, a)| (i128::from(b) + i128::from(a)) / 2)
+        };
+        if let Some(m) = self.fresh(symbol, self.now).and_then(two) {
+            return Some((m, true));
+        }
+        let m = self.market.as_ref()?;
+        let q = m.ids.get(symbol).and_then(|id| m.book.get(id)).copied()?;
+        two(q).map(|m| (m, false))
+    }
+
+    /// Unrealized profit or loss of the futures held, at their fresh mids, or their
+    /// last known ones when quotes go stale (none known: nothing), nanodollars.
     pub(super) fn futures_unrealized(&self) -> i128 {
         self.pos
             .iter()
             .filter(|(s, p)| p.0 != 0 && is_future(s))
             .filter_map(|(s, p)| {
-                let mid = self.fresh(s, self.now).and_then(|q| q.bid.zip(q.ask))?;
-                let mid = (i128::from(mid.0) + i128::from(mid.1)) / 2;
+                let (mid, _) = self.mid(s)?;
                 Some(mid * i128::from(p.0) * multiplier(s) - p.1 * multiplier(s))
             })
             .sum()
     }
 
     /// Net liquidation value, nanodollars: cash, plus each position at its fresh mid
-    /// (an option's at 100 shares, a future's as what it would realize), or at its
-    /// entry price without one.
-    pub(super) fn net_liquidation(&self) -> i128 {
-        let marked: i128 = self
-            .pos
-            .iter()
-            .filter(|(s, p)| p.0 != 0 && !is_future(s))
-            .map(|(s, p)| {
-                let shares = if crate::intent::occ(s).is_some() {
-                    100
-                } else {
-                    1
-                };
-                let mid = self
-                    .fresh(s, self.now)
-                    .and_then(|q| q.bid.zip(q.ask))
-                    .map(|(b, a)| (i128::from(b) + i128::from(a)) / 2);
-                mid.map_or(p.1, |m| m * i128::from(p.0)) * shares
-            })
-            .sum();
-        self.cash + marked + self.futures_unrealized()
+    /// (an option's at 100 shares, a future's as what it would realize). A position
+    /// without one is valued at its last known mid (a future), or at its entry price
+    /// (an option or shares, or a future never quoted); those are named in the second
+    /// value.
+    pub(super) fn net_liquidation(&self) -> (i128, Vec<String>) {
+        let mut stale = Vec::new();
+        let mut marked = 0_i128;
+        for (s, p) in self.pos.iter().filter(|(_, p)| p.0 != 0) {
+            let mid = self.mid(s);
+            if !mid.is_some_and(|(_, fresh)| fresh) {
+                stale.push(s.clone());
+            }
+            if is_future(s) {
+                continue;
+            }
+            let shares = if crate::intent::occ(s).is_some() {
+                100
+            } else {
+                1
+            };
+            let fresh = mid.filter(|(_, f)| *f).map(|(m, _)| m);
+            marked += fresh.map_or(p.1, |m| m * i128::from(p.0)) * shares;
+        }
+        (self.cash + marked + self.futures_unrealized(), stale)
     }
 
     /// Contracts of `root_of` at stake, with `extra` (a symbol and signed contracts)
