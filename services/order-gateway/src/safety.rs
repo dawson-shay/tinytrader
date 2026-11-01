@@ -2,7 +2,6 @@
 //! is portfolio or strategy state.
 use crate::intent::fmt_cents;
 use crate::protocol::Obj;
-use std::time::{Duration, Instant};
 
 const NS: i64 = 1_000_000_000;
 
@@ -88,12 +87,14 @@ impl Profile {
 }
 
 /// One token bucket per account with critical and poll priorities; polls keep a 20%
-/// reserve for critical requests and are shed first.
+/// reserve for critical requests and are shed first. Its times are ns on the
+/// gateway's rate clock (`at`): monotonic live, the market time under a session.
 pub(crate) struct Budget {
     per_min: f64,
     tokens: f64,
-    last: Instant,
-    pub(crate) blocked_until: Option<Instant>,
+    last: u64,
+    now: u64,
+    pub(crate) blocked_until: Option<u64>,
 }
 
 impl Budget {
@@ -101,18 +102,28 @@ impl Budget {
         Self {
             per_min: f64::from(per_min),
             tokens: f64::from(per_min),
-            last: Instant::now(),
+            last: 0,
+            now: 0,
             blocked_until: None,
         }
     }
+    /// The rate clock's time, ns: every use goes through it.
+    pub(crate) fn at(&mut self, now: u64) -> &mut Self {
+        if self.last == 0 {
+            self.last = now;
+        }
+        self.now = now.max(self.now);
+        self
+    }
+    #[allow(clippy::cast_precision_loss)]
     fn refill(&mut self) {
-        let now = Instant::now();
-        let gained = now.duration_since(self.last).as_secs_f64() * self.per_min / 60.0;
+        let gained = self.now.saturating_sub(self.last) as f64 / 1e9 * self.per_min / 60.0;
         self.tokens = (self.tokens + gained).min(self.per_min);
-        self.last = now;
+        self.last = self.now;
     }
     pub(crate) fn blocked(&mut self) -> bool {
-        self.blocked_until = self.blocked_until.filter(|t| *t > Instant::now());
+        let now = self.now;
+        self.blocked_until = self.blocked_until.filter(|t| *t > now);
         self.blocked_until.is_some()
     }
     /// Takes one token; `false` means throttled before any send.
@@ -147,7 +158,9 @@ impl Budget {
     }
     /// After a 429: `blocked_until = max(Retry-After, reset, backoff)`.
     pub(crate) fn block(&mut self, ms: Option<u64>) {
-        let until = Instant::now() + Duration::from_millis(ms.unwrap_or(0).max(1000));
+        let until = self
+            .now
+            .saturating_add(ms.unwrap_or(0).max(1000).saturating_mul(1_000_000));
         self.blocked_until = Some(self.blocked_until.map_or(until, |b| b.max(until)));
     }
 }
@@ -237,4 +250,41 @@ pub(crate) fn et_day(ts: u64) -> i64 {
 pub(crate) fn et_ns(day: i64, minutes: i64) -> u64 {
     let local = day * 86_400 + minutes * 60;
     u64::try_from((local - et_offset(local + 5 * 3600)) * NS).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::Budget;
+
+    const MIN: u64 = 60_000_000_000;
+
+    /// A huge Retry-After blocks (saturating), never wraps around to unblocked.
+    #[test]
+    fn a_huge_retry_after_blocks() {
+        let mut b = Budget::new(60);
+        b.at(5 * MIN).block(Some(u64::MAX / 2));
+        assert!(b.at(6 * MIN).blocked());
+        assert!(!b.at(6 * MIN).take(true));
+    }
+
+    /// The bucket refills on its clock's time: emptied, it has nothing at the same
+    /// time and refills a minute later.
+    #[test]
+    fn the_bucket_refills_on_its_clock() {
+        let mut b = Budget::new(3);
+        for _ in 0..3 {
+            assert!(b.at(MIN).take_close());
+        }
+        assert!(!b.at(MIN).take_close());
+        assert!(b.at(2 * MIN).take_close());
+    }
+
+    /// A 429's block lasts its time on the clock.
+    #[test]
+    fn a_block_lasts_its_time_on_the_clock() {
+        let mut b = Budget::new(60);
+        b.at(MIN).block(Some(30_000));
+        assert!(b.at(MIN + MIN / 4).blocked());
+        assert!(!b.at(2 * MIN).blocked());
+    }
 }

@@ -86,8 +86,8 @@ impl Http {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
-        let after = num("retry-after").map(|s| s * 1000);
-        let reset = num("x-ratelimit-reset").map(|t| t.saturating_sub(now) * 1000);
+        let after = num("retry-after").map(|s| s.saturating_mul(1000));
+        let reset = num("x-ratelimit-reset").map(|t| t.saturating_sub(now).saturating_mul(1000));
         let retry_after_ms = after.max(reset);
         let status = resp.status();
         let mut text = String::new();

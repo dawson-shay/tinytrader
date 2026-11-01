@@ -130,6 +130,15 @@ struct OrderState {
     phase: Phase,
 }
 
+/// Where the live rate clock starts, ns: a day in, so an hour before the start is a
+/// time on it.
+const RATE_ORIGIN: u64 = 86_400_000_000_000;
+
+/// A duration in ns, saturating.
+fn ns(d: Duration) -> u64 {
+    u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn utc_day(ts: u64) -> i64 {
     i64::try_from(ts / 86_400_000_000_000).unwrap_or(0)
 }
@@ -255,7 +264,8 @@ enum Aud {
 
 struct Pending {
     cid: String,
-    start: Instant,
+    /// When its outcome became unknown, ns on the rate clock.
+    start: u64,
     next: usize,
 }
 
@@ -300,13 +310,14 @@ const RECHECK_CAP: Duration = Duration::from_secs(30);
 
 /// The backoff of one unresolved order's poll lookups: due at `due`, after `interval`.
 struct Recheck {
-    due: Instant,
+    /// ns on the rate clock.
+    due: u64,
     interval: Duration,
 }
 
 /// Schedules the next try of a failed order: one poll after the first failure, then twice
 /// the last interval, up to `RECHECK_CAP` (or the poll, if that is longer).
-fn backoff(map: &mut HashMap<String, Recheck>, cid: &str, now: Instant, poll: Duration) {
+fn backoff(map: &mut HashMap<String, Recheck>, cid: &str, now: u64, poll: Duration) {
     let interval = match map.get(cid) {
         Some(r) => (r.interval * 2).min(RECHECK_CAP.max(poll)),
         None => poll,
@@ -314,7 +325,7 @@ fn backoff(map: &mut HashMap<String, Recheck>, cid: &str, now: Instant, poll: Du
     map.insert(
         cid.to_owned(),
         Recheck {
-            due: now + interval,
+            due: now.saturating_add(ns(interval)),
             interval,
         },
     );
@@ -526,8 +537,11 @@ pub(crate) struct Session<B: Broker> {
     degraded: bool,
     last_state: &'static str,
     budget: Budget,
-    minute: VecDeque<Instant>,
-    closes: VecDeque<Instant>,
+    /// Opens and closes submitted in the last minute, ns on the rate clock.
+    minute: VecDeque<u64>,
+    closes: VecDeque<u64>,
+    /// The rate clock's origin live.
+    rate_base: Instant,
     day: (i64, usize),
     rejects: u32,
     pending: Vec<Pending>,
@@ -550,7 +564,11 @@ pub(crate) struct Session<B: Broker> {
     cod_work: VecDeque<(String, String, String)>,
     /// The reconcile in progress, if any.
     reconcile: Option<Reconcile>,
-    last_poll: Instant,
+    /// The last poll, ns on the rate clock.
+    last_poll: u64,
+    /// The last check for the kill sentinel under a session, whose polls follow the
+    /// market clock and stop while it is paused.
+    last_kill_check: Instant,
     last_seq: Arc<AtomicU64>,
     /// Order messages (submits and cancels, valid or not) handled per client, by its
     /// index in the configuration, for clocks.
@@ -585,6 +603,7 @@ impl<B: Broker> Session<B> {
             degraded: false,
             last_state: "",
             minute: VecDeque::new(),
+            rate_base: Instant::now(),
             closes: VecDeque::new(),
             day: (0, 0),
             rejects: 0,
@@ -597,7 +616,8 @@ impl<B: Broker> Session<B> {
             cod_timers: Vec::new(),
             cod_work: VecDeque::new(),
             reconcile: None,
-            last_poll: Instant::now(),
+            last_poll: RATE_ORIGIN,
+            last_kill_check: Instant::now(),
             last_seq,
             handled: HashMap::new(),
             clocks: VecDeque::new(),
@@ -703,6 +723,17 @@ impl<B: Broker> Session<B> {
 
     fn ts(&self) -> u64 {
         self.b.now().unwrap_or_else(wall_ns)
+    }
+
+    /// The clock the rate limits run on, ns: the market time when a session clocks
+    /// the broker (a backtest replays many minutes a minute, and must run the same
+    /// whatever the machine's load), and otherwise a monotonic clock.
+    fn rate_now(&self) -> u64 {
+        if self.b.session_clocked() {
+            self.ts()
+        } else {
+            ns(self.rate_base.elapsed()).saturating_add(RATE_ORIGIN)
+        }
     }
 
     fn state(&self) -> &'static str {
@@ -1145,7 +1176,7 @@ impl<B: Broker> Session<B> {
     #[expect(clippy::too_many_lines, reason = "one flat table of query mappings")]
     fn query(&mut self, rid: &str, op: Op) -> String {
         let name = op_name(&op);
-        if !self.budget.take(false) {
+        if !self.budget.at(self.rate_now()).take(false) {
             return request_error(rid, name, "throttled", "null");
         }
         let order = |o: &BrokerOrder, orders: &HashMap<String, OrderState>| {
@@ -1246,7 +1277,7 @@ impl<B: Broker> Session<B> {
             }
             Err(e) => {
                 if e.http_status == 429 {
-                    self.budget.block(e.retry_after_ms);
+                    self.budget.at(self.rate_now()).block(e.retry_after_ms);
                 }
                 let detail = Obj::new()
                     .n("http_status", e.http_status)
@@ -1328,7 +1359,7 @@ impl<B: Broker> Session<B> {
             return None;
         }
         // A 429 backoff holds opens, not closes, so the read takes a close token.
-        let read = if self.budget.take_close() {
+        let read = if self.budget.at(self.rate_now()).take_close() {
             self.b.positions()
         } else {
             Err(BrokerError::local("throttled", ""))
@@ -1449,7 +1480,7 @@ impl<B: Broker> Session<B> {
         };
         let notional = loss.unwrap_or(0);
         let open = self.orders.values().filter(|o| o.open()).count();
-        let minute_ago = Instant::now().checked_sub(Duration::from_mins(1));
+        let minute_ago = self.rate_now().checked_sub(60_000_000_000);
         self.minute.retain(|t| minute_ago.is_none_or(|m| *t > m));
         self.closes.retain(|t| minute_ago.is_none_or(|m| *t > m));
         let today = utc_day(self.ts());
@@ -1491,9 +1522,9 @@ impl<B: Broker> Session<B> {
             ));
         }
         let admitted = if opening {
-            self.budget.take(true)
+            self.budget.at(self.rate_now()).take(true)
         } else {
-            self.budget.take_close()
+            self.budget.at(self.rate_now()).take_close()
         };
         if !admitted {
             return Some(not_sent("throttled", "null"));
@@ -1517,10 +1548,10 @@ impl<B: Broker> Session<B> {
         );
         self.orders.insert(cid.clone(), st);
         if intent.has_open() {
-            self.minute.push_back(Instant::now());
+            self.minute.push_back(self.rate_now());
             self.day.1 += 1;
         } else {
-            self.closes.push_back(Instant::now());
+            self.closes.push_back(self.rate_now());
         }
         let extra = Obj::new()
             .raw("intent", &intent.canonical())
@@ -1561,7 +1592,7 @@ impl<B: Broker> Session<B> {
                 st.phase = Phase::Done;
                 "rejected".clone_into(&mut st.status);
                 if e.http_status == 429 {
-                    self.budget.block(e.retry_after_ms);
+                    self.budget.at(self.rate_now()).block(e.retry_after_ms);
                 }
                 broker_error_obj("rejected", &e).done()
             }
@@ -1571,11 +1602,11 @@ impl<B: Broker> Session<B> {
             } => {
                 st.phase = Phase::Unknown;
                 if reason == "http_429_after_send" {
-                    self.budget.block(retry_after_ms);
+                    self.budget.at(self.rate_now()).block(retry_after_ms);
                 }
                 self.pending.push(Pending {
                     cid: cid.clone(),
-                    start: Instant::now(),
+                    start: self.rate_now(),
                     next: 0,
                 });
                 outcome("unknown")
@@ -1617,7 +1648,7 @@ impl<B: Broker> Session<B> {
         let (cid, bid) = if let Some(k) = known {
             k
         } else {
-            if !self.budget.take(false) {
+            if !self.budget.at(self.rate_now()).take(false) {
                 return Ok(Err("throttled"));
             }
             match self.b.order(target).map(|r| r.value) {
@@ -1666,7 +1697,7 @@ impl<B: Broker> Session<B> {
             CancelResult::Accepted(raw) => outcome("accepted").raw("broker_raw", &raw).done(),
             CancelResult::Rejected(e) => {
                 if e.http_status == 429 {
-                    self.budget.block(e.retry_after_ms);
+                    self.budget.at(self.rate_now()).block(e.retry_after_ms);
                 }
                 broker_error_obj("rejected", &e).done()
             }
@@ -1675,7 +1706,7 @@ impl<B: Broker> Session<B> {
                 retry_after_ms,
             } => {
                 if reason == "http_429_after_send" {
-                    self.budget.block(retry_after_ms);
+                    self.budget.at(self.rate_now()).block(retry_after_ms);
                 }
                 outcome("unknown").s("reason", reason).done()
             }
@@ -1689,7 +1720,7 @@ impl<B: Broker> Session<B> {
         cid: &str,
         bid: &str,
     ) -> Result<String, String> {
-        let o = if self.budget.take(true) {
+        let o = if self.budget.at(self.rate_now()).take(true) {
             self.cancel_event(client, rid, cid, "sent", "{}")?;
             let r = self.b.cancel(bid);
             self.cancel_outcome(r)
@@ -1720,7 +1751,7 @@ impl<B: Broker> Session<B> {
             .done();
         self.status(&Obj::new().raw("kill", &k).done())?;
         if level == KillLevel::HaltAll {
-            self.budget.charge();
+            self.budget.at(self.rate_now()).charge();
             self.cancel_event(client, rid, "*", "sent", "{}")?;
             let r = self.b.cancel_all();
             let o = self.cancel_outcome(r);
@@ -1732,7 +1763,7 @@ impl<B: Broker> Session<B> {
                 &Obj::new().raw("outcome", &o).done(),
             )?;
             self.drain()?;
-            self.budget.charge();
+            self.budget.at(self.rate_now()).charge();
             if let Ok(r) = self.b.open_orders() {
                 for bo in r.value {
                     self.do_cancel(client, rid, &bo.client_order_id, &bo.broker_order_id)?;
@@ -1763,7 +1794,7 @@ impl<B: Broker> Session<B> {
         if !matches!(self.killed, Some((KillLevel::HaltAll, _))) {
             self.kill(KillLevel::HaltOpens, reason, client, rid)?;
         }
-        self.budget.charge();
+        self.budget.at(self.rate_now()).charge();
         self.cancel_event(client, rid, "*", "sent", "{}")?;
         let r = self.b.cancel_all();
         let o = self.cancel_outcome(r);
@@ -1775,7 +1806,7 @@ impl<B: Broker> Session<B> {
             &Obj::new().raw("outcome", &o).done(),
         )?;
         self.drain()?;
-        self.budget.charge();
+        self.budget.at(self.rate_now()).charge();
         let o = match self.b.flatten() {
             FlattenResult::Sent(closings, raw) => {
                 let list = arr(closings.iter().map(|c| {
@@ -1991,7 +2022,7 @@ impl<B: Broker> Session<B> {
             {
                 continue;
             }
-            if !self.budget.take(critical) {
+            if !self.budget.at(self.rate_now()).take(critical) {
                 self.reconcile_front(step);
                 return Ok(Turn::Waiting);
             }
@@ -2149,15 +2180,16 @@ impl<B: Broker> Session<B> {
                     self.outcome_event(&client, &rid, Some(&cid), o)?;
                     self.pending.push(Pending {
                         cid,
-                        start: Instant::now(),
+                        start: self.rate_now(),
                         next: 0,
                     });
                 }
                 Phase::Unknown => {
                     if !self.pending.iter().any(|p| p.cid == cid) {
+                        let start = self.rate_now();
                         self.pending.push(Pending {
                             cid,
-                            start: Instant::now(),
+                            start,
                             next: 0,
                         });
                     }
@@ -2199,14 +2231,14 @@ impl<B: Broker> Session<B> {
     /// A failed reconcile call; a 429 holds the budget back.
     fn reconcile_failed(&mut self, e: &BrokerError) {
         if e.http_status == 429 {
-            self.budget.block(e.retry_after_ms);
+            self.budget.at(self.rate_now()).block(e.retry_after_ms);
         }
     }
 
     /// The open-orders check of a clear: the order's seen state and the listing's size.
     /// `None` when the budget refused the call, which sends nothing.
     fn open_check(&mut self, cid: &str, critical: bool) -> Option<(Seen, usize)> {
-        if !self.budget.take(critical) {
+        if !self.budget.at(self.rate_now()).take(critical) {
             return None;
         }
         Some(match self.b.open_orders() {
@@ -2229,7 +2261,7 @@ impl<B: Broker> Session<B> {
         cid: &str,
         critical: bool,
     ) -> Option<(Seen, String, Option<BrokerOrder>)> {
-        if !self.budget.take(critical) {
+        if !self.budget.at(self.rate_now()).take(critical) {
             return None;
         }
         Some(match self.b.order(&OrderRef::Client(cid.to_owned())) {
@@ -2244,7 +2276,7 @@ impl<B: Broker> Session<B> {
     /// A failed broker check; a 429 holds the budget back as it does for any query.
     fn failed(&mut self, e: &BrokerError) -> Seen {
         if e.http_status == 429 {
-            self.budget.block(e.retry_after_ms);
+            self.budget.at(self.rate_now()).block(e.retry_after_ms);
         }
         Seen::Failed(e.code.clone())
     }
@@ -2390,7 +2422,7 @@ impl<B: Broker> Session<B> {
     /// a refused token sends nothing, returns `false` and leaves the backoff alone. A
     /// refused automatic clear leaves the order alone and is not journaled, and backs off
     /// like a failed lookup. Returns whether it made a broker call.
-    fn clear_day_orders(&mut self, at: Instant) -> Result<bool, String> {
+    fn clear_day_orders(&mut self, at: u64) -> Result<bool, String> {
         let now = self.ts();
         let mut cids: Vec<String> = self
             .orders
@@ -2430,7 +2462,7 @@ impl<B: Broker> Session<B> {
 
     /// The by-id half of an automatic clear, decided with the listing kept from an earlier
     /// poll. A refused token keeps the half for the next clear turn.
-    fn clear_by_id(&mut self, half: ClearHalf, at: Instant) -> Result<bool, String> {
+    fn clear_by_id(&mut self, half: ClearHalf, at: u64) -> Result<bool, String> {
         let Some((by_id, raw, found)) = self.by_id_check(&half.cid, false) else {
             self.clear_half = Some(half);
             return Ok(false);
@@ -2467,18 +2499,18 @@ impl<B: Broker> Session<B> {
     }
 
     /// Makes at most one lookup of a due pending order. Returns whether it made one.
-    fn resolve(&mut self, now: Instant) -> Result<bool, String> {
+    fn resolve(&mut self, now: u64) -> Result<bool, String> {
         let offsets = self.cfg.timing.resolve.clone();
         let mut i = 0;
         while i < self.pending.len() {
             let k = self.pending[i].next;
-            if self.pending[i].start + offsets[k] > now {
+            if self.pending[i].start.saturating_add(ns(offsets[k])) > now {
                 i += 1;
                 continue;
             }
             // Refused by our own budget: no lookup was made, so the schedule does
             // not move and the order is looked up on a later tick.
-            if !self.budget.take(true) {
+            if !self.budget.at(self.rate_now()).take(true) {
                 i += 1;
                 continue;
             }
@@ -2487,7 +2519,7 @@ impl<B: Broker> Session<B> {
                 Ok(r) => r.value.map_or(Lookup::NotFound, Lookup::Found),
                 Err(e) => {
                     if e.http_status == 429 {
-                        self.budget.block(e.retry_after_ms);
+                        self.budget.at(self.rate_now()).block(e.retry_after_ms);
                     }
                     Lookup::Failed
                 }
@@ -2532,7 +2564,7 @@ impl<B: Broker> Session<B> {
     /// next poll, then after a doubling interval capped at `RECHECK_CAP`. Each lookup
     /// takes a non-critical token first; a refused token skips the order for this poll.
     /// Returns whether a lookup was made.
-    fn recheck_unresolved(&mut self, now: Instant) -> Result<bool, String> {
+    fn recheck_unresolved(&mut self, now: u64) -> Result<bool, String> {
         let mut cids: Vec<String> = self
             .orders
             .iter()
@@ -2551,7 +2583,7 @@ impl<B: Broker> Session<B> {
         else {
             return Ok(false);
         };
-        if !self.budget.take(false) {
+        if !self.budget.at(self.rate_now()).take(false) {
             return Ok(false);
         }
         self.cursor = Some(cid.clone());
@@ -2565,7 +2597,7 @@ impl<B: Broker> Session<B> {
             },
             Err(e) => {
                 if e.http_status == 429 {
-                    self.budget.block(e.retry_after_ms);
+                    self.budget.at(self.rate_now()).block(e.retry_after_ms);
                 }
                 backoff(&mut self.rechecks, &cid, now, self.cfg.timing.poll);
             }
@@ -2578,16 +2610,31 @@ impl<B: Broker> Session<B> {
     /// the rest of the tick's work waits for a later tick.
     fn tick(&mut self) -> Result<(), String> {
         self.drain()?;
-        let now = Instant::now();
+        // Liveness runs on real time; the polls, their backoffs and the timers of
+        // unresolved orders on the rate clock (the market clock under a session).
+        let wall = Instant::now();
+        let now = self.rate_now();
         if let Some((since, _)) = self.stream_down
             && !self.degraded
-            && now.duration_since(since) > self.cfg.timing.stream_grace
+            && wall.duration_since(since) > self.cfg.timing.stream_grace
         {
             self.degraded = true;
             self.sync_state()?;
         }
         let mut called = false;
-        if now.duration_since(self.last_poll) >= self.cfg.timing.poll {
+        // Under a session the sentinel is also checked on real time, so a paused
+        // session can still be killed.
+        if self.b.session_clocked()
+            && wall.duration_since(self.last_kill_check) >= self.cfg.timing.poll
+        {
+            self.last_kill_check = wall;
+            let halted = matches!(self.killed, Some((KillLevel::HaltAll, _)));
+            if !halted && self.cfg.state.join("KILL").exists() {
+                self.kill(KillLevel::HaltAll, "sentinel", "operator", "sentinel")?;
+                called = true;
+            }
+        }
+        if !called && now.saturating_sub(self.last_poll) >= ns(self.cfg.timing.poll) {
             self.last_poll = now;
             // The kill sentinel is checked before any lookup, so a lookup never delays it. A kill
             // made in this tick takes the tick's call, so the poll waits.
@@ -2620,7 +2667,7 @@ impl<B: Broker> Session<B> {
                 }
                 // Degraded: the listing reconciles what the stream missed. It runs only when no
                 // call was made this tick, and a refused token or a 429 is handled as any query.
-                if !called && self.degraded && self.budget.take(false) {
+                if !called && self.degraded && self.budget.at(self.rate_now()).take(false) {
                     called = true;
                     match self.b.open_orders() {
                         Ok(r) => {
@@ -2630,7 +2677,7 @@ impl<B: Broker> Session<B> {
                         }
                         Err(e) => {
                             if e.http_status == 429 {
-                                self.budget.block(e.retry_after_ms);
+                                self.budget.at(self.rate_now()).block(e.retry_after_ms);
                             }
                         }
                     }
@@ -2643,10 +2690,10 @@ impl<B: Broker> Session<B> {
         let due: Vec<String> = self
             .cod_timers
             .iter()
-            .filter(|(_, t)| *t <= now)
+            .filter(|(_, t)| *t <= wall)
             .map(|(n, _)| n.clone())
             .collect();
-        self.cod_timers.retain(|(_, t)| *t > now);
+        self.cod_timers.retain(|(_, t)| *t > wall);
         for name in due {
             let Some(spec) = self.cfg.clients.iter().find(|c| c.name == name).cloned() else {
                 continue;
@@ -2728,7 +2775,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
 
     /// A broker that answers from a script and records each call by name. Its open listing
     /// is `open`; with `open_429` set, the listing fails with a 429 and that retry-after.
@@ -2926,7 +2973,7 @@ mod tests {
 
     /// Makes the next poll due and runs one tick.
     fn poll(s: &mut Session<Stub>) {
-        s.last_poll = Instant::now() - Duration::from_secs(60);
+        s.last_poll = s.rate_now() - 60_000_000_000;
         s.tick().unwrap();
     }
 
@@ -2969,10 +3016,10 @@ mod tests {
         // Each clear turn makes one call: the listing first, the by-id lookup on the next.
         let (mut s, calls) = session("clear-split", None);
         unresolved(&mut s, "wse-day", "day", two_days_ago());
-        assert_eq!(s.clear_day_orders(Instant::now()), Ok(true));
+        assert_eq!(s.clear_day_orders(s.rate_now()), Ok(true));
         assert_eq!(*calls.borrow(), vec!["open_orders"]);
         assert_eq!(s.orders["wse-day"].phase, Phase::Unknown);
-        assert_eq!(s.clear_day_orders(Instant::now()), Ok(true));
+        assert_eq!(s.clear_day_orders(s.rate_now()), Ok(true));
         assert_eq!(*calls.borrow(), vec!["open_orders", "order"]);
         assert_eq!(s.orders["wse-day"].phase, Phase::Cleared);
     }
@@ -3006,8 +3053,9 @@ mod tests {
     fn a_throttled_clear_sends_nothing_and_does_not_back_off() {
         let (mut s, calls) = session("throttled-clear", None);
         unresolved(&mut s, "wse-day", "day", two_days_ago());
-        s.budget.block(Some(60_000));
-        assert_eq!(s.clear_day_orders(Instant::now()), Ok(false));
+        let t = s.rate_now();
+        s.budget.at(t).block(Some(60_000));
+        assert_eq!(s.clear_day_orders(s.rate_now()), Ok(false));
         assert!(calls.borrow().is_empty());
         assert!(s.clear_retry.is_empty());
         // A kept listing whose by-id lookup is refused waits for the next turn, unbacked.
@@ -3016,7 +3064,7 @@ mod tests {
             open: Seen::Absent,
             listed: 0,
         });
-        assert_eq!(s.clear_day_orders(Instant::now()), Ok(false));
+        assert_eq!(s.clear_day_orders(s.rate_now()), Ok(false));
         assert!(s.clear_half.is_some());
         assert!(s.clear_retry.is_empty());
         assert!(calls.borrow().is_empty());
@@ -3190,7 +3238,7 @@ mod tests {
         unresolved(&mut s, "wse-pending", "day", None);
         s.pending.push(Pending {
             cid: "wse-pending".into(),
-            start: Instant::now() - Duration::from_secs(3600),
+            start: s.rate_now() - 3_600_000_000_000,
             next: 0,
         });
         poll(&mut s);
@@ -3359,7 +3407,7 @@ mod tests {
         s.cod_timers.push(("alice".into(), Instant::now()));
         let mut left = Vec::new();
         for _ in 0..5 {
-            s.last_poll = Instant::now();
+            s.last_poll = s.rate_now();
             s.tick().unwrap();
             left.push(s.cod_work.len());
         }

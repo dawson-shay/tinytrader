@@ -1110,3 +1110,31 @@ fn a_sold_leg_without_a_bid() {
         gw.stop().unwrap();
     }
 }
+
+/// The rate limits run on the session's clock: a third open within a market
+/// minute is refused, and accepted a market minute later, though only
+/// milliseconds have passed.
+#[test]
+fn rate_limits_count_market_minutes() {
+    let (sim, feed) = SimBroker::fed(
+        r#"{"expiry":{"settle":false}}"#,
+        r#"{"source":"session","run":"test"}"#,
+    )
+    .unwrap();
+    let mut cfg = config(root("fed-rate-market"));
+    cfg.profile.submits_per_min = 2;
+    let gw = start(cfg, sim).unwrap();
+    let clock = gw.clock();
+    let mut c = Conn::open(&gw, "reactor", None);
+    mappings(&feed);
+    cbbo(&feed, 3, T0, 50, 52);
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    let rest = |cid: &str| single(cid, PUT_B, "buy", "open", 1, "0.01");
+    assert_eq!(c.submit("r1", &rest("wse-rate-1"))["outcome"], "accepted");
+    assert_eq!(c.submit("r2", &rest("wse-rate-2"))["outcome"], "accepted");
+    let r = c.submit("r3", &rest("wse-rate-3"));
+    assert_eq!(r["detail"]["cap"], "submits_per_minute", "{r}");
+    clock.advance("reactor", 3, T0 + 61 * S, WAIT).unwrap();
+    assert_eq!(c.submit("r4", &rest("wse-rate-4"))["outcome"], "accepted");
+    gw.stop().unwrap();
+}

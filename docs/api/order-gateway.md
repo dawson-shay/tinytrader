@@ -331,6 +331,8 @@ Each event has the envelope `{type:"event", seq, ts_gateway, account, kind, …}
 | maximum loss per opening intent (see above). A market opening is refused before this cap (`market_opening_refused`), so it is checked for limit openings only: the cap is named `notional` | `--max-notional` | $2,500 |
 | consecutive broker rejects | `--max-rejects` | 5, which trips `halt_opens` |
 
+The per-minute caps, the request budget (and a 429's backoff), the poll cadence and the timers of unresolved orders (their lookups, backoffs and automatic clears) run on the gateway's rate clock: a monotonic clock live, and the market time when a session clocks the broker. Connection liveness (a client's disconnect grace, the stream's grace, a clock wait's deadline) stays on real time, and under a session the kill sentinel is also checked on real time, so a paused session can still be killed. A backtest replays many market minutes in one real minute, so on real time its caps would refuse orders depending on the machine's load, and the same run wouldn't run the same twice.
+
 **Maximum loss.** `--max-notional` caps what an opening intent can lose, not what it costs to open. The loss is per parent unit, times qty and the multiplier (100 an option, 1 a share):
 - a long option or share: the premium paid.
 - a naked short put: the strike less the credit.
