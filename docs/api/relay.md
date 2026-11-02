@@ -8,11 +8,11 @@
 | **Auth** | None: bind to loopback or a private network. Access to a relay grants nothing at an order gateway. |
 | **Errors** | Stream: one DBN `ErrorMsg`, then the relay closes. HTTP: `{"error": "..."}` with a 4xx or 5xx status. |
 | **Health** | `/health`, `/metrics`, `/describe`, `/events` ([observe](observe.md)); `upstream-*` markers in the stream. |
-| **Stability** | The stream protocol is **stable**. `/clients`, `/bars`, `/quotes`, `/stats` are **stable**; `/recent`, `/tape` and `/session` are **experimental**. |
+| **Stability** | The stream protocol is **stable**. `/clients`, `/bars`, `/quotes`, `/stats` are **stable**; `/recent`, `/tape`, `/session` and `/replay` are **experimental**. |
 
 Shared conventions are in the [API overview](README.md); how to write a client is in the [strategy client tutorial](../tutorials/strategy-client.md).
 
-The relay forwards and keeps no recording ([decision 0006](../decisions/0006-market-data-relay.md)). Everything below the stream is held in memory and is gone after a restart.
+The relay forwards and keeps no recording ([decision 0006](../decisions/0006-market-data-relay.md)). Everything below the stream is held in memory and is gone after a restart; the one exception is `/replay`, which writes a replay file to disk when asked to.
 
 A deployment runs one relay per feed. For example:
 
@@ -149,7 +149,53 @@ Today's data for one option contract, from Databento's intraday replay. Each req
 - **Session and history:** this serves the current session, held in memory. Past days are history: bought from Databento as batch files, filed in the store and read from disk (the Data page's jobs, which quote a price before any purchase).
 - **Cost:** intraday replay is assumed to be included in the live plan (decision 0006); confirm against Databento's usage page.
 
+### `POST /replay`: a replay of every symbol, to a file (experimental)
+
+```
+POST /replay?schema=cbbo-1m&start=2026-11-02T14:30:00Z
+GET  /replay
+GET  /replay/{id}
+```
+
+Databento's intraday replay of the relay's whole parent set (its `RELAY_SYMBOLS`, such as `SPY.OPT`, in its `RELAY_STYPE_IN` symbology, `parent`), written to a DBN file on the relay's machine, in the background. Like `/session` it opens a short second live session subscribed from `start`, reads until Databento reports the replay complete, and closes it; unlike `/session` it is every contract, kept on disk.
+
+This is not a recording of the stream: the relay still keeps nothing of what it forwards ([decision 0006](../decisions/0006-market-data-relay.md)). A replay file is made only on request, from its own session.
+
+**Off unless `RELAY_REPLAY_DIR` is set**, and only on Databento relays: otherwise all three answer `404` with `{"error": "replay files are off on this relay: set RELAY_REPLAY_DIR"}`.
+
+| Parameter | | |
+|---|---|---|
+| `schema` | `cbbo-1m` | `cbbo-1m`, `cbbo-1s`, `tcbbo` or `trades`, as for `/session`. One file per schema: run one, then the next. |
+| `start` | today's 09:30 New York | RFC 3339, within the last 24 hours, as for `/session`. |
+
+- `POST` answers `202` with `{"id": 1, "file": "<path>", "state": "running"}`. One replay runs at a time, sharing `/session`'s turn so the relay holds at most two of the dataset's sessions: a `POST` while one runs (or while a `/session` replay runs) is `409`. A bad schema or start is `400`.
+- `GET /replay` lists the last 32 replays, newest first, as `{"replays": [...]}`; `GET /replay/{id}` gives one: `{id, state, schema, start, file, records, bytes, started, finished, error}`. `state` is `running`, `done` or `failed`; `start`, `started` and `finished` are Unix seconds; `records` and `bytes` count up while it runs. Ids restart with the relay.
+- A replay is given up after `RELAY_REPLAY_TIMEOUT` seconds (default 1800).
+
+**The file** is `<RELAY_REPLAY_DIR>/<YYYY-MM-DD>/<dataset>-<roots>-<schema>-<start>.dbn.zst`: the date of `start` in New York, `<roots>` the parents without `.OPT` joined by `_`, `<start>` in Unix seconds, such as `2026-11-02/OPRA.PILLAR-SPY-cbbo-1m-1793629800.dbn.zst`.
+
+- DBN v3: the session's metadata, then every record Databento sent except heartbeats, unchanged (symbol mappings, definitions where the schema carries them, and the `ReplayCompleted` system record, which ends a complete file).
+- Zstandard, as independent checksummed frames of at most 4 MiB decoded that never split a record, so any zstd or DBN reader reads it and a partial file reads up to its last whole frame. Records go to disk as they arrive.
+- Written as `….dbn.zst.tmp` and renamed when the replay completes. A replay that ends otherwise (Databento closes the session, an error, the timeout) is kept as `….partial.dbn.zst`, the job `failed` with the reason in `error`. A complete replay of the same schema and start replaces the earlier file and removes its partial one.
+- Beside it, `<file>.json`:
+
+```json
+{"format": "tinytrader.replay-file/1", "file": "OPRA.PILLAR-SPY-cbbo-1m-1793629800.dbn.zst",
+ "dataset": "OPRA.PILLAR", "parents": ["SPY.OPT"], "stype_in": "parent", "schema": "cbbo-1m",
+ "start": "2026-11-02T14:30:00Z", "end": "2026-11-02T20:59:00.000000000Z",
+ "records": 81234, "bytes": 80123456, "sha256": "…", "completed": true, "error": null}
+```
+
+`end` is the last record's event time (system and error records aside); `bytes` and `sha256` are the file's.
+
+#### Next
+
+Not built yet; the code is laid out for them (a record source, a Databento session from a start until `ReplayCompleted`, apart from the file writer):
+
+- **A replay through the stream.** A join request carrying an optional replay (schema, start): the relay plays that replay's records to the client over `tinytrader.relay/1` as it would live data, then hands over to live or ends. Databento won't replay `cmbp-1` intraday, so a replay join gets `cbbo-1s`, `cbbo-1m`, `tcbbo` or `trades`, not the live `cmbp-1`, and the stream must say so.
+- **Recording the relay's output** (such as `RELAY_RECORD_DIR`, off by default): what the relay forwards, or what its Databento session receives, to files by the same writer. This changes decision 0006 ("keeps no recording"), which is amended when it is built. Its design follows Hyphae's recorder (`docs/design/continuous-recording-checkpoint-2026-09-29.md`, `docs/design/capture-quality.org`, `crates/dbn/src/tape_writer.rs`): sealed segments with checkpoints and an explicit end, as [decision 0013](../decisions/0013-lossless-capture-and-hot-swap.md) describes.
+
 ## Stability
 
 - **Stable:** the join request, the record sequence (header, reference, catch-up, `ReplayCompleted`, live) and the `upstream-*` markers; `/clients`, `/bars`, `/quotes`, `/stats`. They change additively: new optional join fields, new JSON fields.
-- **Experimental:** `/recent` (the console's price panels), `/tape` and `/session`: shapes may change with the console.
+- **Experimental:** `/recent` (the console's price panels), `/tape`, `/session` and `/replay`: shapes may change with the console.

@@ -11,7 +11,8 @@
 //! just that contract, subscribed from `start` (default: today's 09:30 New
 //! York, or the last 24 hours before then; never more than 24 hours back),
 //! reads until Databento says the replay is complete, and closes it. One
-//! request runs at a time, so the relay never holds more than two of the
+//! request runs at a time (sharing its turn with `/replay`, replay.rs), so
+//! the relay never holds more than two of the
 //! dataset's sessions, and answers are kept a minute.
 //!
 //! Only contracts on this relay's roots (`SPY.OPT` gives SPY) are served.
@@ -53,7 +54,7 @@ const KEEP: Duration = Duration::from_secs(60);
 /// The longest a replay may take before it is given up.
 const WAIT: Duration = Duration::from_secs(30);
 /// Databento replays at most this far back.
-const REPLAY_LIMIT: i64 = 24 * 3600;
+pub const REPLAY_LIMIT: i64 = 24 * 3600;
 /// Answers kept at once, at most.
 const CACHED: usize = 64;
 
@@ -66,13 +67,20 @@ pub struct Session {
     /// Option roots this relay carries, such as `SPY`.
     roots: Vec<String>,
     cache: Mutex<Cache>,
-    one: tokio::sync::Semaphore,
+    /// Held while a replay runs; shared with `/replay` (replay.rs), so the
+    /// relay holds at most one session beside its own.
+    one: Arc<tokio::sync::Semaphore>,
 }
 
 impl Session {
     /// For a Databento relay of option parents (`SPY.OPT`); `None` otherwise.
     #[must_use]
-    pub fn new(key: &str, dataset: &str, symbols: &[String]) -> Option<Arc<Self>> {
+    pub fn new(
+        key: &str,
+        dataset: &str,
+        symbols: &[String],
+        one: Arc<tokio::sync::Semaphore>,
+    ) -> Option<Arc<Self>> {
         let roots: Vec<String> = symbols
             .iter()
             .filter_map(|s| s.strip_suffix(".OPT").map(str::to_owned))
@@ -83,7 +91,7 @@ impl Session {
                 dataset: dataset.to_owned(),
                 roots,
                 cache: Mutex::default(),
-                one: tokio::sync::Semaphore::new(1),
+                one,
             })
         })
     }
@@ -102,7 +110,11 @@ impl Session {
         {
             return Ok(v.clone());
         }
-        let _turn = self.one.acquire().await.map_err(|e| e.to_string())?;
+        // A replay to file (`/replay`) may hold the turn for many minutes.
+        let _turn = tokio::time::timeout(WAIT, self.one.acquire())
+            .await
+            .map_err(|_| "another replay is running; try again later".to_owned())?
+            .map_err(|e| e.to_string())?;
         // Another request may have filled it while this one waited.
         if let Some((at, v)) = self.lock().get(&key)
             && at.elapsed() < KEEP
@@ -289,6 +301,32 @@ pub fn default_start(now: i64) -> i64 {
     }
 }
 
+/// A schema Databento replays intraday for OPRA (default `cbbo-1m`).
+pub fn replay_schema(s: Option<&str>) -> Result<Schema, String> {
+    match s.unwrap_or("cbbo-1m") {
+        "cbbo-1m" => Ok(Schema::Cbbo1M),
+        "cbbo-1s" => Ok(Schema::Cbbo1S),
+        "tcbbo" => Ok(Schema::Tcbbo),
+        "trades" => Ok(Schema::Trades),
+        s => Err(format!("schema {s}: cbbo-1m, cbbo-1s, tcbbo or trades")),
+    }
+}
+
+/// A replay's start (Unix seconds) from an RFC 3339 time, [`default_start`]
+/// when absent; it must be within the last 24 hours (Databento's limit).
+pub fn replay_start(s: Option<&str>, now: i64) -> Result<i64, String> {
+    let start = match s {
+        None => default_start(now),
+        Some(s) => OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+            .map_err(|e| format!("start: RFC 3339 ({e})"))?
+            .unix_timestamp(),
+    };
+    if start < now - REPLAY_LIMIT || start >= now {
+        return Err("start: within the last 24 hours".to_owned());
+    }
+    Ok(start)
+}
+
 #[derive(Deserialize)]
 struct Ask {
     symbol: String,
@@ -316,32 +354,15 @@ async fn serve(State(h): State<Arc<Session>>, Query(ask): Query<Ask>) -> (Status
             ),
         );
     }
-    let schema = match ask.schema.as_deref().unwrap_or("cbbo-1m") {
-        "cbbo-1m" => Schema::Cbbo1M,
-        "cbbo-1s" => Schema::Cbbo1S,
-        "tcbbo" => Schema::Tcbbo,
-        "trades" => Schema::Trades,
-        s => {
-            return refuse(
-                StatusCode::BAD_REQUEST,
-                format!("schema {s}: cbbo-1m, cbbo-1s, tcbbo or trades"),
-            );
-        }
+    let schema = match replay_schema(ask.schema.as_deref()) {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
     };
     let now = tinytrader_observe::unix_seconds() as i64;
-    let start = match ask.start.as_deref() {
-        None => default_start(now),
-        Some(s) => match OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339) {
-            Ok(t) => t.unix_timestamp(),
-            Err(e) => return refuse(StatusCode::BAD_REQUEST, format!("start: RFC 3339 ({e})")),
-        },
+    let start = match replay_start(ask.start.as_deref(), now) {
+        Ok(s) => s,
+        Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
     };
-    if start < now - REPLAY_LIMIT || start >= now {
-        return refuse(
-            StatusCode::BAD_REQUEST,
-            "start: within the last 24 hours".to_owned(),
-        );
-    }
     match h.quotes(&ask.symbol, schema, start).await {
         Ok(v) => (StatusCode::OK, Json(v)),
         Err(e) => refuse(StatusCode::BAD_GATEWAY, e),
@@ -359,10 +380,24 @@ mod tests {
         assert_eq!(occ_root("SPY"), None);
         assert_eq!(occ_root("SPY261012X00777000"), None);
         assert_eq!(opra_symbol("SPY261012C00777000"), "SPY   261012C00777000");
-        let h = Session::new("k", "OPRA.PILLAR", &["SPY.OPT".into()]).unwrap();
+        let h = Session::new(
+            "k",
+            "OPRA.PILLAR",
+            &["SPY.OPT".into()],
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
         assert!(h.serves("SPY261012C00777000"));
         assert!(!h.serves("QQQ261012C00500000"));
-        assert!(Session::new("k", "XNAS.ITCH", &["SPY".into()]).is_none());
+        assert!(
+            Session::new(
+                "k",
+                "XNAS.ITCH",
+                &["SPY".into()],
+                Arc::new(tokio::sync::Semaphore::new(1))
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -372,6 +407,26 @@ mod tests {
         // Before the open: the last 24 hours.
         let early = ny_to_unix(2026, 10, 12, 8, 0);
         assert_eq!(default_start(early), early - REPLAY_LIMIT + 60);
+    }
+
+    #[test]
+    fn starts_within_the_last_day() {
+        let now = ny_to_unix(2026, 10, 12, 12, 0);
+        let open = ny_to_unix(2026, 10, 12, 9, 30);
+        assert_eq!(replay_start(None, now), Ok(open));
+        assert_eq!(replay_start(Some("2026-10-12T13:30:00Z"), now), Ok(open));
+        let day_ago = |d: i64| {
+            OffsetDateTime::from_unix_timestamp(now - d)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        assert!(replay_start(Some(&day_ago(REPLAY_LIMIT - 1)), now).is_ok());
+        assert!(replay_start(Some(&day_ago(REPLAY_LIMIT + 1)), now).is_err());
+        assert!(replay_start(Some(&day_ago(-60)), now).is_err());
+        assert!(replay_start(Some("yesterday"), now).is_err());
+        assert_eq!(replay_schema(Some("tcbbo")), Ok(Schema::Tcbbo));
+        assert!(replay_schema(Some("cmbp-1")).is_err());
     }
 
     #[test]
@@ -400,7 +455,13 @@ mod live {
     async fn live_replay() {
         let key = std::env::var("DATABENTO_API_KEY").expect("DATABENTO_API_KEY");
         let sym = std::env::var("REPLAY_SYMBOL").unwrap_or_else(|_| "SPY261012C00777000".into());
-        let h = Session::new(&key, "OPRA.PILLAR", &["SPY.OPT".into()]).unwrap();
+        let h = Session::new(
+            &key,
+            "OPRA.PILLAR",
+            &["SPY.OPT".into()],
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        )
+        .unwrap();
         let now = tinytrader_observe::unix_seconds() as i64;
         let schema = std::env::var("REPLAY_SCHEMA").map_or(Schema::Cbbo1M, |s| s.parse().unwrap());
         let v = h.quotes(&sym, schema, default_start(now)).await.unwrap();

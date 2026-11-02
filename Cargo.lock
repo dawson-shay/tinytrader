@@ -2412,6 +2412,7 @@ dependencies = [
  "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tar",
  "time",
  "tinytrader-alpaca",
@@ -2420,6 +2421,7 @@ dependencies = [
  "tinytrader-schedule",
  "tokio",
  "tokio-tungstenite",
+ "zstd 0.13.3",
 ]
 
 [[package]]
