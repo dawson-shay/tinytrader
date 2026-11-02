@@ -193,7 +193,7 @@ This is not a recording of the stream: the relay still keeps nothing of what it 
 Not built yet; the code is laid out for them (a record source, a Databento session from a start until `ReplayCompleted`, apart from the file writer):
 
 - **A replay through the stream.** A join request carrying an optional replay (schema, start): the relay plays that replay's records to the client over `tinytrader.relay/1` as it would live data, then hands over to live or ends. Databento won't replay `cmbp-1` intraday, so a replay join gets `cbbo-1s`, `cbbo-1m`, `tcbbo` or `trades`, not the live `cmbp-1`, and the stream must say so.
-- **Recording the relay's output** (such as `RELAY_RECORD_DIR`, off by default): what the relay forwards, or what its Databento session receives, to files by the same writer. This changes decision 0006 ("keeps no recording"), which is amended when it is built. Its design follows Hyphae's recorder (`docs/design/continuous-recording-checkpoint-2026-09-29.md`, `docs/design/capture-quality.org`, `crates/dbn/src/tape_writer.rs`): sealed segments with checkpoints and an explicit end, as [decision 0013](../decisions/0013-lossless-capture-and-hot-swap.md) describes.
+- **Recording the relay's output** (such as `RELAY_RECORD_DIR`, off by default): what the relay forwards, or what its Databento session receives, to files by the same writer. This changes decision 0006 ("keeps no recording"), which is amended when it is built. Its design follows Hyphae's recorder (its continuous-recording design and tape writer): sealed segments with checkpoints and an explicit end, as [decision 0013](../decisions/0013-lossless-capture-and-hot-swap.md) describes.
 
 ## Stability
 
