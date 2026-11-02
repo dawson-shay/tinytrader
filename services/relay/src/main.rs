@@ -132,6 +132,11 @@ struct Args {
     /// a partial file).
     #[arg(long, env = "RELAY_REPLAY_TIMEOUT", default_value_t = 1800)]
     replay_timeout: u64,
+
+    /// Megabits a second a replay to file may read, at most; unlimited when
+    /// unset. A replay during market hours shares the link with the live feed.
+    #[arg(long, env = "RELAY_REPLAY_MAX_MBPS")]
+    replay_max_mbps: Option<f64>,
 }
 
 #[tokio::main]
@@ -245,8 +250,11 @@ async fn run(args: Args) -> Result<(), String> {
                     &args.dataset,
                     &args.symbols,
                     replay_stype,
-                    dir.clone(),
-                    Duration::from_secs(args.replay_timeout.max(1)),
+                    replay::Settings {
+                        dir: dir.clone(),
+                        timeout: Duration::from_secs(args.replay_timeout.max(1)),
+                        max_mbps: args.replay_max_mbps,
+                    },
                     turn,
                 )),
                 None => Err("replay files are off on this relay: set RELAY_REPLAY_DIR".to_owned()),

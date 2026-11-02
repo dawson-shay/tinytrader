@@ -28,6 +28,8 @@
 //! - **One at a time,** sharing `/session`'s turn: the relay holds at most two
 //!   of the dataset's sessions. A second request while one runs is `409`.
 //!   A replay is given up after `RELAY_REPLAY_TIMEOUT` seconds (30 minutes).
+//!   `RELAY_REPLAY_MAX_MBPS` paces its reads: in market hours it shares the
+//!   link with the live feed.
 //!
 //! The parts are kept apart for what comes next: a [`RecordSource`] yields DBN
 //! records (here [`LiveReplay`], a Databento live session from a start until
@@ -349,6 +351,40 @@ pub struct About<'a> {
     pub start: i64,
 }
 
+/// The file's metadata: the session's, saying what was asked for. A live
+/// gateway's header may leave the schema, symbology and symbols out, and
+/// readers (Python's `DBNStore.to_df()`) refuse a file without them.
+fn file_metadata(session: &Metadata, about: &About<'_>) -> Metadata {
+    let mut m = session.clone();
+    m.dataset = about.dataset.to_owned();
+    m.schema = Some(about.schema);
+    m.stype_in = Some(about.stype_in);
+    m.symbols = about.symbols.to_vec();
+    m.start = u64::try_from(about.start).unwrap_or(0) * 1_000_000_000;
+    m
+}
+
+/// How long to wait before reading more, to keep a replay's reads near
+/// `max_mbps` (megabits a second of DBN): `None` when not ahead of it.
+#[must_use]
+pub fn pace(read: u64, elapsed: Duration, max_mbps: f64) -> Option<Duration> {
+    if max_mbps <= 0.0 || !max_mbps.is_finite() {
+        return None;
+    }
+    let due = Duration::from_secs_f64(read as f64 * 8.0 / (max_mbps * 1e6));
+    due.checked_sub(elapsed)
+        .filter(|d| *d >= Duration::from_millis(5))
+}
+
+/// A replay's limits.
+#[derive(Clone, Copy)]
+pub struct Limits {
+    /// Given up then (kept as partial).
+    pub deadline: Instant,
+    /// Reads paced to this many megabits a second; unlimited when `None`.
+    pub max_mbps: Option<f64>,
+}
+
 /// Reads `src` into `paths.tmp` until Databento's `ReplayCompleted` (kept as
 /// `paths.file`), or until it ends otherwise or `deadline` passes (kept as
 /// `paths.partial`); then writes the sidecar. `Err` only when the file can't
@@ -357,13 +393,15 @@ pub async fn write_replay<S: RecordSource>(
     src: &mut S,
     paths: &Paths,
     about: &About<'_>,
-    deadline: Instant,
+    limits: Limits,
     records: &AtomicU64,
     bytes: Arc<AtomicU64>,
 ) -> Result<Written, String> {
+    let deadline = limits.deadline;
+    let (began, mut read, mut paced) = (Instant::now(), 0u64, 0u64);
     let io = |e: io::Error| format!("cannot write {}: {e}", paths.tmp.display());
     let file = {
-        let (tmp, metadata) = (paths.tmp.clone(), src.metadata().clone());
+        let (tmp, metadata) = (paths.tmp.clone(), file_metadata(src.metadata(), about));
         tokio::task::spawn_blocking(move || DbnFile::create(&tmp, &metadata, bytes))
             .await
             .map_err(|e| e.to_string())?
@@ -390,6 +428,7 @@ pub async fn write_replay<S: RecordSource>(
             }
             Ok(Ok(Some(r))) => r,
         };
+        read += r.as_ref().len() as u64;
         let done = if let Some(m) = r.get::<SystemMsg>() {
             if m.is_heartbeat() {
                 // Heartbeats only say the session is alive; everything else is kept.
@@ -417,6 +456,15 @@ pub async fn write_replay<S: RecordSource>(
             error = None;
             break;
         }
+        // Checked every 64 KiB read.
+        if let Some(mbps) = limits.max_mbps
+            && read - paced >= 64 << 10
+        {
+            paced = read;
+            if let Some(wait) = pace(read, began.elapsed(), mbps) {
+                tokio::time::sleep_until((Instant::now() + wait).min(deadline)).await;
+            }
+        }
     }
     let to = if completed {
         &paths.file
@@ -432,7 +480,12 @@ pub async fn write_replay<S: RecordSource>(
         sha256,
         error,
     };
-    let size = fs::metadata(to).map_or(0, |m| m.len());
+    let size = {
+        let to = to.clone();
+        tokio::task::spawn_blocking(move || fs::metadata(to).map_or(0, |m| m.len()))
+            .await
+            .unwrap_or(0)
+    };
     let rfc = |ns: i128| {
         OffsetDateTime::from_unix_timestamp_nanos(ns)
             .ok()
@@ -453,16 +506,20 @@ pub async fn write_replay<S: RecordSource>(
         "completed": w.completed,
         "error": w.error,
     });
-    let json_tmp = sidecar(&paths.tmp);
     let body = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
-    fs::write(&json_tmp, body)
-        .and_then(|()| fs::rename(&json_tmp, sidecar(to)))
-        .map_err(io)?;
-    if completed {
-        // An earlier attempt's partial file is superseded.
-        let _ = fs::remove_file(&paths.partial);
-        let _ = fs::remove_file(sidecar(&paths.partial));
-    }
+    let (json_tmp, json, partial) = (sidecar(&paths.tmp), sidecar(to), paths.partial.clone());
+    tokio::task::spawn_blocking(move || {
+        fs::write(&json_tmp, body).and_then(|()| fs::rename(&json_tmp, json))?;
+        if completed {
+            // An earlier attempt's partial file is superseded.
+            let _ = fs::remove_file(sidecar(&partial));
+            let _ = fs::remove_file(partial);
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(io)?;
     Ok(w)
 }
 
@@ -497,6 +554,16 @@ impl Job {
     }
 }
 
+/// Where replay files go, and their limits.
+pub struct Settings {
+    /// `RELAY_REPLAY_DIR`.
+    pub dir: PathBuf,
+    /// `RELAY_REPLAY_TIMEOUT`.
+    pub timeout: Duration,
+    /// `RELAY_REPLAY_MAX_MBPS`: reads paced to this; unlimited when `None`.
+    pub max_mbps: Option<f64>,
+}
+
 /// Replays to file for one Databento relay.
 pub struct Replays {
     key: String,
@@ -505,6 +572,7 @@ pub struct Replays {
     stype_in: SType,
     dir: PathBuf,
     timeout: Duration,
+    max_mbps: Option<f64>,
     /// Shared with `/session`.
     one: Arc<Semaphore>,
     jobs: Mutex<VecDeque<Job>>,
@@ -518,8 +586,7 @@ impl Replays {
         dataset: &str,
         symbols: &[String],
         stype_in: SType,
-        dir: PathBuf,
-        timeout: Duration,
+        settings: Settings,
         one: Arc<Semaphore>,
     ) -> Arc<Self> {
         Arc::new(Self {
@@ -527,8 +594,9 @@ impl Replays {
             dataset: dataset.to_owned(),
             symbols: symbols.to_vec(),
             stype_in,
-            dir,
-            timeout,
+            dir: settings.dir,
+            timeout: settings.timeout,
+            max_mbps: settings.max_mbps,
             one,
             jobs: Mutex::default(),
             next: AtomicU64::new(1),
@@ -596,8 +664,16 @@ impl Replays {
         }
         let me = self.clone();
         tokio::spawn(async move {
+            // The turn is held until the job is marked finished, whatever
+            // becomes of the replay (a panic in it too).
             let _permit = permit;
-            let result = me.run(&paths, schema, start, &records, bytes).await;
+            let run = {
+                let me = me.clone();
+                tokio::spawn(async move { me.run(&paths, schema, start, &records, bytes).await })
+            };
+            let result = run
+                .await
+                .unwrap_or_else(|e| Err(format!("the replay stopped unexpectedly: {e}")));
             let mut jobs = me.lock();
             let Some(j) = jobs.iter_mut().find(|j| j.id == id) else {
                 return;
@@ -648,10 +724,15 @@ impl Replays {
             schema,
             start,
         };
-        let w = write_replay(&mut src, paths, &about, deadline, records, bytes).await;
+        let limits = Limits {
+            deadline,
+            max_mbps: self.max_mbps,
+        };
+        let w = write_replay(&mut src, paths, &about, limits, records, bytes).await;
         src.close().await;
         if w.is_err() {
-            let _ = fs::remove_file(&paths.tmp);
+            let tmp = paths.tmp.clone();
+            let _ = tokio::task::spawn_blocking(move || fs::remove_file(tmp)).await;
         }
         w
     }
@@ -788,13 +869,14 @@ mod tests {
                     SystemMsg::new(5_000, Some(SystemCode::ReplayCompleted), "done").unwrap();
                 records.push_back(RecordBuf::from(done));
             }
+            // As a live gateway's header may be: no schema, symbology or
+            // symbols.
             let metadata = Metadata::builder()
                 .dataset("OPRA.PILLAR".to_owned())
-                .schema(Some(Schema::Trades))
+                .schema(None)
                 .start(1_000)
-                .stype_in(Some(SType::Parent))
+                .stype_in(None)
                 .stype_out(SType::InstrumentId)
-                .symbols(spy())
                 .build();
             Self {
                 metadata,
@@ -830,17 +912,13 @@ mod tests {
             schema: Schema::Trades,
             start: 1_791_811_800,
         };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let w = write_replay(
-            fake,
-            &p,
-            &about,
-            deadline,
-            &AtomicU64::new(0),
-            Arc::default(),
-        )
-        .await
-        .unwrap();
+        let limits = Limits {
+            deadline: Instant::now() + Duration::from_secs(10),
+            max_mbps: None,
+        };
+        let w = write_replay(fake, &p, &about, limits, &AtomicU64::new(0), Arc::default())
+            .await
+            .unwrap();
         (p, w)
     }
 
@@ -864,7 +942,11 @@ mod tests {
         assert_eq!(w.file, p.file);
         assert!(!p.tmp.exists() && !p.partial.exists());
         let (meta, ts) = read_back(&p.file);
+        // The session's header said none of these; the file does.
         assert_eq!(meta.symbols, spy());
+        assert_eq!(meta.schema, Some(Schema::Trades));
+        assert_eq!(meta.stype_in, Some(SType::Parent));
+        assert_eq!(meta.start, 1_791_811_800 * 1_000_000_000);
         assert_eq!(ts.len() as u64, n + 1);
         assert_eq!(w.end, Some(1_000 + n - 1));
         let side: Value = serde_json::from_slice(&fs::read(sidecar(&p.file)).unwrap()).unwrap();
@@ -906,10 +988,25 @@ mod tests {
             "OPRA.PILLAR",
             &spy(),
             SType::Parent,
-            dir,
-            Duration::from_secs(60),
+            Settings {
+                dir,
+                timeout: Duration::from_secs(60),
+                max_mbps: None,
+            },
             one,
         )
+    }
+
+    #[test]
+    fn paces_reads_to_the_limit() {
+        // 1 MB at 8 Mb/s is due after a second.
+        let mb = 1_000_000;
+        assert_eq!(
+            pace(mb, Duration::from_millis(250), 8.0),
+            Some(Duration::from_millis(750))
+        );
+        assert_eq!(pace(mb, Duration::from_secs(2), 8.0), None);
+        assert_eq!(pace(mb, Duration::ZERO, 0.0), None);
     }
 
     #[tokio::test]

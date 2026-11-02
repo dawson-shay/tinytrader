@@ -164,7 +164,7 @@ async fn serve(State(ctx): State<Arc<Ctx>>, Query(ask): Query<Ask>) -> (StatusCo
                     ),
                 )
             }
-            Err(e) => (StatusCode::BAD_GATEWAY, Json(json!({ "error": e }))),
+            Err(e) => (e.status(), Json(json!({ "error": e.to_string() }))),
         };
     }
     if !ctx.bars.lock().symbols.contains(&ask.symbol) {

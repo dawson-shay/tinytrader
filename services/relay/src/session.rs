@@ -103,7 +103,7 @@ impl Session {
     }
 
     /// The contract's quotes from `start` (Unix seconds) to now.
-    pub async fn quotes(&self, symbol: &str, schema: Schema, start: i64) -> Result<Value, String> {
+    pub async fn quotes(&self, symbol: &str, schema: Schema, start: i64) -> Result<Value, Failed> {
         let key = (symbol.to_owned(), schema, start);
         if let Some((at, v)) = self.lock().get(&key)
             && at.elapsed() < KEEP
@@ -113,8 +113,8 @@ impl Session {
         // A replay to file (`/replay`) may hold the turn for many minutes.
         let _turn = tokio::time::timeout(WAIT, self.one.acquire())
             .await
-            .map_err(|_| "another replay is running; try again later".to_owned())?
-            .map_err(|e| e.to_string())?;
+            .map_err(|_| Failed::Busy)?
+            .map_err(|e| Failed::Upstream(e.to_string()))?;
         // Another request may have filled it while this one waited.
         if let Some((at, v)) = self.lock().get(&key)
             && at.elapsed() < KEEP
@@ -123,7 +123,8 @@ impl Session {
         }
         let (rows, complete) = tokio::time::timeout(WAIT, self.replay(symbol, schema, start))
             .await
-            .map_err(|_| format!("the replay took over {} s", WAIT.as_secs()))??;
+            .map_err(|_| Failed::Upstream(format!("the replay took over {} s", WAIT.as_secs())))?
+            .map_err(Failed::Upstream)?;
         let note = (!complete)
             .then(|| "Databento ended the session before the replay completed".to_owned());
         let v = json!({ "symbol": symbol, "schema": schema.to_string(), "start": start, "fields": fields(schema), "rows": rows, "note": note });
@@ -204,6 +205,56 @@ impl Session {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Cache> {
         self.cache.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Why a replay couldn't be had.
+#[derive(Debug)]
+pub enum Failed {
+    /// Another replay holds the turn: a `/replay` file or another `/session`.
+    Busy,
+    /// Databento failed or took too long.
+    Upstream(String),
+}
+
+/// Seconds a busy answer asks the client to wait.
+pub const RETRY_AFTER: u64 = 30;
+
+impl Failed {
+    /// `503` when busy, `502` when Databento failed.
+    #[must_use]
+    pub fn status(&self) -> StatusCode {
+        match self {
+            Self::Busy => StatusCode::SERVICE_UNAVAILABLE,
+            Self::Upstream(_) => StatusCode::BAD_GATEWAY,
+        }
+    }
+}
+
+impl std::fmt::Display for Failed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy => write!(
+                f,
+                "another replay is running (a /replay file or another /session); try again in {RETRY_AFTER} s"
+            ),
+            Self::Upstream(e) => f.write_str(e),
+        }
+    }
+}
+
+impl axum::response::IntoResponse for Failed {
+    fn into_response(self) -> axum::response::Response {
+        let body = Json(json!({ "error": self.to_string() }));
+        match self {
+            Self::Busy => (
+                self.status(),
+                [(axum::http::header::RETRY_AFTER, RETRY_AFTER.to_string())],
+                body,
+            )
+                .into_response(),
+            Self::Upstream(_) => (self.status(), body).into_response(),
+        }
     }
 }
 
@@ -341,8 +392,9 @@ pub fn router(session: Arc<Session>) -> Router {
         .with_state(session)
 }
 
-async fn serve(State(h): State<Arc<Session>>, Query(ask): Query<Ask>) -> (StatusCode, Json<Value>) {
-    let refuse = |code, e: String| (code, Json(json!({ "error": e })));
+async fn serve(State(h): State<Arc<Session>>, Query(ask): Query<Ask>) -> axum::response::Response {
+    use axum::response::IntoResponse as _;
+    let refuse = |code, e: String| (code, Json(json!({ "error": e }))).into_response();
     if !h.serves(&ask.symbol) {
         return refuse(
             StatusCode::NOT_FOUND,
@@ -364,8 +416,8 @@ async fn serve(State(h): State<Arc<Session>>, Query(ask): Query<Ask>) -> (Status
         Err(e) => return refuse(StatusCode::BAD_REQUEST, e),
     };
     match h.quotes(&ask.symbol, schema, start).await {
-        Ok(v) => (StatusCode::OK, Json(v)),
-        Err(e) => refuse(StatusCode::BAD_GATEWAY, e),
+        Ok(v) => (StatusCode::OK, Json(v)).into_response(),
+        Err(e) => e.into_response(),
     }
 }
 
@@ -407,6 +459,18 @@ mod tests {
         // Before the open: the last 24 hours.
         let early = ny_to_unix(2026, 10, 12, 8, 0);
         assert_eq!(default_start(early), early - REPLAY_LIMIT + 60);
+    }
+
+    #[test]
+    fn busy_is_503_with_retry_after() {
+        use axum::response::IntoResponse as _;
+        let r = Failed::Busy.into_response();
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers()["retry-after"], "30");
+        assert_eq!(
+            Failed::Upstream("x".into()).into_response().status(),
+            StatusCode::BAD_GATEWAY
+        );
     }
 
     #[test]

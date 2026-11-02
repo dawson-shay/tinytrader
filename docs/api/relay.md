@@ -144,7 +144,7 @@ Today's data for one option contract, from Databento's intraday replay. Each req
 
 `side` is `A` (sell aggressor), `B` (buy) or `N` (unknown, usual for OPRA). `note` is set when Databento ended the session before the replay completed.
 
-- **Limits:** one replay runs at a time per relay, so a relay holds at most two of the dataset's live sessions (Databento allows 10 per dataset on Standard). Answers are kept for a minute. A replay taking over 30 seconds fails with `502`.
+- **Limits:** one replay runs at a time per relay, so a relay holds at most two of the dataset's live sessions (Databento allows 10 per dataset on Standard). Answers are kept for a minute. A replay taking over 30 seconds fails with `502`. While another replay holds the turn (a `/replay` file, or another `/session`) for over 30 seconds, the answer is `503` with `Retry-After: 30`.
 - **Sizes:** a busy at-the-money 0DTE contract at midday is about 250 `cbbo-1m` rows and 20,000 `tcbbo` rows.
 - **Session and history:** this serves the current session, held in memory. Past days are history: bought from Databento as batch files, filed in the store and read from disk (the Data page's jobs, which quote a price before any purchase).
 - **Cost:** intraday replay is assumed to be included in the live plan (decision 0006); confirm against Databento's usage page.
@@ -171,10 +171,11 @@ This is not a recording of the stream: the relay still keeps nothing of what it 
 - `POST` answers `202` with `{"id": 1, "file": "<path>", "state": "running"}`. One replay runs at a time, sharing `/session`'s turn so the relay holds at most two of the dataset's sessions: a `POST` while one runs (or while a `/session` replay runs) is `409`. A bad schema or start is `400`.
 - `GET /replay` lists the last 32 replays, newest first, as `{"replays": [...]}`; `GET /replay/{id}` gives one: `{id, state, schema, start, file, records, bytes, started, finished, error}`. `state` is `running`, `done` or `failed`; `start`, `started` and `finished` are Unix seconds; `records` and `bytes` count up while it runs. Ids restart with the relay.
 - A replay is given up after `RELAY_REPLAY_TIMEOUT` seconds (default 1800).
+- **The network:** a replay during market hours shares the machine's link with the live feed, and Databento sends a replay as fast as it is read. `RELAY_REPLAY_MAX_MBPS` (unset: unlimited) paces the reads to that many megabits a second of DBN. Pace it well below Databento's rate, or Databento may count the replay session as a slow reader. Busy `tcbbo` or `cbbo-1s` replays of a whole parent are the heavy ones.
 
 **The file** is `<RELAY_REPLAY_DIR>/<YYYY-MM-DD>/<dataset>-<roots>-<schema>-<start>.dbn.zst`: the date of `start` in New York, `<roots>` the parents without `.OPT` joined by `_`, `<start>` in Unix seconds, such as `2026-11-02/OPRA.PILLAR-SPY-cbbo-1m-1793629800.dbn.zst`.
 
-- DBN v3: the session's metadata, then every record Databento sent except heartbeats, unchanged (symbol mappings, definitions where the schema carries them, and the `ReplayCompleted` system record, which ends a complete file).
+- DBN v3: the session's metadata, with the schema, `stype_in`, symbols (the parents) and start set to what was asked for (a live gateway's header leaves them out, and readers such as `DBNStore.to_df()` need them), then every record Databento sent except heartbeats, unchanged (symbol mappings, definitions where the schema carries them, and the `ReplayCompleted` system record, which ends a complete file).
 - Zstandard, as independent checksummed frames of at most 4 MiB decoded that never split a record, so any zstd or DBN reader reads it and a partial file reads up to its last whole frame. Records go to disk as they arrive.
 - Written as `….dbn.zst.tmp` and renamed when the replay completes. A replay that ends otherwise (Databento closes the session, an error, the timeout) is kept as `….partial.dbn.zst`, the job `failed` with the reason in `error`. A complete replay of the same schema and start replaces the earlier file and removes its partial one.
 - Beside it, `<file>.json`:
