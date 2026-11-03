@@ -73,7 +73,23 @@ capability is the exception ([decision 0004](docs/decisions/0004-nix-not-nixos.m
 ## Resource bounds
 
 - No unbounded queue, buffer, cache or log inside a service: every one has a
-  fixed capacity (as `Events` and `Series` do).
+  fixed capacity (as `Events` and `Series` do), and says what happens when it's
+  full: the sender waits (backpressure, where waiting can't deadlock), the item
+  is refused with an answer (`busy`), the consumer is cut off and resumes
+  (`slow_consumer`), or the run stops naming the limit. A channel is never
+  `channel()` or `unbounded_channel()`.
+
+## Shared state
+
+- State that changes belongs to one owner: a thread or task that holds it and is
+  reached by messages, as the order gateway's account session is. Others ask it;
+  they don't share it.
+- No shared mutable state behind a lock that more than one thread contends for.
+  A lock is acceptable only where it guards a small structure with one writer and
+  one reader that never wait on each other for long (a connection's outbound
+  queue); say so where it's declared. A global lock over shared work (one for a
+  whole store's filing, say) is a defect to shard or replace with an owner.
+- Read-mostly counters and flags are atomics; values set once are `OnceLock`s.
 - Services get supervisor limits by default: `resources` in the
   `tinytrader.services` module (memory, CPU, tasks, open files, restart loops,
   a capped journal) and memory caps plus log rotation in Compose files.
