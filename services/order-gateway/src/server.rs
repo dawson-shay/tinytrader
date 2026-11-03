@@ -348,6 +348,55 @@ pub(crate) const INBOX: usize = 1024;
 pub(crate) const URGENT: usize = 64;
 
 impl Shared {
+    /// The client a hello names, if its token is that client's (compared in
+    /// constant time).
+    fn authenticate(&self, name: &str, token: &str) -> Option<usize> {
+        let presented = digest(token);
+        self.clients.iter().position(|c| {
+            let want = digest(&c.token);
+            c.name == name && presented.iter().zip(want).fold(0, |a, (x, y)| a | (x ^ y)) == 0
+        })
+    }
+
+    /// One line from a connected client, after its hello: a request into the
+    /// inbox, or a fatal error that closes the connection (`false`). The one
+    /// path a TCP connection and an in-process client both take.
+    fn line(&self, ob: &Outbox, client: usize, id: u64, buf: &[u8]) -> bool {
+        let fatal = |code: &str, msg: &str| ob.close(Some(error_line(code, msg)));
+        match parse_line(buf) {
+            Ok(Line::Heartbeat) => {}
+            Ok(Line::Request { request_id, op }) => self.request(
+                ob,
+                client,
+                Input::Request {
+                    id,
+                    request: Ok((request_id, op)),
+                },
+            ),
+            Ok(Line::Hello(_)) => {
+                fatal("hello_required", "hello only once");
+                return false;
+            }
+            Err(LineError::Fatal(code, msg)) => {
+                fatal(code, &msg);
+                return false;
+            }
+            Err(LineError::Invalid {
+                request_id,
+                op,
+                invalid,
+            }) => self.request(
+                ob,
+                client,
+                Input::Request {
+                    id,
+                    request: Err((request_id, op, invalid)),
+                },
+            ),
+        }
+        true
+    }
+
     /// A connection's lifecycle (hello, closed): waits for room, as the session
     /// must see it.
     fn send(&self, input: Input) {
@@ -430,12 +479,7 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
         Err(LineError::Fatal(code, msg)) => return fatal(code, &msg),
         _ => return fatal("hello_required", "the first line must be hello"),
     };
-    let presented = digest(&hello.token);
-    let client = sh.clients.iter().position(|c| {
-        let want = digest(&c.token);
-        c.name == hello.client && presented.iter().zip(want).fold(0, |a, (x, y)| a | (x ^ y)) == 0
-    });
-    let Some(client) = client else {
+    let Some(client) = sh.authenticate(&hello.client, &hello.token) else {
         return fatal("unauthorized", "unknown client or bad token");
     };
     sh.send(Input::Hello {
@@ -469,36 +513,8 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
                 break;
             }
         }
-        match parse_line(&buf) {
-            Ok(Line::Heartbeat) => {}
-            Ok(Line::Request { request_id, op }) => sh.request(
-                &ob,
-                client,
-                Input::Request {
-                    id,
-                    request: Ok((request_id, op)),
-                },
-            ),
-            Ok(Line::Hello(_)) => {
-                fatal("hello_required", "hello only once");
-                break;
-            }
-            Err(LineError::Fatal(code, msg)) => {
-                fatal(code, &msg);
-                break;
-            }
-            Err(LineError::Invalid {
-                request_id,
-                op,
-                invalid,
-            }) => sh.request(
-                &ob,
-                client,
-                Input::Request {
-                    id,
-                    request: Err((request_id, op, invalid)),
-                },
-            ),
+        if !sh.line(&ob, client, id, &buf) {
+            break;
         }
     }
 }
@@ -521,6 +537,72 @@ pub struct Gateway {
     tx: SyncSender<Input>,
     stop: Arc<AtomicBool>,
     session: JoinHandle<Result<(), String>>,
+    shared: Arc<Shared>,
+    /// Connection ids, TCP and in-process alike, from 1.
+    next_id: Arc<AtomicU64>,
+}
+
+/// A client connected in process (decision 0029's `inproc` transport): the same
+/// hello, authentication, parsing, inbox and admission as a TCP connection, with
+/// lines handed over directly instead of through a socket. Dropped, it closes as a
+/// connection does (cancel-on-disconnect included).
+pub struct LocalClient {
+    sh: Arc<Shared>,
+    id: u64,
+    client: usize,
+    ob: Arc<Outbox>,
+}
+
+impl LocalClient {
+    /// Sends a message of type `ty` with `fields` (a JSON object's members), as
+    /// [`crate::client::Client::send`] writes it.
+    ///
+    /// # Errors
+    /// A line over [`MAX_LINE`], or a closed connection.
+    pub fn send(&self, ty: &str, fields: &str) -> Result<(), String> {
+        self.send_raw(Obj::msg(ty).merge(fields).done().as_bytes())
+    }
+
+    /// Sends one line, as a TCP client's line would be read.
+    ///
+    /// # Errors
+    /// A line over [`MAX_LINE`] (which closes the connection, as on TCP), or a
+    /// closed connection.
+    pub fn send_raw(&self, line: &[u8]) -> Result<(), String> {
+        if self.ob.closed() {
+            return Err("the connection is closed".into());
+        }
+        if line.len() >= MAX_LINE {
+            self.ob
+                .close(Some(error_line("line_too_long", "line exceeds 65536 bytes")));
+            return Err("line exceeds 65536 bytes".into());
+        }
+        if self.sh.line(&self.ob, self.client, self.id, line) {
+            Ok(())
+        } else {
+            Err("the gateway closed the connection".into())
+        }
+    }
+
+    /// The next line from the gateway, waiting at most `wait`: `Ok(None)` if none
+    /// came, `Err` once the connection is closed and drained.
+    ///
+    /// # Errors
+    /// The connection closed.
+    pub fn line(&self, wait: Duration) -> Result<Option<String>, String> {
+        match self.ob.pop(wait) {
+            Pop::Line(l) => Ok(Some(l)),
+            Pop::Idle => Ok(None),
+            Pop::Closed => Err("the connection is closed".into()),
+        }
+    }
+}
+
+impl Drop for LocalClient {
+    fn drop(&mut self) {
+        self.ob.close(None);
+        self.sh.send(Input::Closed(self.id));
+    }
 }
 
 /// An in-process clock for a simulated account (decision 0022): the session that owns
@@ -565,6 +647,41 @@ impl Clock {
 }
 
 impl Gateway {
+    /// Connects a client in process: its hello, as `client` with `token`, and the
+    /// gateway's answer (the welcome, the first line from [`LocalClient::line`]).
+    ///
+    /// # Errors
+    /// An unknown client or bad token, or no answer to the hello in time.
+    pub fn connect_local(
+        &self,
+        client: &str,
+        token: &str,
+        cancel_on_disconnect: bool,
+    ) -> Result<LocalClient, String> {
+        let Some(client) = self.shared.authenticate(client, token) else {
+            return Err("unauthorized: unknown client or bad token".into());
+        };
+        let id = self.next_id.fetch_add(1, SeqCst) + 1;
+        let ob = Arc::new(Outbox::new(self.shared.timing.queue_bytes));
+        self.shared.send(Input::Hello {
+            id,
+            client,
+            outbox: Arc::clone(&ob),
+            resume: None,
+            cancel_on_disconnect,
+        });
+        let local = LocalClient {
+            sh: Arc::clone(&self.shared),
+            id,
+            client,
+            ob,
+        };
+        if !local.ob.wait_started(self.shared.timing.hello) {
+            return Err("the account didn't answer the hello in time".into());
+        }
+        Ok(local)
+    }
+
     /// The account's clock, for a session that owns market time.
     #[must_use]
     pub fn clock(&self) -> Clock {
@@ -631,15 +748,18 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
     let session = thread::spawn(move || session.run(&rx, &urgent_rx));
     let stop = Arc::new(AtomicBool::new(false));
     let accept_stop = Arc::clone(&stop);
+    let next_id = Arc::new(AtomicU64::new(0));
+    let (accept_shared, accept_next) = (Arc::clone(&shared), Arc::clone(&next_id));
     thread::spawn(move || {
-        let mut next = 0;
         for stream in listener.incoming() {
             if accept_stop.load(SeqCst) {
                 break;
             }
             let Ok(stream) = stream else { continue };
-            next += 1;
-            let (sh, id) = (Arc::clone(&shared), next);
+            let (sh, id) = (
+                Arc::clone(&accept_shared),
+                accept_next.fetch_add(1, SeqCst) + 1,
+            );
             thread::spawn(move || connection(&stream, id, &sh));
         }
     });
@@ -648,6 +768,8 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
         tx,
         stop,
         session,
+        shared,
+        next_id,
     })
 }
 

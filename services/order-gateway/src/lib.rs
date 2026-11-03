@@ -23,7 +23,7 @@ pub use intent::{Class, Intent, Leg, MaxLoss, future_multiplier, max_loss};
 pub use protocol::{KillLevel, MAX_LINE, SCHEMA};
 pub use safety::Profile;
 pub use server::{
-    ClientSpec, Clock, Config, Gateway, Role, Timing, check_paths, check_state, check_state_under,
+    ClientSpec, Clock, Config, Gateway, LocalClient, Role, Timing, check_paths, check_state, check_state_under,
     start,
 };
 pub use session::{Advanced, wall_ns};
