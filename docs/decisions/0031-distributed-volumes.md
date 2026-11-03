@@ -283,6 +283,11 @@ and it is never bought again.
   - **Only an operator unseals:** `POST /volumes/{id}/unseal` with the path
     (or none, for the whole volume) and a reason. That removes it from both,
     and is recorded in `/events` and the state file, with who and why.
+    - It needs the **operator token** (`STORE_OPERATOR_TOKEN_FILE`), a
+      credential of its own, never the write token that databento-jobs and
+      alpaca-history hold. Without one configured, unseal is refused.
+    - Sealing, `--apply` and `--immutable` take the same token, so a client
+      that files can neither change a seal nor migrate.
   - **Before the migration, a seal by configuration.** `STORE_SEALED` (such
     as `data:Databento`, as `VOLUME:PATH`, comma-separated) seals paths on
     today's store, enforced by the same write gate, with no marker and no
@@ -291,6 +296,14 @@ and it is never bought again.
     `apply_conditions` or scan settling a merge can write under it in
     between. The migration carries each such seal into the volume's v1
     marker and the registry.
+    - **Until the migration, `STORE_SEALED` is the protection.** Dropping it
+      from the configuration unseals those paths, so it is protected
+      deployment configuration.
+      - The deployment's store module sets it from the inventory (a data
+        root marked sealed).
+      - A check refuses a store configuration without it on a host holding a
+        sealed root.
+      - The store logs its seals at startup and shows them in `/describe`.
   - **Sealing a path** (`POST /volumes/{id}/seal` with `{ "path": … }`) waits
     for the filer to finish any write under it, checks its files against the
     manifests, and adds it to the marker's `sealed` list. The volume stays
