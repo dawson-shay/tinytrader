@@ -1,0 +1,79 @@
+{
+  "audit": "055970b8c245433a10ef2552ff9bde629084d8c1aab8e41bfa49f44a270c84a2",
+  "reason": "the strategy's first ready must be ready{as_of: 0}, sending nothing",
+  "received": [
+    {
+      "audit": "055970b8c245433a10ef2552ff9bde629084d8c1aab8e41bfa49f44a270c84a2",
+      "reason": "the strategy's first ready must be ready{as_of: 0}, sending nothing",
+      "records": 0,
+      "reports": null,
+      "status": "incomplete",
+      "steps": 0,
+      "type": "end"
+    }
+  ],
+  "records": 0,
+  "run": {
+    "audit": "055970b8c245433a10ef2552ff9bde629084d8c1aab8e41bfa49f44a270c84a2",
+    "calendar_sha256": null,
+    "days": [
+      "2026-10-27"
+    ],
+    "format": "tinytrader.session-run/1",
+    "lockstep": {
+      "batch": "instant",
+      "strategy_latency_ms": 0
+    },
+    "merge": {
+      "order": "(ts, class, rank, position)",
+      "ranks": [
+        "opra"
+      ]
+    },
+    "mode": "backtest",
+    "reason": "the strategy's first ready must be ready{as_of: 0}, sending nothing",
+    "records": 0,
+    "seed": 0,
+    "sources": [
+      {
+        "clamped": 0,
+        "dataset": "OPRA.PILLAR",
+        "days": [],
+        "expiries_within_days": null,
+        "latency_offset_ns": 0,
+        "name": "opra",
+        "reading": [],
+        "records": 0,
+        "schema": "cbbo-1m",
+        "symbol": "SPY.OPT"
+      }
+    ],
+    "status": "incomplete",
+    "steps": 0,
+    "strategy": {
+      "name": "toy",
+      "revision": "test"
+    },
+    "strategy_process": null,
+    "venues": [
+      {
+        "model": "tinytrader-sim/9",
+        "name": "options",
+        "quotes": [
+          "opra"
+        ],
+        "script": {
+          "expiry": {
+            "settle": false
+          },
+          "fee_per_contract": "0.65",
+          "seed": 14575324489130542917,
+          "strategy_latency_ms": 0
+        },
+        "sent": null
+      }
+    ]
+  },
+  "status": "incomplete",
+  "steps": 0
+}
