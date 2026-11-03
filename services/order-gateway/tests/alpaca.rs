@@ -1065,3 +1065,200 @@ fn alpaca_refuses_futures_and_reconciles_allowed_roots() {
     assert!(posts(&r.fake).is_empty());
     r.gw.stop().unwrap();
 }
+
+/// The journal's events of `kind`, parsed.
+fn journaled(state: &std::path::Path, kind: &str) -> Vec<Value> {
+    journal(state)
+        .iter()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["kind"] == kind)
+        .collect()
+}
+
+/// Waits until the journal holds at least `n` events of `kind`.
+fn wait_journaled(state: &std::path::Path, kind: &str, n: usize) -> Vec<Value> {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let got = journaled(state, kind);
+        if got.len() >= n {
+            return got;
+        }
+        assert!(Instant::now() < until, "{kind}: {} of {n}", got.len());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Waits for a reconcile after a restart: `n` resync statuses in the journal.
+fn wait_resyncs(state: &std::path::Path, n: usize) {
+    let until = Instant::now() + Duration::from_secs(10);
+    while journaled(state, "status")
+        .iter()
+        .filter(|v| v.get("resync").is_some())
+        .count()
+        < n
+    {
+        assert!(Instant::now() < until, "no resync");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn resyncs(state: &std::path::Path) -> usize {
+    journaled(state, "status")
+        .iter()
+        .filter(|v| v.get("resync").is_some())
+        .count()
+}
+
+/// A broker order of its own (a liquidation): `qty` of `symbol`, bought.
+fn broker_buy(fake: &Fake, cid: &str, symbol: &str, qty: u64) {
+    fake.appear(&format!(
+        r#"{{"client_order_id":"{cid}","symbol":"{symbol}","qty":"{qty}","side":"buy","type":"market","time_in_force":"day"}}"#
+    ));
+}
+
+/// A liquidation by the broker, new → partial → fill on the stream: one `foreign`
+/// event and a `foreign_fill` per execution. A restart's REST reconcile then sees
+/// the same fills and reports none again.
+#[test]
+fn a_broker_liquidation_reports_each_fill_once() {
+    let r = rig("foreign-fills-stream");
+    let _c = ready(&r.gw, "reactor");
+    broker_buy(&r.fake, "liq-1", PUT_A, 2);
+    r.fake.event("liq-1", "new", "new");
+    r.fake.fill("liq-1", 1, "0.33");
+    r.fake.fill("liq-1", 1, "0.35");
+    let ff = wait_journaled(&r.state, "foreign_fill", 2);
+    assert_eq!(journaled(&r.state, "foreign").len(), 1);
+    for (f, (price, cum)) in ff.iter().zip([("0.33", 1), ("0.35", 2)]) {
+        assert_eq!(f["symbol"], PUT_A, "{f}");
+        assert_eq!(f["side"], "buy", "{f}");
+        assert_eq!(f["qty"], 1, "{f}");
+        assert_eq!(f["price"], price, "{f}");
+        assert_eq!(f["price_basis"], "fill", "{f}");
+        assert_eq!(f["filled_qty"], cum, "{f}");
+        assert_eq!(f["source"], "stream", "{f}");
+        assert!(f["execution_id"].as_str().is_some(), "{f}");
+    }
+    let before = resyncs(&r.state);
+    let r = restart(r, 2);
+    wait_resyncs(&r.state, before + 1);
+    let _c = ready(&r.gw, "reactor");
+    assert_eq!(
+        journaled(&r.state, "foreign_fill").len(),
+        2,
+        "no fill twice"
+    );
+    r.gw.stop().unwrap();
+}
+
+/// A restart between the partial and the fill: the REST reconcile reports nothing
+/// already reported; the stream's last fill is reported, once.
+#[test]
+fn a_restart_mid_way_reports_only_the_rest() {
+    let r = rig("foreign-fills-restart");
+    let _c = ready(&r.gw, "reactor");
+    broker_buy(&r.fake, "liq-2", PUT_A, 2);
+    r.fake.event("liq-2", "new", "new");
+    r.fake.fill("liq-2", 1, "0.33");
+    wait_journaled(&r.state, "foreign_fill", 1);
+    let before = resyncs(&r.state);
+    let r = restart(r, 2);
+    // Both reconciles (startup, and once the stream listens) before the stream fills.
+    wait_resyncs(&r.state, before + 2);
+    assert_eq!(journaled(&r.state, "foreign_fill").len(), 1);
+    r.fake.fill("liq-2", 1, "0.35");
+    let ff = wait_journaled(&r.state, "foreign_fill", 2);
+    assert_eq!(
+        (ff[1]["qty"].as_u64(), ff[1]["price"].as_str()),
+        (Some(1), Some("0.35"))
+    );
+    r.gw.stop().unwrap();
+}
+
+/// A fill the REST reconcile sees first is reported from it (priced from the average);
+/// the stream's copy of it isn't reported again, and the next fill is, once.
+#[test]
+fn rest_first_then_the_stream_reports_no_fill_twice() {
+    let r = rig("foreign-fills-rest-first");
+    let _c = ready(&r.gw, "reactor");
+    broker_buy(&r.fake, "liq-3", PUT_A, 2);
+    {
+        let mut st = r.fake.lock();
+        let o = st.orders.iter_mut().find(|o| o.cid == "liq-3").unwrap();
+        o.filled = 1;
+        o.avg = Some("0.33".into());
+        o.status = "partially_filled".into();
+    }
+    let before = resyncs(&r.state);
+    let r = restart(r, 2);
+    // Both reconciles (startup, and once the stream listens) before the stream fills.
+    wait_resyncs(&r.state, before + 2);
+    let ff = wait_journaled(&r.state, "foreign_fill", 1);
+    assert_eq!(ff[0]["source"], "rest_reconcile", "{}", ff[0]);
+    assert_eq!(ff[0]["price_basis"], "avg_delta", "{}", ff[0]);
+    assert_eq!(ff[0]["price"], "0.33", "{}", ff[0]);
+    // The stream then fills the second contract at 0.35 (average 0.34).
+    r.fake.fill("liq-3", 1, "0.35");
+    let ff = wait_journaled(&r.state, "foreign_fill", 2);
+    // Whichever path sees it first (the fake's REST state changes before its frame
+    // is pushed) reports it, once.
+    assert_eq!(ff[1]["qty"], 1, "{}", ff[1]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(journaled(&r.state, "foreign_fill").len(), 2);
+    r.gw.stop().unwrap();
+}
+
+/// Two broker orders filled at the same price and quantity are both reported.
+#[test]
+fn two_orders_alike_are_both_reported() {
+    let r = rig("foreign-fills-alike");
+    let _c = ready(&r.gw, "reactor");
+    broker_buy(&r.fake, "liq-4", PUT_A, 1);
+    broker_buy(&r.fake, "liq-5", PUT_A, 1);
+    r.fake.fill("liq-4", 1, "0.33");
+    r.fake.fill("liq-5", 1, "0.33");
+    let ff = wait_journaled(&r.state, "foreign_fill", 2);
+    assert_ne!(ff[0]["broker_order_id"], ff[1]["broker_order_id"]);
+    r.gw.stop().unwrap();
+}
+
+/// An mleg broker order whose stream shows one leg filled, then a REST reconcile
+/// showing both: each leg is reported once.
+#[test]
+fn an_mleg_broker_order_reports_each_leg_once() {
+    let r = rig("foreign-fills-mleg");
+    let _c = ready(&r.gw, "reactor");
+    r.fake.appear(&format!(
+        r#"{{"client_order_id":"liq-6","order_class":"mleg","qty":"1","type":"market","time_in_force":"day","legs":[{{"symbol":"{PUT_A}","ratio_qty":"1","side":"buy","position_intent":"buy_to_close"}},{{"symbol":"{PUT_B}","ratio_qty":"1","side":"sell","position_intent":"sell_to_close"}}]}}"#
+    ));
+    {
+        let mut st = r.fake.lock();
+        let o = st.orders.iter_mut().find(|o| o.cid == "liq-6").unwrap();
+        o.legs[0].filled = 1;
+        o.legs[0].avg = Some("0.33".into());
+    }
+    r.fake.event("liq-6", "partial_fill", "partially_filled");
+    let ff = wait_journaled(&r.state, "foreign_fill", 1);
+    assert_eq!(
+        (ff[0]["symbol"].as_str(), ff[0]["side"].as_str()),
+        (Some(PUT_A), Some("buy"))
+    );
+    {
+        let mut st = r.fake.lock();
+        let o = st.orders.iter_mut().find(|o| o.cid == "liq-6").unwrap();
+        o.legs[1].filled = 1;
+        o.legs[1].avg = Some("0.12".into());
+        o.filled = 1;
+        o.status = "filled".into();
+    }
+    let before = resyncs(&r.state);
+    let r = restart(r, 2);
+    wait_resyncs(&r.state, before + 1);
+    let ff = wait_journaled(&r.state, "foreign_fill", 2);
+    assert_eq!(ff.len(), 2, "{ff:?}");
+    assert_eq!(
+        (ff[1]["symbol"].as_str(), ff[1]["price"].as_str()),
+        (Some(PUT_B), Some("0.12"))
+    );
+    r.gw.stop().unwrap();
+}

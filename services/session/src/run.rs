@@ -730,7 +730,14 @@ impl Session {
                 };
                 if !matches!(
                     v["kind"].as_str(),
-                    Some("submit" | "cancel" | "order" | "activity")
+                    Some(
+                        "submit"
+                            | "cancel"
+                            | "order"
+                            | "activity"
+                            | "foreign_fill"
+                            | "foreign_fill_lag"
+                    )
                 ) {
                     continue;
                 }

@@ -224,6 +224,132 @@ impl OrderState {
 /// Whether a broker status ends an order of this time in force. `done_for_day` ends a day
 /// order only: a good-til-canceled or closing order in it may still be live, and an unknown
 /// time in force fails closed. Stopped and suspended never end an order.
+/// What has been reported of one foreign order's fills (`foreign_fill`).
+#[derive(Default)]
+struct ForeignFills {
+    /// Per symbol: the cumulative quantity reported, and its average price then.
+    legs: HashMap<String, (u64, Option<String>)>,
+    /// The latest execution ids seen, at most [`FOREIGN_EXECS`].
+    execs: VecDeque<String>,
+    /// When the order was seen in a terminal status, ns.
+    done: Option<u64>,
+}
+
+/// Execution ids kept per foreign order.
+const FOREIGN_EXECS: usize = 64;
+/// How long a terminal foreign order's fills are kept, ns: a day.
+const FOREIGN_KEEP: u64 = 86_400_000_000_000;
+
+/// One leg of a foreign order as an update shows it: its symbol and side, its
+/// cumulative quantity and average price, and the execution this update reports.
+struct LegFill {
+    symbol: String,
+    side: String,
+    cum: u64,
+    avg: Option<String>,
+    exec: Option<Exec>,
+}
+
+struct Exec {
+    id: Option<String>,
+    qty: u64,
+    price: Option<String>,
+}
+
+fn num(v: &Value) -> Option<u64> {
+    v.as_u64()
+        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+}
+
+fn exec_of(v: &Value) -> Option<Exec> {
+    Some(Exec {
+        id: v["execution_id"].as_str().map(String::from),
+        qty: num(&v["qty"])?,
+        price: v["price"].as_str().map(String::from),
+    })
+}
+
+/// A decimal price as nanodollars.
+fn dec(s: &str) -> Option<i128> {
+    let (neg, s) = s.strip_prefix('-').map_or((false, s), |r| (true, r));
+    let (w, f) = s.split_once('.').unwrap_or((s, ""));
+    if f.len() > 9 || !w.bytes().chain(f.bytes()).all(|b| b.is_ascii_digit()) || w.is_empty() {
+        return None;
+    }
+    let v = w.parse::<i128>().ok()? * 1_000_000_000 + format!("{f:0<9}").parse::<i128>().ok()?;
+    Some(if neg { -v } else { v })
+}
+
+/// The legs of a foreign order in an update: an mleg order's from the update's legs
+/// (with their executions) or the order's; a single's from the order.
+fn foreign_legs(up: &OrderUpdate) -> Vec<LegFill> {
+    let raw: Value = serde_json::from_str(&up.order.raw).unwrap_or(Value::Null);
+    let side_of = |sym: &str| {
+        raw["legs"]
+            .as_array()
+            .and_then(|ls| ls.iter().find(|l| l["symbol"] == sym))
+            .and_then(|l| l["side"].as_str())
+            .unwrap_or("")
+            .to_owned()
+    };
+    let parsed = |t: &Option<String>| -> Option<Vec<Value>> {
+        t.as_deref()
+            .and_then(|t| serde_json::from_str::<Value>(t).ok())
+            .and_then(|v| v.as_array().cloned())
+            .filter(|a| !a.is_empty())
+    };
+    if let Some(legs) = parsed(&up.legs).or_else(|| parsed(&up.order.legs)) {
+        return legs
+            .iter()
+            .filter_map(|l| {
+                let symbol = l["symbol"].as_str()?.to_owned();
+                Some(LegFill {
+                    side: side_of(&symbol),
+                    cum: num(&l["filled_qty"])?,
+                    avg: l["avg_price"].as_str().map(String::from),
+                    exec: exec_of(&l["fill"]),
+                    symbol,
+                })
+            })
+            .collect();
+    }
+    if let Some(legs) = raw["legs"].as_array().filter(|a| !a.is_empty()) {
+        return legs
+            .iter()
+            .filter_map(|l| {
+                Some(LegFill {
+                    symbol: l["symbol"].as_str()?.to_owned(),
+                    side: l["side"].as_str().unwrap_or("").to_owned(),
+                    cum: num(&l["filled_qty"])?,
+                    avg: l["filled_avg_price"].as_str().map(String::from),
+                    exec: None,
+                })
+            })
+            .collect();
+    }
+    let fill = up
+        .fill
+        .as_deref()
+        .and_then(|f| serde_json::from_str::<Value>(f).ok());
+    vec![LegFill {
+        symbol: raw["symbol"].as_str().unwrap_or("").to_owned(),
+        side: raw["side"].as_str().unwrap_or("").to_owned(),
+        cum: up.order.filled_qty,
+        avg: up.order.avg_price.clone(),
+        exec: fill.as_ref().and_then(exec_of),
+    }]
+}
+
+/// The price of the quantity between two cumulative fills, from their averages.
+fn avg_delta(prev: (u64, Option<&str>), cum: u64, avg: Option<&str>) -> Option<String> {
+    let a1 = dec(avg?)?;
+    let a0 = if prev.0 == 0 { 0 } else { dec(prev.1?)? };
+    let d = i128::from(cum.checked_sub(prev.0).filter(|d| *d > 0)?);
+    Some(crate::sim::fmt_nanos(
+        (a1 * i128::from(cum) - a0 * i128::from(prev.0)) / d,
+    ))
+}
+
 fn settled(status: &str, tif: Option<&str>) -> bool {
     match status {
         "done_for_day" => tif == Some("day"),
@@ -531,6 +657,8 @@ pub(crate) struct Session<B: Broker> {
     orders: HashMap<String, OrderState>,
     by_broker: HashMap<String, String>,
     foreign: HashSet<String>,
+    /// What has been reported of foreign orders' fills, by broker order id.
+    foreign_fills: HashMap<String, ForeignFills>,
     conns: Vec<Conn>,
     hold: Option<Vec<(String, Aud)>>,
     gate_ok: bool,
@@ -597,6 +725,7 @@ impl<B: Broker> Session<B> {
             orders: HashMap::new(),
             by_broker: HashMap::new(),
             foreign: HashSet::new(),
+            foreign_fills: HashMap::new(),
             conns: Vec::new(),
             hold: None,
             gate_ok: false,
@@ -719,6 +848,25 @@ impl<B: Broker> Session<B> {
                 self.foreign
                     .extend(text("symbol").map(|s| format!("position:{s}")));
             }
+            "foreign_fill" => {
+                let (Some(bid), Some(symbol)) = (text("broker_order_id"), text("symbol")) else {
+                    return;
+                };
+                let f = self.foreign_fills.entry(bid).or_default();
+                f.legs.insert(
+                    symbol,
+                    (v["filled_qty"].as_u64().unwrap_or(0), text("avg_price")),
+                );
+                if let Some(e) = text("execution_id") {
+                    f.execs.push_back(e);
+                    if f.execs.len() > FOREIGN_EXECS {
+                        f.execs.pop_front();
+                    }
+                }
+                if text("status").is_some_and(|s| crate::broker::terminal(&s)) {
+                    f.done = v["ts_gateway"].as_u64();
+                }
+            }
             _ => {}
         }
     }
@@ -752,7 +900,10 @@ impl<B: Broker> Session<B> {
 
     fn emit(&mut self, ts: u64, kind: &str, body: &str, aud: Aud) -> Result<(), String> {
         let (seq, line) = self.j.append(ts, kind, body)?;
-        if matches!(kind, "submit" | "cancel" | "order" | "activity") {
+        if matches!(
+            kind,
+            "submit" | "cancel" | "order" | "activity" | "foreign_fill" | "foreign_fill_lag"
+        ) {
             self.order_events += 1;
         }
         self.last_seq.store(seq, SeqCst);
@@ -1900,6 +2051,100 @@ impl<B: Broker> Session<B> {
         Ok(())
     }
 
+    /// Reports each new fill of a foreign order once, as `foreign_fill`, whichever path
+    /// (the stream or a REST reconcile) shows it first. A fill is new when it moves a
+    /// symbol's cumulative quantity past what was reported; a stream execution that
+    /// doesn't is reported as `foreign_fill_lag`, so a lost fill is never silent.
+    fn foreign_fills(&mut self, up: &OrderUpdate) -> Result<(), String> {
+        let now = self.ts();
+        self.foreign_fills
+            .retain(|_, f| f.done.is_none_or(|d| now.saturating_sub(d) < FOREIGN_KEEP));
+        let bo = &up.order;
+        let ts = if self.b.now().is_some() {
+            up.ts_broker
+        } else {
+            wall_ns()
+        };
+        let terminal = crate::broker::terminal(&bo.status);
+        for leg in foreign_legs(up) {
+            let f = self
+                .foreign_fills
+                .entry(bo.broker_order_id.clone())
+                .or_default();
+            let prev = f.legs.get(&leg.symbol).cloned().unwrap_or((0, None));
+            let exec_id = leg.exec.as_ref().and_then(|e| e.id.clone());
+            if exec_id.as_ref().is_some_and(|id| f.execs.contains(id)) {
+                continue;
+            }
+            if let Some(id) = &exec_id {
+                f.execs.push_back(id.clone());
+                if f.execs.len() > FOREIGN_EXECS {
+                    f.execs.pop_front();
+                }
+            }
+            if leg.cum <= prev.0 {
+                // A new execution that moves nothing: out of order, or the cumulative
+                // lags the fill. Said, never dropped silently.
+                if let Some(e) = &leg.exec
+                    && exec_id.is_some()
+                {
+                    let body = Obj::new()
+                        .s("broker_order_id", &bo.broker_order_id)
+                        .s("symbol", &leg.symbol)
+                        .opt_s("execution_id", exec_id.as_deref())
+                        .n("qty", e.qty)
+                        .opt_s("price", e.price.as_deref())
+                        .n("filled_qty", leg.cum)
+                        .n("reported_qty", prev.0)
+                        .s("source", up.source)
+                        .done();
+                    self.emit(ts, "foreign_fill_lag", &body, Aud::All)?;
+                }
+                continue;
+            }
+            let qty = leg.cum - prev.0;
+            let (price, basis) = match &leg.exec {
+                Some(e) if e.qty == qty && e.price.is_some() => (e.price.clone(), "fill"),
+                e => (
+                    avg_delta((prev.0, prev.1.as_deref()), leg.cum, leg.avg.as_deref())
+                        .or_else(|| e.as_ref().and_then(|e| e.price.clone())),
+                    "avg_delta",
+                ),
+            };
+            let body = Obj::new()
+                .s("broker_order_id", &bo.broker_order_id)
+                .s("client_order_id", &bo.client_order_id)
+                .s("symbol", &leg.symbol)
+                .s("side", &leg.side)
+                .n("qty", qty)
+                .opt_s("price", price.as_deref())
+                .s("price_basis", basis)
+                .n("filled_qty", leg.cum)
+                .opt_s("avg_price", leg.avg.as_deref())
+                .opt_s("execution_id", exec_id.as_deref())
+                .s("status", &bo.status)
+                .s("source", up.source)
+                .n("ts_broker", up.ts_broker)
+                .raw("broker_raw", &up.raw)
+                .done();
+            let f = self
+                .foreign_fills
+                .entry(bo.broker_order_id.clone())
+                .or_default();
+            f.legs
+                .insert(leg.symbol.clone(), (leg.cum, leg.avg.clone()));
+            self.emit(ts, "foreign_fill", &body, Aud::All)?;
+        }
+        if terminal {
+            let f = self
+                .foreign_fills
+                .entry(bo.broker_order_id.clone())
+                .or_default();
+            f.done.get_or_insert(now);
+        }
+        Ok(())
+    }
+
     fn resolution(&mut self, cid: &str, kind: &str, window: Duration) -> Result<(), String> {
         let body = Obj::new()
             .s("client_order_id", cid)
@@ -1917,7 +2162,9 @@ impl<B: Broker> Session<B> {
                 .s("broker_order_id", &bo.broker_order_id)
                 .raw("broker_raw", &bo.raw)
                 .done();
-            return self.foreign(&bo.broker_order_id, &f);
+            self.foreign(&bo.broker_order_id, &f)?;
+            let up = OrderUpdate { order: bo, ..up };
+            return self.foreign_fills(&up);
         }
         if let Some(i) = self.pending.iter().position(|p| p.cid == cid) {
             let p = self.pending.remove(i);
