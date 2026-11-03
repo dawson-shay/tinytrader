@@ -275,6 +275,9 @@ struct StoreState {
     incorporated: Vec<String>,
     /// Filing fails with this, when set.
     incorporate_error: Option<String>,
+    /// Incorporations answered 503 (the store's filing queue full) before one is
+    /// taken.
+    incorporate_busy: u32,
     incorporate_delay_ms: u64,
 }
 
@@ -329,6 +332,7 @@ fn ready_store() -> StoreState {
         uploaded: Vec::new(),
         incorporated: Vec::new(),
         incorporate_error: None,
+        incorporate_busy: 0,
         incorporate_delay_ms: 0,
     }
 }
@@ -412,6 +416,10 @@ async fn serve_store(state: StoreHandle) -> String {
                     let delay = lock(&s).incorporate_delay_ms;
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     let mut s = lock(&s);
+                    if s.incorporate_busy > 0 {
+                        s.incorporate_busy -= 1;
+                        return answer((503, json!({ "error": "busy: the store's filing queue is full; try again" })));
+                    }
                     s.incorporated.push(format!("{job}?{}", q.unwrap_or_default()));
                     match s.incorporate_error.clone() {
                         Some(e) => answer((500, json!({ "error": e }))),
@@ -1943,6 +1951,20 @@ async fn a_download_waits_while_the_store_rescans() {
     settled(&r).await;
     let t = lock(&r.jobs.transfers).get("OPRA-C2").cloned().unwrap();
     assert!(t.error.unwrap().contains("503"));
+}
+
+/// A busy store (503) is waited for and asked again; it costs no try.
+#[tokio::test]
+async fn a_busy_store_is_waited_for_not_a_failed_filing() {
+    let r = rig("busy-filing").await;
+    contract_job(&r, "OPRA-C3");
+    lock(&r.store).incorporate_busy = 3;
+    refresh(&r.jobs).await.unwrap();
+    settled(&r).await;
+    assert_eq!(lock(&r.store).incorporated.len(), 1);
+    let t = lock(&r.jobs.transfers).get("OPRA-C3").cloned().unwrap();
+    assert_eq!(t.state, "filed", "{:?}", t.error);
+    assert!(!lock(&r.jobs.tries).contains_key("OPRA-C3"));
 }
 
 #[tokio::test]

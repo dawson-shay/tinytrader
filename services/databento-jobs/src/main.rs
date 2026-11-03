@@ -3072,11 +3072,22 @@ async fn fetch_and_file(
         Some(p) => format!("{}/incorporate/databento/{job}?parent={p}", jobs.store),
         None => format!("{}/incorporate/databento/{job}", jobs.store),
     };
-    let r = jobs
-        .store_write(jobs.http.post(url))
-        .send()
-        .await
-        .map_err(|e| format!("store: {e}"))?;
+    // A busy store (its filing queue full, 503) is waited for, longer each time,
+    // up to `store_wait`: it isn't a failed filing.
+    let until = Instant::now() + jobs.store_wait;
+    let mut wait = Duration::from_millis(if cfg!(test) { 10 } else { 5_000 });
+    let r = loop {
+        let r = jobs
+            .store_write(jobs.http.post(&url))
+            .send()
+            .await
+            .map_err(|e| format!("store: {e}"))?;
+        if r.status() != StatusCode::SERVICE_UNAVAILABLE || Instant::now() + wait > until {
+            break r;
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(Duration::from_secs(60));
+    };
     if !r.status().is_success() {
         let body: Value = r.json().await.unwrap_or_default();
         return Err(format!(
