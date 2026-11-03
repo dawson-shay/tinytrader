@@ -154,6 +154,7 @@ impl Holdings for StoreApi {
             let files = names
                 .iter()
                 .map(|n| FileRef {
+                    route: Vec::new(),
                     name: (*n).to_owned(),
                     sha256: sha.clone().filter(|_| names.len() == 1),
                 })

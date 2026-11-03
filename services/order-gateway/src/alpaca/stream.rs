@@ -8,7 +8,7 @@ use crate::broker::Update;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::SyncSender;
 use std::thread;
 use std::time::{Duration, Instant};
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
@@ -39,7 +39,7 @@ enum End {
 pub(crate) fn spawn(
     url: String,
     auth: String,
-    tx: Sender<Update>,
+    tx: SyncSender<Update>,
     backoff: (Duration, Duration),
 ) -> Stream {
     let stop = Arc::new(AtomicBool::new(false));
@@ -139,7 +139,13 @@ fn expect(ws: &mut Ws, want: &StreamMessage, flag: &AtomicBool) -> Result<(), En
     })
 }
 
-fn session(url: &str, auth: &str, tx: &Sender<Update>, flag: &AtomicBool, up: &mut bool) -> End {
+fn session(
+    url: &str,
+    auth: &str,
+    tx: &SyncSender<Update>,
+    flag: &AtomicBool,
+    up: &mut bool,
+) -> End {
     let (mut ws, tcp) = match connect(url) {
         Ok(x) => x,
         Err(e) => return End::Lost(e),
