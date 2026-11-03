@@ -265,9 +265,32 @@ and it is never bought again.
     the rest of the volume stays writable. A filing whose days fall under a
     sealed path is refused at placement (`409`, naming the path), never
     left waiting.
+  - **A purchase is refused before it is bought** if any of its days would
+    be filed under a sealed path: the jobs service asks the store's guard
+    (0019), which knows the seals, before it submits. Nothing is bought to
+    be refused at filing. A download the store refused for any reason stays
+    visible to the guard as pending (the jobs service's ledger), so its days
+    are never taken as missing and bought again.
 
   A seal is recorded in the coordinator's registry and in the volume's
   marker, so it travels with the volume to any host.
+  - **A seal holds if either says so.** A path counts as sealed if the marker
+    or the registry seals it, so neither a hand edit of one nor a lost
+    registry undoes it. Every write of the marker (an epoch's bump on each
+    writable mount, an approval, a migration) keeps its `sealed` list and
+    `immutable` exactly; a test writes the marker every way the store does,
+    and checks that they survive.
+  - **Only an operator unseals:** `POST /volumes/{id}/unseal` with the path
+    (or none, for the whole volume) and a reason. That removes it from both,
+    and is recorded in `/events` and the state file, with who and why.
+  - **Before the migration, a seal by configuration.** `STORE_SEALED` (such
+    as `data:Databento`, as `VOLUME:PATH`, comma-separated) seals paths on
+    today's store, enforced by the same write gate, with no marker and no
+    registry. It is the first thing built (step 0), so a purchased tree is
+    protected from now through the migration: no filing, adopt,
+    `apply_conditions` or scan settling a merge can write under it in
+    between. The migration carries each such seal into the volume's v1
+    marker and the registry.
   - **Sealing a path** (`POST /volumes/{id}/seal` with `{ "path": … }`) waits
     for the filer to finish any write under it, checks its files against the
     manifests, and adds it to the marker's `sealed` list. The volume stays
@@ -379,6 +402,13 @@ the data.
    it in the registry only, or skip it, and why. Nothing is written.
    `store migrate --apply VOLUME…` then acts on the volumes named, and only
    those.
+   - **`--apply` is one exclusive write.** It takes the filer's turn (0030):
+     filing stops, no turn is granted to anything else, and the scan doesn't
+     settle merges until the migration has written every marker and the
+     state file. A store that crashes part way restarts with the old state
+     file and the markers written so far, and `--apply` can be run again.
+   - **`STORE_SEALED` paths** (step 0) stay sealed throughout, and are carried
+     into the new markers.
 2. **No marker is ever written to a volume that must not be written**, and
    `--apply` refuses one even when it is named:
    - one configured `:ro` or mounted read-only;
@@ -418,6 +448,13 @@ kept in the deployment repository, and starts from the dry run's output.
 
 Each step is its own PR, and each one is useful on its own:
 
+0. **Seals by configuration, today.** `STORE_SEALED`, the one write gate as
+   far as today's store needs it (every write path asks it), and the
+   purchase guard refusing days under a seal. Tests: a filing, an adopt,
+   `apply_conditions` and the scan's merge settling each refused under a
+   sealed path; the rest of the volume still written; a purchase of a sealed
+   day refused before it's submitted.
+
 1. **Identity and the write gate.**
    - The v1 marker, `id`, `filesystem_uuid` and `epoch`, and the registry
      for volumes without a marker.
@@ -426,6 +463,8 @@ Each step is its own PR, and each one is useful on its own:
    - `migrate --dry-run` and `--apply`, and quarantine for clones and stale
      epochs.
    - Sealed paths, and placement refusing a filing under one.
+   - `unseal`, recorded; a seal held when either the marker or the registry
+     says so; every marker writer keeping `sealed` (tested).
    - Still one process. Tests:
      - migration from v0 state and markers;
      - a `:ro` or wholly sealed volume left unwritten, even when named;
