@@ -57,7 +57,7 @@ impl Feed {
 }
 
 /// What a day came to.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, Deserialize)]
 pub struct Outcome {
     pub trades: usize,
     pub quotes: usize,
@@ -195,6 +195,11 @@ fn write_batches(
     let d = day.replace('-', "");
     let schema = feed.schema();
     let (main_dir, cond_dir) = (dir.join(&main_id), dir.join(&cond_id));
+    // Not complete until both batches are written and checked.
+    let marker = complete_marker(feed, symbol, day, dir);
+    if marker.exists() {
+        std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+    }
     for p in [&main_dir, &cond_dir] {
         // A leftover from an interrupted attempt is rebuilt from scratch.
         if p.exists() {
@@ -295,7 +300,177 @@ fn write_batches(
         std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     }
+    std::fs::write(&marker, serde_json::to_vec_pretty(&outcome).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     Ok((main_dir, cond_dir, outcome))
+}
+
+/// The file that says a day's spool is complete: both batches written and checked
+/// against their pages. It holds the day's [`Outcome`].
+fn complete_marker(feed: Feed, symbol: &str, day: &str, dir: &Path) -> PathBuf {
+    dir.join(format!("{}.complete.json", feed.batches(symbol, day).0))
+}
+
+/// A day's complete spool, kept from an earlier pass (the store was busy): its two
+/// batch folders and outcome, if the marker is there and every file still matches
+/// its manifest. Filing from it files exactly what was built, without asking
+/// Alpaca again, so a day whose data changed upstream since isn't refused. It reads
+/// every file, streamed: call it off the async runtime. `Ok(None)` when there's no
+/// complete spool (none, or damaged: a file missing or changed), `Err` when it
+/// couldn't be read (the day is tried later, the spool kept).
+pub fn spooled(feed: Feed, symbol: &str, day: &str, dir: &Path) -> Result<Option<(PathBuf, PathBuf, Outcome)>, String> {
+    use std::io::ErrorKind::NotFound;
+    let marker = complete_marker(feed, symbol, day, dir);
+    let text = match std::fs::read(&marker) {
+        Ok(t) => t,
+        Err(e) if e.kind() == NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", marker.display())),
+    };
+    let Ok(outcome) = serde_json::from_slice::<Outcome>(&text) else { return Ok(None) };
+    let (main_id, cond_id) = feed.batches(symbol, day);
+    let (main_dir, cond_dir) = (dir.join(main_id), dir.join(cond_id));
+    // Whether a batch matches its manifest: a missing or changed file is a damaged
+    // spool (`false`, rebuilt); any other error reading it is `Err` (try later).
+    let intact = |d: &Path| -> Result<bool, String> {
+        let read = |p: PathBuf| match std::fs::File::open(&p) {
+            Ok(f) => Ok(Some(f)),
+            Err(e) if e.kind() == NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", p.display())),
+        };
+        let Some(mut mf) = read(d.join("manifest.json"))? else { return Ok(false) };
+        let mut text = Vec::new();
+        std::io::Read::read_to_end(&mut mf, &mut text).map_err(|e| format!("{}: {e}", d.display()))?;
+        let Ok(m) = serde_json::from_slice::<Value>(&text) else { return Ok(false) };
+        let Some(files) = m["files"].as_array() else { return Ok(false) };
+        for f in files {
+            let (Some(name), Some(size), Some(hash)) = (f["filename"].as_str(), f["size"].as_u64(), f["hash"].as_str()) else {
+                return Ok(false);
+            };
+            let Some(mut file) = read(d.join(name))? else { return Ok(false) };
+            let mut h = Sha256::new();
+            let n = std::io::copy(&mut file, &mut h).map_err(|e| format!("{}: {e}", d.join(name).display()))?;
+            if n != size || hash != format!("sha256:{:x}", h.finalize()) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    Ok((intact(&main_dir)? && intact(&cond_dir)?).then_some((main_dir, cond_dir, outcome)))
+}
+
+/// What a conditions batch says it belongs to: the main file's SHA-256, from its
+/// `binding.json`.
+fn bound_main(cond_dir: &Path) -> Result<String, String> {
+    let b: Value = serde_json::from_slice(&std::fs::read(cond_dir.join("binding.json")).map_err(|e| format!("binding.json: {e}"))?)
+        .map_err(|e| format!("binding.json: {e}"))?;
+    b["main"]["sha256"].as_str().map(str::to_owned).ok_or_else(|| "binding.json names no main sha256".into())
+}
+
+/// The SHA-256 of a file the store serves, streamed: never the whole file in
+/// memory.
+async fn hash_served(http: &reqwest::Client, store: &str, name: &str) -> Result<String, String> {
+    let mut r = http
+        .get(format!("{store}/files/{name}"))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("store: {e}"))?;
+    let mut h = Sha256::new();
+    while let Some(chunk) = r.chunk().await.map_err(|e| format!("store: {e}"))? {
+        h.update(&chunk);
+    }
+    Ok(format!("{:x}", h.finalize()))
+}
+
+/// Before conditions are filed alone (their main filed on an earlier pass), check
+/// that they were built against the main the store holds: the binding's main
+/// SHA-256 against the held day's. The store doesn't check this itself.
+///
+/// The held day is asked of `/coverage`, which names its files in whichever layout
+/// and on every volume holding a copy, with its SHA-256 when the store has one;
+/// otherwise each copy is hashed as it streams. Every copy must agree.
+///
+/// `Err` with `unbound` only when the held main is known and differs (the
+/// provider's data changed since main was filed): nothing is filed, a person
+/// decides. Anything else that stops the check (the store unreachable or busy, the
+/// day not listed, its volume away, copies that disagree) is `later`: the day
+/// waits with its spool kept.
+pub async fn check_binding(
+    http: &reqwest::Client,
+    store: &str,
+    feed: Feed,
+    symbol: &str,
+    day: &str,
+    cond_dir: &Path,
+) -> Result<(), FileError> {
+    let want = bound_main(cond_dir).map_err(FileError::later)?;
+    let r = http
+        .get(format!("{store}/coverage"))
+        .query(&[
+            ("provider", "alpaca"),
+            ("dataset", feed.dataset()),
+            ("symbol", symbol),
+            ("schema", feed.schema().as_str()),
+            ("start", day),
+            ("end", day),
+        ])
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| FileError::later(format!("store coverage: {e}")))?;
+    let cov: Value = r.json().await.map_err(|e| FileError::later(format!("store coverage: {e}")))?;
+    let rows: Vec<&Value> = cov["days"].as_array().map(|d| d.iter().filter(|r| r["day"] == day).collect()).unwrap_or_default();
+    let [row] = rows.as_slice() else {
+        let away = cov["missing_volumes"].as_array().filter(|m| !m.is_empty()).map(|m| format!("; volumes away: {}", Value::Array(m.clone()))).unwrap_or_default();
+        return Err(FileError::later(format!("the store lists {} rows for the held main of {symbol} {day}{away}", rows.len())));
+    };
+    if row["conflict"] == true {
+        return Err(FileError::later(format!("the store's copies of {symbol} {day} differ")));
+    }
+    // Only the day's data file in the store layout, on each volume holding it; an
+    // older day folder also lists its sidecars, and a batch download names a range
+    // file, neither of which is the main as filed.
+    let filed = format!("/{}/{symbol}/{}/{day}.dbn.zst", feed.dataset(), feed.schema().as_str()).to_lowercase();
+    let files: Vec<&str> = row["files"]
+        .as_array()
+        .map(|f| f.iter().filter_map(Value::as_str).filter(|n| n.to_lowercase().ends_with(&filed)).collect())
+        .unwrap_or_default();
+    if files.is_empty() {
+        return Err(FileError::later(format!("the store holds {symbol} {day}, but not as a filed day in its layout: {}", row["files"])));
+    }
+    let mut held: Vec<(String, String)> = Vec::new();
+    match row["sha256"].as_str() {
+        Some(h) => held.push((files.join(", "), h.to_owned())),
+        None => {
+            for f in &files {
+                held.push(((*f).to_owned(), hash_served(http, store, f).await.map_err(FileError::later)?));
+            }
+        }
+    }
+    if held.iter().any(|(_, h)| *h != held[0].1) {
+        return Err(FileError::later(format!("the store's copies of {symbol} {day} have different hashes: {held:?}")));
+    }
+    let (name, got) = &held[0];
+    if *got == want {
+        Ok(())
+    } else {
+        Err(FileError {
+            busy: false,
+            unbound: true,
+            later: false,
+            message: format!(
+                "conditions built against main sha256 {want}, but the store holds {name} with sha256 {got}: the provider's data changed since main was filed; not filed"
+            ),
+        })
+    }
+}
+
+/// Removes a day's spool: its batch folders and its marker.
+pub fn clear_spool(feed: Feed, symbol: &str, day: &str, dir: &Path) {
+    let _ = std::fs::remove_file(complete_marker(feed, symbol, day, dir));
+    let (main_id, cond_id) = feed.batches(symbol, day);
+    for d in [dir.join(main_id), dir.join(cond_id)] {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
 
 /// A filing that didn't happen: the store busy past the wait (`busy`: try the day
@@ -303,18 +478,29 @@ fn write_batches(
 #[derive(Debug)]
 pub struct FileError {
     pub busy: bool,
+    /// Conditions that don't belong to the main the store holds.
+    pub unbound: bool,
+    /// Couldn't tell yet (the store unreachable or busy, the held main on a volume
+    /// that's away): the day is deferred, its spool kept.
+    pub later: bool,
     pub message: String,
+}
+
+impl FileError {
+    fn later(message: String) -> Self {
+        Self { busy: false, unbound: false, later: true, message }
+    }
 }
 
 impl From<String> for FileError {
     fn from(message: String) -> Self {
-        Self { busy: false, message }
+        Self { busy: false, unbound: false, later: false, message }
     }
 }
 
 impl From<&str> for FileError {
     fn from(message: &str) -> Self {
-        Self { busy: false, message: message.to_owned() }
+        Self { busy: false, unbound: false, later: false, message: message.to_owned() }
     }
 }
 
@@ -333,6 +519,17 @@ pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batc
         None => req,
     };
     let id = batch_dir.file_name().and_then(|n| n.to_str()).ok_or("bad batch folder")?;
+    // Only the store's explicit refusal (409, 422, with its reason) is final; a
+    // network error or any other status leaves the day to be tried again, its
+    // spool kept.
+    let unfiled = |what: String, status: reqwest::StatusCode, body: String| {
+        let message = format!("{what}: {status} {body}");
+        if status == reqwest::StatusCode::CONFLICT || status == reqwest::StatusCode::UNPROCESSABLE_ENTITY {
+            FileError::from(message)
+        } else {
+            FileError::later(message)
+        }
+    };
     let mut names: Vec<String> = std::fs::read_dir(batch_dir)
         .map_err(|e| e.to_string())?
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
@@ -345,9 +542,10 @@ pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batc
             .body(bytes)
             .send()
             .await
-            .map_err(|e| format!("store: {e}"))?;
+            .map_err(|e| FileError::later(format!("store: {e}")))?;
         if !r.status().is_success() {
-            return Err(format!("store refused {name}: {} {}", r.status(), r.text().await.unwrap_or_default()).into());
+            let status = r.status();
+            return Err(unfiled(format!("store didn't take {name}"), status, r.text().await.unwrap_or_default()));
         }
     }
     let until = std::time::Instant::now() + BUSY_WAIT;
@@ -356,12 +554,12 @@ pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batc
         let r = write(http.post(format!("{store}/incorporate/alpaca/{id}")))
             .send()
             .await
-            .map_err(|e| format!("store: {e}"))?;
+            .map_err(|e| FileError::later(format!("store: {e}")))?;
         if r.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
             break r;
         }
         if std::time::Instant::now() + wait > until {
-            return Err(FileError { busy: true, message: format!("the store stayed busy filing {id}") });
+            return Err(FileError { busy: true, unbound: false, later: false, message: format!("the store stayed busy filing {id}") });
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(std::time::Duration::from_secs(60));
@@ -369,7 +567,7 @@ pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batc
     let status = r.status();
     let v: Value = r.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!("store didn't file {id}: {status} {v}").into());
+        return Err(unfiled(format!("store didn't file {id}"), status, v.to_string()));
     }
     Ok(v)
 }
@@ -427,5 +625,264 @@ mod filing_tests {
         let e = file(&reqwest::Client::new(), &url, None, &batch("busy")).await.unwrap_err();
         assert!(e.busy, "{e:?}");
     }
+
+    /// A store answering incorporate (or, with `at_put`, the upload) with `status`.
+    async fn answering(status: u16, at_put: bool) -> String {
+        let code = axum::http::StatusCode::from_u16(status).unwrap();
+        let ok = axum::http::StatusCode::OK;
+        let app = axum::Router::new()
+            .route("/incoming/alpaca/{id}/{name}", put(move || async move { (if at_put { code } else { ok }, "{}") }))
+            .route("/incorporate/alpaca/{id}", post(move || async move { (code, r#"{"error":"the reason"}"#) }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Only the store's explicit refusal (409, 422) is final; a network error or any
+    /// other status, at the upload or the filing, is tried again with the spool kept.
+    #[tokio::test]
+    async fn only_an_explicit_refusal_is_final() {
+        let http = reqwest::Client::new();
+        for (status, at_put) in [(409, false), (422, false), (409, true)] {
+            let e = file(&http, &answering(status, at_put).await, None, &batch("refused")).await.unwrap_err();
+            assert!(!e.later && !e.busy && !e.unbound, "{status} {at_put}: {e:?}");
+            assert!(e.message.contains(&status.to_string()), "{e:?}");
+        }
+        for (status, at_put) in [(500, false), (502, false), (500, true), (404, false), (401, true)] {
+            let e = file(&http, &answering(status, at_put).await, None, &batch("later")).await.unwrap_err();
+            assert!(e.later, "{status} {at_put}: {e:?}");
+        }
+        let e = file(&http, "http://127.0.0.1:9", None, &batch("no-store")).await.unwrap_err();
+        assert!(e.later, "{e:?}");
+    }
 }
 
+
+#[cfg(test)]
+mod spool_tests {
+    use super::{Feed, build, check_binding, clear_spool, spooled};
+    use crate::fetch::{Alpaca, Pace};
+    use axum::routing::get;
+
+    const DAY: &str = "2026-10-01";
+
+    /// A fake Alpaca with one trade and one quote for `DAY`.
+    async fn alpaca() -> Alpaca {
+        let app = axum::Router::new()
+            .route(
+                "/v2/stocks/SPY/trades",
+                get(|| async {
+                    r#"{"trades":[{"t":"2026-10-01T13:30:00.5Z","x":"V","p":774.51,"s":100,"i":7,"c":["@","I"],"z":"B"}],"next_page_token":null}"#
+                }),
+            )
+            .route(
+                "/v2/stocks/SPY/quotes",
+                get(|| async {
+                    r#"{"quotes":[{"t":"2026-10-01T13:30:00.4Z","bp":774.5,"bs":2,"bx":"Q","ap":774.6,"as":3,"ax":"Q","c":["R"],"z":"B"}],"next_page_token":null}"#
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        Alpaca { http: reqwest::Client::new(), data: format!("http://{addr}"), key_id: "k".into(), secret: "s".into(), pace: Pace::new(10_000) }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("alpaca-spool-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn a_complete_spool_is_found_and_a_damaged_one_is_not() {
+        let dir = scratch("complete");
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_none(), "nothing spooled yet");
+        let (m, c, out) = build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let (km, kc, kept) = spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().expect("the built day is kept");
+        assert_eq!((km, kc), (m.clone(), c));
+        assert_eq!((kept.trades, kept.quotes, kept.pages, kept.bytes), (out.trades, out.quotes, out.pages, out.bytes));
+        // A file changed since it was built: not filed from the spool.
+        let data = std::fs::read_dir(&m)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".dbn.zst"))
+            .unwrap();
+        let original = std::fs::read(&data).unwrap();
+        std::fs::write(&data, b"changed").unwrap();
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_none());
+        std::fs::write(&data, &original).unwrap();
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_some());
+        clear_spool(Feed::Sip, "SPY", DAY, &dir);
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the spool is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A spool that can't be read just now is an error (the day waits), not a
+    /// damaged spool to build over.
+    #[tokio::test]
+    async fn an_unreadable_spool_is_an_error_not_damage() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("unreadable");
+        let (m, _, _) = build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let data = std::fs::read_dir(&m).unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().ends_with(".dbn.zst")).unwrap();
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = spooled(Feed::Sip, "SPY", DAY, &dir);
+        std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(r.is_err(), "{:?}", r.map(|k| k.is_some()));
+        // Missing, it's damage: rebuilt.
+        std::fs::remove_file(&data).unwrap();
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Batches without their marker (a build interrupted after writing them) aren't
+    /// a complete spool.
+    #[tokio::test]
+    async fn batches_without_their_marker_are_not_complete() {
+        let dir = scratch("unmarked");
+        build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let marker = dir.join(format!("{}.complete.json", Feed::Sip.batches("SPY", DAY).0));
+        std::fs::remove_file(marker).unwrap();
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A fake store: `/coverage` answers `cov` for exactly the query asked for the
+    /// SIP day (400 otherwise), and `/files/{name}` serves `files`.
+    async fn store(cov: serde_json::Value, files: Vec<(&'static str, Vec<u8>)>) -> String {
+        use axum::extract::{Path, Query};
+        use std::collections::HashMap;
+        let files: std::sync::Arc<HashMap<String, Vec<u8>>> = std::sync::Arc::new(files.into_iter().map(|(n, b)| (n.to_owned(), b)).collect());
+        let app = axum::Router::new()
+            .route(
+                "/coverage",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let cov = cov.clone();
+                    async move {
+                        let want = [("provider", "alpaca"), ("dataset", "ALPACA.SIP"), ("symbol", "SPY"), ("schema", "cmbp-1"), ("start", DAY), ("end", DAY)];
+                        if want.iter().all(|(k, v)| q.get(*k).map(String::as_str) == Some(*v)) && q.len() == want.len() {
+                            (axum::http::StatusCode::OK, axum::Json(cov))
+                        } else {
+                            (axum::http::StatusCode::BAD_REQUEST, axum::Json(serde_json::json!({ "error": format!("{q:?}") })))
+                        }
+                    }
+                }),
+            )
+            .route(
+                "/files/{*name}",
+                get(move |Path(name): Path<String>| {
+                    let files = std::sync::Arc::clone(&files);
+                    async move { files.get(&name).cloned().ok_or(axum::http::StatusCode::NOT_FOUND) }
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    /// Files a fake store serves: name and bytes (empty: the built main's).
+    type Served = Vec<(&'static str, Vec<u8>)>;
+
+    const A: &str = "data/Alpaca/ALPACA.SIP/SPY/cmbp-1/2026-10-01.dbn.zst";
+    const B: &str = "tt03/Alpaca/ALPACA.SIP/SPY/cmbp-1/2026-10-01.dbn.zst";
+
+    fn row(files: &[&str], sha: Option<&str>) -> serde_json::Value {
+        let mut r = serde_json::json!({ "day": DAY, "files": files, "conflict": false });
+        if let Some(h) = sha {
+            r["sha256"] = serde_json::json!(h);
+        }
+        serde_json::json!({ "days": [r], "missing_volumes": [] })
+    }
+
+    fn main_file(m: &std::path::Path) -> Vec<u8> {
+        let p = std::fs::read_dir(m).unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().ends_with(".dbn.zst")).unwrap();
+        std::fs::read(p).unwrap()
+    }
+
+    fn sha(b: &[u8]) -> String {
+        format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b))
+    }
+
+    async fn check(cov: serde_json::Value, files: Served, name: &str) -> (Vec<u8>, Result<(), super::FileError>) {
+        let dir = scratch(name);
+        let (m, c, _) = build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let main = main_file(&m);
+        let files = files.into_iter().map(|(n, b)| (n, if b.is_empty() { main.clone() } else { b })).collect();
+        let cov = serde_json::from_str(&cov.to_string().replace("MAIN_SHA", &sha(&main))).unwrap();
+        let r = check_binding(&reqwest::Client::new(), &store(cov, files).await, Feed::Sip, "SPY", DAY, &c).await;
+        let _ = std::fs::remove_dir_all(dir);
+        (main, r)
+    }
+
+    /// Conditions rebuilt against the same main the store holds bind to it: hashed
+    /// as it streams when the store gives no hash, every copy agreeing.
+    #[tokio::test]
+    async fn conditions_built_against_the_held_main_bind() {
+        let (_, r) = check(row(&[A], None), vec![(A, vec![])], "bound").await;
+        r.unwrap();
+        let (_, r) = check(row(&[A, B], None), vec![(A, vec![]), (B, vec![])], "bound-two").await;
+        r.unwrap();
+    }
+
+    /// Only the filed data file is hashed: sidecars listed beside it are not.
+    #[tokio::test]
+    async fn only_the_filed_data_file_is_compared() {
+        const SIDECAR: &str = "data/Alpaca/ALPACA.SIP/SPY/cmbp-1/manifest.json";
+        let (_, r) = check(row(&[SIDECAR, A], None), vec![(A, vec![]), (SIDECAR, b"{}".to_vec())], "sidecar").await;
+        r.unwrap();
+    }
+
+    /// The store's own hash is used when it has one: nothing is downloaded.
+    #[tokio::test]
+    async fn the_stores_hash_is_used_without_downloading() {
+        let (_, r) = check(row(&[A], Some("MAIN_SHA")), vec![], "store-hash").await;
+        r.unwrap();
+    }
+
+    /// The held main differs (the provider's data changed): unbound, naming both
+    /// hashes.
+    #[tokio::test]
+    async fn conditions_against_another_main_are_unbound() {
+        let (_, r) = check(row(&[A], None), vec![(A, b"another main".to_vec())], "unbound").await;
+        let e = r.unwrap_err();
+        assert!(e.unbound && !e.later && !e.busy, "{e:?}");
+        assert!(e.message.contains(&sha(b"another main")), "{}", e.message);
+    }
+
+    /// Anything that stops the check short of a known, different main defers the
+    /// day: never unbound, never filed.
+    #[tokio::test]
+    async fn what_cant_be_checked_is_deferred() {
+        let away = serde_json::json!({ "days": [], "missing_volumes": ["archive"] });
+        let disagree = (vec![(A, vec![]), (B, b"another copy".to_vec())], row(&[A, B], None));
+        let cases: Vec<(&str, serde_json::Value, Served)> = vec![
+            ("away", away, vec![]),
+            ("copies", disagree.1, disagree.0),
+            ("conflict", serde_json::json!({ "days": [{ "day": DAY, "files": [A], "conflict": true }], "missing_volumes": [] }), vec![(A, vec![])]),
+            ("unserved", row(&[A], None), vec![]),
+            // An older day folder's sidecar, and a batch download's range file: not
+            // the main as filed.
+            (
+                "old-layout",
+                row(&["data/Alpaca/ALPACA.SIP/SPY/2026-10-01/metadata.json", "data/Alpaca/ALPACA-SIP-SPY-20261001/alpaca-sip-20261001-20261002.cmbp-1.dbn.zst"], None),
+                vec![],
+            ),
+        ];
+        for (name, cov, files) in cases {
+            let (_, r) = check(cov, files, name).await;
+            let e = r.unwrap_err();
+            assert!(e.later && !e.unbound, "{name}: {e:?}");
+        }
+        // The store not there at all.
+        let dir = scratch("no-store");
+        let (_, c, _) = build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let e = check_binding(&reqwest::Client::new(), "http://127.0.0.1:9", Feed::Sip, "SPY", DAY, &c).await.unwrap_err();
+        assert!(e.later && !e.unbound, "{e:?}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
