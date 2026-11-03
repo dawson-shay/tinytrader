@@ -77,9 +77,17 @@ Most volumes carry it in `.tinytrader-volume` at their root, as
   registry: an `id` assigned there and bound to its `filesystem_uuid`, plus
   the name and `approved_at` of its existing marker, if it has one. That is
   weaker than a marker, because a block-level clone has the same filesystem
-  UUID. So for an immutable volume, the store treats "the same volume online
-  twice" as a conflict, and reads only from the first copy seen until an
-  operator decides.
+  UUID, and it has no epoch, since nothing may be written to the volume.
+  - The store treats "the same volume online twice" as a conflict, and reads
+    only from the first copy seen until an operator decides.
+  - **The limit:** a clone of a marker-less volume, mounted while the
+    original is away, is taken for the original. That is safe for the data:
+    such a volume is never written, so a clone holds exactly what the
+    original held when it was cloned, and its full scan is still compared
+    with the snapshot (§3). What the store can't do is tell the two drives
+    apart, for example to say which one to retire. Drives are labelled
+    physically for that, and the coordinator records each mount's host and
+    time in `/events`.
 
 ### 2. A store node per host, one coordinator
 
@@ -142,17 +150,28 @@ files, and **each file's size and SHA-256**, the same records `/coverage`
 serves plus the hashes. This is a few MB per volume, written with the state
 file.
 
-**The snapshot is current, not just as of the last scan.** Each filing
-reaches the snapshot before it is acknowledged:
+**The snapshot is current, not just as of the last scan.** The coordinator
+hears of each filing before it happens, and again once it has happened:
 
-- A node's filer reports each filing to the coordinator: the manifest entries
-  it wrote, with the volume's **snapshot version** (a counter the node keeps
-  in the volume's own manifests).
-- The node answers the client only once the coordinator has recorded it.
-- If the coordinator can't be reached, the node refuses new filings with
-  `503`, rather than filing something the snapshot would miss.
-- When a node reconnects, it sends what changed since the version the
-  coordinator has.
+1. **Intent, before anything is written.** The node's filer records an
+   *intent* with the coordinator: the volume, the batch, and the days it will
+   add or change. The coordinator writes the intent to its state file before
+   it answers. Without that answer, nothing is written, and the node refuses
+   the filing with `503`.
+2. **The filing.** The node files, and then reports the manifest entries it
+   wrote, with the volume's **snapshot version** (a counter the node keeps in
+   the volume's own manifests). The coordinator records them, and resolves
+   the intent.
+3. **The acknowledgement.** The node answers the client only then.
+
+A volume whose snapshot has an **unresolved intent** counts as **unknown**,
+not offline-known, so it blocks purchases. That covers the worst case: a node
+writes, crashes before reporting, and the drive is unplugged. Its snapshot
+can't say what the interrupted filing left, so the store doesn't vouch for
+it. Wherever the volume is next mounted, its node reads the volume's own
+manifests, which are the record. It reports what was filed, the intent is
+resolved, and the volume is known again. An operator can also resolve an
+intent by retiring the volume.
 
 So a day filed and then taken away on its volume is still in the snapshot,
 and it is never bought again.
@@ -161,7 +180,7 @@ and it is never bought again.
 |---|---|---|
 | **online** (a node reads it now) | held, available | proceed |
 | **offline, known** (away, with a current snapshot) | held, `"available": false`, `"volume_state": "offline"` | proceed: its days count as held and aren't bought again |
-| **unknown** (never read in full, no current snapshot, quarantined, or a node that won't say which volumes it has) | not listed | **refused**, as today |
+| **unknown** (never read in full, no current snapshot, an unresolved intent, quarantined, or a node that won't say which volumes it has) | not listed | **refused**, as today |
 | **retired** | not held | proceed: its days may be bought again |
 
 - `missing_volumes` keeps its name and its rule for the jobs service: refuse
@@ -203,11 +222,27 @@ and it is never bought again.
      (`STORE_PLACEMENT`, such as `databento/*=archive-*`, or by protection
      class: purchased to the NAS);
   3. otherwise 0007's rule: the most room.
+- **Days are reserved at placement.** When the coordinator places a batch,
+  it reserves each day the batch adds or changes on the chosen volume, until
+  the filing's intent is resolved. A second batch touching a reserved day is
+  placed on the same volume, and waits its turn in that volume's filer. Two
+  concurrent batches that both bring a new day can never land it on two
+  nodes.
+- **A batch whose held days are on several volumes** (some of its days on
+  one, some on another) is refused at placement, before it is uploaded, with
+  `409` naming the volumes. The client keeps its download. Splitting a batch
+  per volume is later work; until then, an operator moves the days onto one
+  volume, or files the batch as separate per-volume imports.
 - 0007's second copies go to a different volume, and to a different host when
   one is online.
 - **One write gate.** Every write the store makes to a volume goes through
-  one function, which refuses a volume that is immutable, configured
-  read-only, mounted read-only, or quarantined. That covers filing,
+  one function. It refuses a volume that is immutable, configured read-only,
+  mounted read-only, or quarantined, and, **by default, any volume without a
+  v1 marker on it** saying `"mount": "rw"` and not `"immutable": true`. The
+  gate reads that from the volume itself at the time of the write, not from
+  the registry. So a registry rebuilt or edited (§3) can never make the
+  archive, a purchased volume or a `:ro` volume writable. Only a marker
+  written on purpose can, and the migration never writes one to them. That covers filing,
   `.incoming`, provenance, migrations, repairs, markers and the indexing
   files. A test drives every write endpoint against such a volume and checks
   that nothing on it changed. fstab and mount flags (below) are a second
@@ -245,12 +280,17 @@ the write gate):
   `mdutil -i off` on it;
 - `.fseventsd/no_log`, so `fseventsd` keeps no change log on it.
 
+Both are written before a seal's remount, while the volume is still writable.
+`mdutil -i off` itself may write Spotlight's state to the volume, so it is
+run only while the volume is writable, never on a read-only one.
+
 Each node checks these on every scan and reports `indexing: off | on |
 unknown` per volume. `on` is a warning, with the command that fixes it. A
-read-only volume can't be given them, so it stays `unknown`. The host module
-turns indexing off for it by mount point instead (`mdutil -i off`, which
-needs no write to the volume). The deployment's host module may also exclude
-store volumes from Time Machine.
+read-only volume that was never given them stays `unknown`. The host module
+excludes it from Spotlight on the host side instead: a privacy exclusion by
+mount point, kept in the host's own Spotlight configuration, with no write to
+the volume. The deployment's host module may also exclude store volumes from
+Time Machine.
 
 ### 6. Moving a volume between hosts
 
@@ -317,16 +357,18 @@ the data.
    it in the registry only, or skip it, and why. Nothing is written.
    `store migrate --apply VOLUME…` then acts on the volumes named, and only
    those.
-2. **No marker is written to a volume that must not be written:**
+2. **No marker is ever written to a volume that must not be written**, and
+   `--apply` refuses one even when it is named:
    - one configured `:ro` or mounted read-only;
    - one an operator names as immutable or as an archive (`--immutable
      VOLUME`);
-   - one whose datasets are of the purchased class (0007) or Databento, by
-     default, unless an operator names it in `--apply` explicitly.
+   - one holding any dataset of the purchased class (0007), Databento's
+     included.
 
    Each of these gets its `id` in the registry only, bound to its
    `filesystem_uuid` and to its existing v0 marker's name and `approved_at`
-   (§1). The purchased archive is never written by the migration.
+   (§1). The write gate keeps it unwritable (§4). The purchased archive is
+   never written by the migration, and can't be made writable by naming it.
 3. **Other writable volumes**, once named in `--apply`, get the v1 marker,
    keeping their name. One is created for a `STORE_VOLUMES` volume that has
    none. The old marker is kept as `.tinytrader-volume.v0`. Each write goes
@@ -359,8 +401,8 @@ Each step is its own PR, and each one is useful on its own:
      read-only or purchased volume left unwritten; a clone and a stale epoch
      quarantined.
 2. **Offline but known.**
-   - Per-volume snapshots with file hashes, updated by each filing before it
-     is acknowledged.
+   - Per-volume snapshots with file hashes, and filing intents recorded
+     before each write and resolved after it.
    - `offline_volumes`, and `missing_volumes` narrowed to unknown volumes.
    - The offline-age warning, `lost` days on return, and `accept-loss`.
    - Rebuilding the state file from the volumes.
@@ -368,6 +410,8 @@ Each step is its own PR, and each one is useful on its own:
      - a purchase proceeds with a known volume away, and is refused with an
        unknown one;
      - a day filed just before its volume goes away is still held;
+     - a node that crashes between writing and reporting leaves its volume
+       unknown until the volume's manifests are read again;
      - a volume that returns missing days doesn't make them purchasable
        until the loss is accepted.
 3. **Volume hygiene.**
@@ -378,7 +422,8 @@ Each step is its own PR, and each one is useful on its own:
 5. **Node and coordinator.**
    - Node approval and credentials, and `STORE_NODES`.
    - Merged catalogs, `307` reads, and placement with write tickets.
-   - A day's writes kept on the volume that holds it.
+   - A day's writes kept on the volume that holds it, with days reserved at
+     placement, and a batch spanning volumes refused.
    - Moves and conflicts recorded in `/events`.
    - Tests on two nodes on one machine (two mount directories): a move, a
      silent node, a stale clone claimed by a second node, a redirect, a
@@ -392,14 +437,17 @@ Each step is its own PR, and each one is useful on its own:
   that drive's days, and every caller is told which volume and why.
 - **Moving a drive is plugging it in.** Configuration catches up later.
 - **Nothing is bought twice:**
-  - a filing reaches the snapshot before it is acknowledged;
+  - a filing is recorded as an intent before it writes, and in the snapshot
+    before it is acknowledged; an unresolved intent makes a volume unknown;
   - a returning volume's losses need an operator to accept them;
   - a lost state file makes volumes unknown, not empty.
 
   The cost is purchases blocked or skipped until someone acts, never a
   purchase made twice.
-- **Immutability is enforced in code** by one gate, with mount flags behind
-  it. The archive is never written by the migration.
+- **Immutability is enforced in code** by one gate, which reads the volume's
+  own marker and refuses a volume without one by default, with mount flags
+  behind it. The archive is never written by the migration, and no registry
+  change can make it writable.
 - **The coordinator is a single point**, as the one store is today. If it is
   down, reads stop, and so do new filings (§3), even though the nodes are up.
   A client may be given a node's address for reading that node's volumes,
