@@ -51,6 +51,7 @@
 
 mod catalog;
 mod conditions;
+mod filer;
 mod ingest;
 mod manifest;
 #[cfg(test)]
@@ -147,18 +148,31 @@ struct Store {
     rescan: tokio::sync::Notify,
     bytes_in: AtomicU64,
     batches_in: AtomicU64,
-    /// One batch is filed at a time.
-    filing: Arc<tokio::sync::Mutex<()>>,
-    /// Partial-day filings waiting for `filing`, each with the folders it
-    /// writes and where its answer goes: the one that takes the lock files
-    /// them all, as a group.
-    queue: Mutex<Vec<(partial::Filing, Vec<PathBuf>, Answer)>>,
+    /// The filing owner (decision 0030): every write asks it for a turn, and
+    /// partial-day filings are filed by it, in groups.
+    filer: filer::Filer<PartialJob>,
 }
+
+/// A partial-day filing waiting for the filer: the store, the filing, the folders it
+/// writes, and where its answer goes.
+type PartialJob = (Shared, partial::Filing, Vec<PathBuf>, Answer);
 
 type Answer = tokio::sync::oneshot::Sender<Result<Value, String>>;
 
 /// The most filings filed as one group; the rest wait for the next turn.
 const GROUP: usize = 16;
+
+/// The status for a filing that didn't run: 503 when the filer's queue was full.
+fn filing_failed(e: &str) -> StatusCode {
+    if e == BUSY {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+}
+
+/// What a write asked while the filer's queue is full is told (503).
+const BUSY: &str = "busy: the store's filing queue is full; try again";
 
 type Shared = Arc<Store>;
 
@@ -457,7 +471,7 @@ async fn scan(store: &Shared, observer: &Observer) {
                 // Settling writes manifests: only while no filing runs (one
                 // may be between recording its merge and swapping it in).
                 // Otherwise the merge stays listed, for the next scan.
-                if let Ok(_one_at_a_time) = s.filing.try_lock() {
+                if let Some(_turn) = s.filer.turn_if_idle() {
                     settle_merges(v, &mut root, &mut places, &mut served);
                 }
                 let errors: Vec<String> = if root["present"] == true {
@@ -692,74 +706,67 @@ impl Store {
         }
     }
 
-    /// Run `work` under the filing lock, in a task of its own, so a request
-    /// whose client goes away can't release the lock while it writes.
-    fn under_lock(self: &Arc<Self>, work: impl FnOnce(&Self) + Send + 'static) {
-        let (s, filing) = (self.clone(), self.filing.clone());
-        tokio::spawn(async move {
-            let _one_at_a_time = filing.lock_owned().await;
-            let _ = tokio::task::spawn_blocking(move || work(&s)).await;
-        });
-    }
-
-    /// Run a filing alone, under the filing lock, then read again the
-    /// folders it wrote (`targets`, and those its summary names).
+    /// Run a filing in its turn (decision 0030), alone, then read again the
+    /// folders it wrote (`targets`, and those its summary names). The write runs in
+    /// a task of its own, holding the turn, so a request whose client goes away
+    /// can't end the turn while it writes.
     async fn file_alone(
         self: &Arc<Self>,
         targets: Vec<PathBuf>,
         f: impl FnOnce() -> Result<Value, String> + Send + 'static,
     ) -> Result<Result<Value, String>, String> {
+        let turn = self.filer.turn().await.map_err(|_| BUSY.to_owned())?;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.under_lock(move |s| {
-            let r = f();
-            let mut dirs = targets;
-            dirs.extend(r.as_ref().map(Self::filed_folders).unwrap_or_default());
-            s.refresh(&dirs);
-            let _ = tx.send(r);
+        let s = self.clone();
+        tokio::spawn(async move {
+            let _turn = turn;
+            let _ = tokio::task::spawn_blocking(move || {
+                let r = f();
+                let mut dirs = targets;
+                dirs.extend(r.as_ref().map(Self::filed_folders).unwrap_or_default());
+                s.refresh(&dirs);
+                let _ = tx.send(r);
+            })
+            .await;
         });
         rx.await
             .map_err(|_| "the filing stopped unexpectedly".to_owned())
     }
 
-    /// File a partial-day filing together with others waiting for the
-    /// filing lock (decision 0024, section 8b), up to `GROUP` in the order
-    /// asked: they are filed as a group, so each day they touch is written
-    /// once, and the folders they wrote are read again. Each gets its own
-    /// answer.
+    /// File a partial-day filing together with others waiting right behind it
+    /// (decision 0024, section 8b), up to `GROUP` in the order asked: the filer
+    /// files them as a group, so each day they touch is written once, and the
+    /// folders they wrote are read again. Each gets its own answer.
     async fn file_partial(
         self: &Arc<Self>,
         f: partial::Filing,
         targets: Vec<PathBuf>,
     ) -> Result<Result<Value, String>, String> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        lock(&self.queue).push((f, targets, tx));
-        self.under_lock(|s| {
-            let queued: Vec<_> = {
-                let mut q = lock(&s.queue);
-                let n = q.len().min(GROUP);
-                q.drain(..n).collect()
-            };
-            // Empty if filings before it took this one into their group.
-            if queued.is_empty() {
-                return;
-            }
-            let (group, rest): (Vec<_>, Vec<_>) =
-                queued.into_iter().map(|(f, t, tx)| (f, (t, tx))).unzip();
-            let done = partial::import_group(&group);
-            let mut answers = Vec::new();
-            let mut dirs = Vec::new();
-            for ((targets, tx), r) in rest.into_iter().zip(done) {
-                dirs.extend(targets);
-                dirs.extend(r.as_ref().map(Self::filed_folders).unwrap_or_default());
-                answers.push((tx, r));
-            }
-            s.refresh(&dirs);
-            for (tx, r) in answers {
-                let _ = tx.send(r);
-            }
-        });
+        self.filer
+            .file_partial((self.clone(), f, targets, tx))
+            .map_err(|_| BUSY.to_owned())?;
         rx.await
             .map_err(|_| "the filing stopped unexpectedly".to_owned())
+    }
+
+    /// Files a group of partial-day filings (on the filer's blocking thread),
+    /// answering each.
+    fn file_group(&self, queued: Vec<PartialJob>) {
+        let (group, rest): (Vec<_>, Vec<_>) =
+            queued.into_iter().map(|(_, f, t, tx)| (f, (t, tx))).unzip();
+        let done = partial::import_group(&group);
+        let mut answers = Vec::new();
+        let mut dirs = Vec::new();
+        for ((targets, tx), r) in rest.into_iter().zip(done) {
+            dirs.extend(targets);
+            dirs.extend(r.as_ref().map(Self::filed_folders).unwrap_or_default());
+            answers.push((tx, r));
+        }
+        self.refresh(&dirs);
+        for (tx, r) in answers {
+            let _ = tx.send(r);
+        }
     }
 
     /// The schema folders of the day files a filing's summary names.
@@ -840,6 +847,11 @@ impl Store {
                 });
             }
         }
+        let filer = filer::Filer::start(GROUP, |group: Vec<PartialJob>| {
+            if let Some(s) = group.first().map(|j| j.0.clone()) {
+                s.file_group(group);
+            }
+        });
         Arc::new(Self {
             volumes: std::sync::RwLock::new(volumes),
             discover,
@@ -857,8 +869,7 @@ impl Store {
             rescan: tokio::sync::Notify::new(),
             bytes_in: AtomicU64::new(0),
             batches_in: AtomicU64::new(0),
-            filing: Arc::default(),
-            queue: Mutex::default(),
+            filer,
         })
     }
 
@@ -1129,7 +1140,7 @@ async fn incorporate(
                 .push(format!("refused {pdir}/{batch}: {e}"), e.clone());
             refused(StatusCode::CONFLICT, e)
         }
-        Err(e) => refused(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => refused(filing_failed(&e), e),
     }
 }
 
@@ -1181,7 +1192,7 @@ async fn import(
                 .push(format!("refused import {pdir}/{id}: {e}"), e.clone());
             refused(StatusCode::CONFLICT, e)
         }
-        Err(e) => refused(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => refused(filing_failed(&e), e),
     }
 }
 
@@ -1441,7 +1452,9 @@ async fn adopt(
         .map(|v| v.path.join(pdir))
         .filter(|p| *p != root)
         .collect();
-    let _one_at_a_time = store.filing.lock().await;
+    let Ok(_turn) = store.filer.turn().await else {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, BUSY);
+    };
     let part = ingest::Part {
         inc: dir.clone(),
         root: root.clone(),
@@ -1987,7 +2000,9 @@ async fn apply_conditions(
     if let Err(r) = store.settled(false).await {
         return r;
     }
-    let _one_at_a_time = store.filing.lock().await;
+    let Ok(_turn) = store.filer.turn().await else {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, BUSY);
+    };
     let index = lock(&store.index).clone();
     let mut out = conditions::Applied::default();
     let result = tokio::task::block_in_place(|| f(&index.volumes, &mut out));
@@ -2031,7 +2046,9 @@ async fn rebuild_coverage(AxState(store): AxState<Shared>) -> Reply {
     if let Err(r) = store.settled(false).await {
         return r;
     }
-    let _one_at_a_time = store.filing.lock().await;
+    let Ok(_turn) = store.filer.turn().await else {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, BUSY);
+    };
     let volumes: Vec<Volume> = store
         .volumes()
         .into_iter()
@@ -2893,22 +2910,22 @@ mod tests {
             tokio::spawn(async move { call(&a, "POST", &p, None, "").await })
         };
         // Three asked while a filing runs: one group.
-        let running = s.filing.clone().lock_owned().await;
+        let running = s.filer.turn().await.unwrap();
         let (lead, two, three) = (post("G1"), post("G2"), post("G3"));
-        while lock(&s.queue).len() < 3 {
+        while s.filer.queued() < 3 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // Held at its last step, reading its folders into the catalog.
         let catalog = lock(&s.catalog);
         drop(running);
-        while !lock(&s.queue).is_empty() {
+        while s.filer.queued() > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         // The lead's client goes away mid-group: the lock stays held.
         lead.abort();
         let four = post("G4");
         tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(s.filing.try_lock().is_err() && !four.is_finished());
+        assert!(s.filer.busy() && !four.is_finished());
         drop(catalog);
         for r in [two, three, four] {
             let (code, body) = r.await.unwrap();
@@ -2994,7 +3011,7 @@ mod tests {
             .join(format!("{DAY}.pending.json"));
         // A merge recorded, its file not yet swapped in, while it is filed.
         manifest::write_pending(&folder, DAY, &json!({ "sha256": "the merged file" })).unwrap();
-        let filing = s.filing.lock().await;
+        let filing = s.filer.turn().await.unwrap();
         scanned(&s).await;
         assert!(pending.exists(), "not settled while a filing runs");
         drop(filing);
