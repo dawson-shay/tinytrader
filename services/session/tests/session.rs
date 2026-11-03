@@ -462,11 +462,19 @@ fn the_calendar_closes_a_holiday() {
     );
 }
 
-/// An I/O error's text is the platform's ("Resource temporarily unavailable (os
-/// error 35)" on macOS, 11 on Linux): a timeout reads as `<io timeout>`.
+/// A timeout's text is the platform's: would block (os error 35 on macOS, 11 on
+/// Linux) or timed out (60, 110). Only those read as `<io timeout>`; any other
+/// error (a reset, a broken pipe) is kept verbatim, so a refactor that turns a
+/// timeout into one is caught.
 fn normalised_reason(r: &str) -> String {
+    const TIMEOUTS: [&str; 4] = [
+        "Resource temporarily unavailable (os error 35)",
+        "Resource temporarily unavailable (os error 11)",
+        "Operation timed out (os error 60)",
+        "Connection timed out (os error 110)",
+    ];
     match r.split_once(": ") {
-        Some((what, rest)) if rest.contains("(os error ") => format!("{what}: <io timeout>"),
+        Some((what, rest)) if TIMEOUTS.contains(&rest) => format!("{what}: <io timeout>"),
         _ => r.to_owned(),
     }
 }
