@@ -18,6 +18,7 @@
         fileset = lib.fileset.unions [
           ../Cargo.toml
           ../Cargo.lock
+          ../clippy.toml # its disallowed-methods ban (CONTRIBUTING), so the Nix clippy enforces it too
           ../libs/observe
           ../libs/fleet
           ../libs/schedule
