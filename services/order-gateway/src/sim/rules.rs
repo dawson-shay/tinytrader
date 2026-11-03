@@ -332,36 +332,10 @@ impl SimBroker {
             );
             self.orders[i].active = true;
             self.push(i, "new", None, None, None);
+            // The broker's own order: the gateway reports it as `foreign` and its fill
+            // as `foreign_fill`, as it does Alpaca's.
             self.execute(i, u64::try_from(qty).unwrap_or(0), &[ask]);
-            // The client hears of the fill as an account activity: the gateway sends a
-            // broker's own order once, as `foreign`, without its fills.
-            self.liquidation_fill(&symbol, qty, ask, ts, i);
         }
-    }
-}
-
-impl SimBroker {
-    fn liquidation_fill(&mut self, symbol: &str, qty: i64, ask: i64, ts: u64, i: usize) {
-        self.acts += 1;
-        let raw = crate::protocol::Obj::new()
-            .s("activity_type", "FILL")
-            .s("id", &format!("sim-act-{:06}", self.acts))
-            .s("order_id", &self.orders[i].id.clone())
-            .s("client_order_id", &self.orders[i].cid.clone())
-            .s("symbol", symbol)
-            .s("side", "buy")
-            .s("qty", &qty.to_string())
-            .s("price", &super::fmt_nanos(i128::from(ask)))
-            .s("reason", "liquidation")
-            .n("transaction_time_ns", ts)
-            .done();
-        self.activities.push(raw.clone());
-        let update = crate::broker::Update::Activity {
-            activity_type: "FILL".into(),
-            raw,
-        };
-        // While the stream is down it waits in the report queue, in time order.
-        self.report(update);
     }
 }
 
