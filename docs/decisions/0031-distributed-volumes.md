@@ -29,9 +29,9 @@ the drives are used:
   store on the new host doesn't know it is the same volume.
 - **Data will live on more than one host** (host drives now, a NAS later). One
   process can only read the drives attached to its own host.
-- **Some volumes must never change.** The purchased corpus is irreplaceable.
-  Nothing marks a volume as one that must never be written; `:ro` is only a
-  flag in the configuration.
+- **Some data must never change.** The purchased corpus is irreplaceable.
+  Nothing marks a volume, or a tree on one, as never to be written; `:ro` is
+  only a flag in the configuration, and it covers a whole volume.
 - **macOS writes to every volume it mounts.** Spotlight indexes millions of
   DBN files, and `mds` keeps files open so a drive won't unmount cleanly.
   `fseventsd` writes a change log to the volume. This costs I/O on drives that
@@ -236,22 +236,44 @@ and it is never bought again.
 - 0007's second copies go to a different volume, and to a different host when
   one is online.
 - **One write gate.** Every write the store makes to a volume goes through
-  one function. It refuses a volume that is immutable, configured read-only,
-  mounted read-only, or quarantined, and, **by default, any volume without a
-  v1 marker on it** saying `"mount": "rw"` and not `"immutable": true`. The
-  gate reads that from the volume itself at the time of the write, not from
-  the registry. So a registry rebuilt or edited (§3) can never make the
-  archive, a purchased volume or a `:ro` volume writable. Only a marker
-  written on purpose can, and the migration never writes one to them. That covers filing,
+  one function. It refuses a write to a volume that is sealed, configured
+  read-only, mounted read-only, or quarantined, and a write under a sealed
+  path (below).
+  - **Once a deployment has migrated** (its state file is v1), the gate
+    also refuses, by default, any volume without a v1 marker on it saying
+    `"mount": "rw"`. The gate reads that from the volume itself at the time
+    of the write, not from the registry. So a registry rebuilt or edited (§3)
+    can never make a sealed or `:ro` volume writable: only a marker written
+    on purpose can, and the migration never writes one to them.
+  - **Before migrating**, the gate keeps today's rule (writable unless `:ro`),
+    so upgrading a one-process store changes nothing until its operator runs
+    the migration.
+
+  The gate covers filing,
   `.incoming`, provenance, migrations, repairs, markers and the indexing
   files. A test drives every write endpoint against such a volume and checks
   that nothing on it changed. fstab and mount flags (below) are a second
   line, not the only one.
-- **`immutable`** is a property of the volume, recorded in the coordinator's
-  registry and, for a volume sealed while writable, in its marker, so it
-  travels with the volume to any host.
-  - **Sealing** (`POST /volumes/{id}/seal`) is the last write a volume
-    takes. It needs a writable mount, so the node:
+- **Immutability is an operator's choice, never inferred** from the kind of
+  data a volume holds. A working volume holding purchased data alongside
+  everything else stays writable: its held days still take merges and
+  supersedes (0018). What an operator seals is never written:
+  - **a whole volume** (`"immutable": true`), such as an archive drive;
+  - **a path on a working volume** (`"sealed": ["Databento/OPRA.PILLAR"]` in
+    its marker), such as a provider's purchased tree. The gate refuses any
+    write under a sealed path, including a merge into one of its days, and
+    the rest of the volume stays writable. A filing whose days fall under a
+    sealed path is refused at placement (`409`, naming the path), never
+    left waiting.
+
+  A seal is recorded in the coordinator's registry and in the volume's
+  marker, so it travels with the volume to any host.
+  - **Sealing a path** (`POST /volumes/{id}/seal` with `{ "path": … }`) waits
+    for the filer to finish any write under it, checks its files against the
+    manifests, and adds it to the marker's `sealed` list. The volume stays
+    mounted writable.
+  - **Sealing a whole volume** (`POST /volumes/{id}/seal`) is the last write
+    the volume takes. It needs a writable mount, so the node:
     1. stops placing new filings on the volume, and waits for its filer to
        be idle;
     2. checks every file against the manifests;
@@ -360,19 +382,25 @@ the data.
 2. **No marker is ever written to a volume that must not be written**, and
    `--apply` refuses one even when it is named:
    - one configured `:ro` or mounted read-only;
-   - one an operator names as immutable or as an archive (`--immutable
-     VOLUME`);
-   - one holding any dataset of the purchased class (0007), Databento's
-     included.
+   - one an operator seals as a whole (`--immutable VOLUME`).
 
    Each of these gets its `id` in the registry only, bound to its
    `filesystem_uuid` and to its existing v0 marker's name and `approved_at`
-   (§1). The write gate keeps it unwritable (§4). The purchased archive is
-   never written by the migration, and can't be made writable by naming it.
-3. **Other writable volumes**, once named in `--apply`, get the v1 marker,
-   keeping their name. One is created for a `STORE_VOLUMES` volume that has
-   none. The old marker is kept as `.tinytrader-volume.v0`. Each write goes
-   through the write gate.
+   (§1). The write gate keeps it unwritable (§4), and naming it in
+   `--apply` can't change that. The dry run lists, for every volume, which
+   providers' data it holds, so an operator decides what to seal with that
+   in front of them. Nothing is sealed because of what a volume holds.
+3. **Working volumes** (writable, not sealed as a whole), once named in
+   `--apply`, get the v1 marker, keeping their name. One is created for a
+   `STORE_VOLUMES` volume that has none. The old marker is kept as
+   `.tinytrader-volume.v0`. Each write goes through the write gate. With
+   `--seal VOLUME:PATH`, the same step seals a path on it, such as the
+   volume's purchased provider tree: the marker is written with that path in
+   `sealed`, so from its first v1 write the tree is never written again,
+   while the rest of the volume takes filings as before. From then on, until
+   a working volume has its v1 marker, the migrated store refuses to write
+   to it (§4), and the dry run says so: migrate the working volumes in the
+   same `--apply` as the state file.
 4. **The state file** is rekeyed by `id`, the old one kept beside it.
 5. **Snapshots** are taken by the first full scan after the upgrade. Until a
    volume has one, an offline volume is **unknown**, and blocks purchases as
@@ -397,9 +425,14 @@ Each step is its own PR, and each one is useful on its own:
    - The one write gate, with its test over every write endpoint.
    - `migrate --dry-run` and `--apply`, and quarantine for clones and stale
      epochs.
-   - Still one process. Tests: migration from v0 state and markers; a
-     read-only or purchased volume left unwritten; a clone and a stale epoch
-     quarantined.
+   - Sealed paths, and placement refusing a filing under one.
+   - Still one process. Tests:
+     - migration from v0 state and markers;
+     - a `:ro` or wholly sealed volume left unwritten, even when named;
+     - a working volume holding purchased data migrated and still taking
+       merges, with its sealed tree refusing them;
+     - a store that hasn't migrated writing as before;
+     - a clone and a stale epoch quarantined.
 2. **Offline but known.**
    - Per-volume snapshots with file hashes, and filing intents recorded
      before each write and resolved after it.
@@ -445,9 +478,11 @@ Each step is its own PR, and each one is useful on its own:
   The cost is purchases blocked or skipped until someone acts, never a
   purchase made twice.
 - **Immutability is enforced in code** by one gate, which reads the volume's
-  own marker and refuses a volume without one by default, with mount flags
-  behind it. The archive is never written by the migration, and no registry
-  change can make it writable.
+  own marker (whole-volume and path seals), with mount flags behind it. Once
+  migrated, it refuses a volume without a v1 marker by default. What is
+  sealed is an operator's choice, never inferred: a working volume that holds
+  purchases stays writable, and its purchased tree can be sealed on its own.
+  No registry change can make a sealed volume or path writable.
 - **The coordinator is a single point**, as the one store is today. If it is
   down, reads stop, and so do new filings (§3), even though the nodes are up.
   A client may be given a node's address for reading that node's volumes,
