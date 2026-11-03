@@ -230,9 +230,14 @@ struct ForeignFills {
     done: Option<u64>,
     /// When it was last seen, by either path, ns.
     seen: u64,
-    /// Seen by this process. Only these are dropped: one rebuilt from the journal
-    /// is kept until it's seen again, however old.
+    /// Seen by this process.
     touched: bool,
+    /// When this process first held it, ns (0 until then): one rebuilt from the journal
+    /// and never seen again is dropped a keep period after that, once ended.
+    since: u64,
+    /// Rebuilt from a first sighting that didn't show what was filled: seeded from the
+    /// next update, said with a `foreign_fill_lag`.
+    unknown: bool,
 }
 
 /// What has been reported of one symbol of a foreign order.
@@ -246,6 +251,26 @@ struct LegReported {
     unmatched: u64,
     /// The latest execution ids seen, at most [`FOREIGN_EXECS`].
     execs: VecDeque<String>,
+}
+
+/// What a foreign order's first sighting (its `broker_raw`) shows filled, per symbol;
+/// `None` when it doesn't say.
+fn first_sighting(raw: &Value) -> Option<Vec<(String, u64, Option<String>)>> {
+    let legs = raw["legs"].as_array().filter(|a| !a.is_empty());
+    let rows: Vec<&Value> = match legs {
+        Some(ls) => ls.iter().collect(),
+        None if raw["order_class"] == "mleg" => return None,
+        None => vec![raw],
+    };
+    rows.iter()
+        .map(|l| {
+            Some((
+                l["symbol"].as_str()?.to_owned(),
+                num(&l["filled_qty"])?,
+                l["filled_avg_price"].as_str().map(String::from),
+            ))
+        })
+        .collect()
 }
 
 /// Execution ids kept per symbol of a foreign order.
@@ -877,11 +902,24 @@ impl<B: Broker> Session<B> {
                 // An order whose fills are reported (`fills`): its record starts here,
                 // so a fill after a restart is new. One from an older journal has none,
                 // and is seeded from what it next shows.
-                if v["fills"] == true
-                    && let Some(bid) = text("broker_order_id")
-                {
+                if let Some(bid) = text("broker_order_id") {
                     let f = self.foreign_fills.entry(bid).or_default();
                     f.seen = v["ts_gateway"].as_u64().unwrap_or(0);
+                    // From a journal older than fill reporting (no `fills`): what the
+                    // first sighting showed filled, so later fills are reported from
+                    // there.
+                    if v["fills"] != true {
+                        match first_sighting(&v["broker_raw"]) {
+                            Some(rows) => {
+                                for (symbol, cum, avg) in rows {
+                                    let l = f.legs.entry(symbol).or_default();
+                                    l.cum = cum;
+                                    l.avg = avg;
+                                }
+                            }
+                            None => f.unknown = true,
+                        }
+                    }
                 }
             }
             "foreign_fill" => {
@@ -2107,20 +2145,27 @@ impl<B: Broker> Session<B> {
     /// symbol's cumulative quantity past what was reported. A stream execution that
     /// moves nothing is expected when a REST reconcile already reported its quantity;
     /// otherwise it's reported as `foreign_fill_lag`, so a lost fill is never silent.
-    /// With `seed` (an order known from an older journal), the record takes what the
-    /// update shows and reports nothing.
-    fn foreign_fills(&mut self, up: &OrderUpdate, seed: bool) -> Result<(), String> {
+    /// An order whose record was dropped, or rebuilt from a first sighting that didn't
+    /// show what was filled, is seeded from what the update shows: nothing is reported
+    /// for it, and a `foreign_fill_lag` says so.
+    fn foreign_fills(&mut self, up: &OrderUpdate, dropped: bool) -> Result<(), String> {
         let now = self.ts();
         let keep = u64::try_from(self.cfg.timing.foreign_keep.as_nanos()).unwrap_or(u64::MAX);
         let bo = &up.order;
         let bid = bo.broker_order_id.clone();
         // Ended, quiet for the keep period and seen by this process: dropped. Never
         // the order in hand, and never one rebuilt from the journal and not seen since.
+        for f in self.foreign_fills.values_mut() {
+            if f.since == 0 {
+                f.since = now;
+            }
+        }
         self.foreign_fills.retain(|k, f| {
+            let quiet = now.saturating_sub(f.seen.max(if f.touched { 0 } else { f.since })) >= keep;
             *k == bid
-                || !(f.touched
-                    && f.done.is_some_and(|d| now.saturating_sub(d) >= keep)
-                    && now.saturating_sub(f.seen) >= keep)
+                || !(f.done.is_some_and(|d| now.saturating_sub(d) >= keep)
+                    && quiet
+                    && (f.touched || now.saturating_sub(f.since) >= keep))
         });
         let ts = if self.b.now().is_some() {
             up.ts_broker
@@ -2146,12 +2191,28 @@ impl<B: Broker> Session<B> {
                 return self.emit(ts, "foreign_fill_lag", &body, Aud::All);
             }
         };
-        let was_done = {
+        let (was_done, seed) = {
             let f = self.foreign_fills.entry(bid.clone()).or_default();
             f.seen = now;
             f.touched = true;
-            f.done.is_some()
+            let seed = dropped || std::mem::take(&mut f.unknown);
+            (f.done.is_some(), seed)
         };
+        if seed {
+            let reason = if dropped {
+                "record_dropped"
+            } else {
+                "seeded_from_first_sighting"
+            };
+            let body = Obj::new()
+                .s("broker_order_id", &bid)
+                .s("reason", reason)
+                .n("filled_qty", bo.filled_qty)
+                .s("source", up.source)
+                .raw("broker_raw", &up.raw)
+                .done();
+            self.emit(ts, "foreign_fill_lag", &body, Aud::All)?;
+        }
         for leg in legs {
             let prev = self.foreign_fills[&bid]
                 .legs
@@ -2266,9 +2327,9 @@ impl<B: Broker> Session<B> {
         let bo = up.order;
         let cid = bo.client_order_id.clone();
         if !self.orders.contains_key(&cid) {
-            // Known from a journal that predates fill reporting: its record is seeded
-            // from what it shows now, so its history isn't reported again.
-            let seed = self.foreign.contains(&bo.broker_order_id)
+            // Known, but with no record (dropped once ended and quiet): it can only be
+            // seeded from what it shows now, which is said.
+            let dropped = self.foreign.contains(&bo.broker_order_id)
                 && !self.foreign_fills.contains_key(&bo.broker_order_id);
             let f = Obj::new()
                 .s("broker_order_id", &bo.broker_order_id)
@@ -2281,7 +2342,7 @@ impl<B: Broker> Session<B> {
                     .or_default();
             }
             let up = OrderUpdate { order: bo, ..up };
-            return self.foreign_fills(&up, seed);
+            return self.foreign_fills(&up, dropped);
         }
         if let Some(i) = self.pending.iter().position(|p| p.cid == cid) {
             let p = self.pending.remove(i);
@@ -3899,5 +3960,92 @@ mod tests {
         let r = reason(s.refusal("alice", "wse-", &es("wse-f3", 3)));
         assert_eq!(r["detail"]["cap"], "future_qty", "{r}");
         assert_eq!(s.refusal("alice", "wse-", &es("wse-f4", 2)), None);
+    }
+
+    /// An order the journal knows only from a first sighting written before fills
+    /// were reported: its next fill is reported, from what that sighting showed.
+    #[test]
+    fn an_old_journals_foreign_order_reports_its_next_fill() {
+        let (mut s, _) = session("foreign-old-journal", None);
+        let sym = "SPY261005P00570000";
+        let first = serde_json::json!({"kind":"foreign","broker_order_id":"b-1","ts_gateway":1,
+            "broker_raw":{"symbol":sym,"side":"buy","qty":"2","filled_qty":"0","filled_avg_price":null,"order_class":"simple","time_in_force":"gtc"}});
+        s.rebuild(&first, 0);
+        let raw = format!(
+            r#"{{"symbol":"{sym}","side":"buy","qty":"2","filled_qty":"1","filled_avg_price":"0.33","order_class":"simple","time_in_force":"gtc"}}"#
+        );
+        let bo = BrokerOrder {
+            client_order_id: "dash-1".into(),
+            broker_order_id: "b-1".into(),
+            status: "partially_filled".into(),
+            filled_qty: 1,
+            avg_price: Some("0.33".into()),
+            legs: None,
+            updated_ts: 0,
+            raw: raw.clone(),
+        };
+        s.on_order(OrderUpdate {
+            event: "partial_fill".into(),
+            ts_broker: 0,
+            fill: Some(r#"{"execution_id":"x1","qty":1,"price":"0.33"}"#.into()),
+            legs: None,
+            position_qty: None,
+            reason: None,
+            source: "stream",
+            raw,
+            order: bo,
+        })
+        .unwrap();
+        let f = &s.foreign_fills["b-1"];
+        assert_eq!(f.legs[sym].cum, 1);
+        let journal: String = std::fs::read_dir(s.cfg.state.join("journal"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert_eq!(
+            journal.matches(r#""kind":"foreign_fill""#).count(),
+            1,
+            "{journal}"
+        );
+        assert!(!journal.contains("foreign_fill_lag"), "{journal}");
+    }
+
+    /// A first sighting that doesn't show what was filled: the next update seeds the
+    /// record, and a `foreign_fill_lag` says so.
+    #[test]
+    fn an_unreadable_first_sighting_is_said() {
+        let (mut s, _) = session("foreign-old-unknown", None);
+        let first = serde_json::json!({"kind":"foreign","broker_order_id":"b-2","ts_gateway":1,
+            "broker_raw":{"id":"b-2"}});
+        s.rebuild(&first, 0);
+        let raw = r#"{"symbol":"SPY261005P00570000","side":"buy","qty":"1","filled_qty":"1","filled_avg_price":"0.33","order_class":"simple"}"#.to_owned();
+        let bo = BrokerOrder {
+            client_order_id: "dash-2".into(),
+            broker_order_id: "b-2".into(),
+            status: "filled".into(),
+            filled_qty: 1,
+            avg_price: Some("0.33".into()),
+            legs: None,
+            updated_ts: 0,
+            raw: raw.clone(),
+        };
+        s.on_order(OrderUpdate {
+            event: "filled".into(),
+            ts_broker: 0,
+            fill: None,
+            legs: None,
+            position_qty: None,
+            reason: None,
+            source: "rest_reconcile",
+            raw,
+            order: bo,
+        })
+        .unwrap();
+        let journal: String = std::fs::read_dir(s.cfg.state.join("journal"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect();
+        assert!(journal.contains("seeded_from_first_sighting"), "{journal}");
+        assert!(!journal.contains(r#""kind":"foreign_fill","#), "{journal}");
     }
 }
