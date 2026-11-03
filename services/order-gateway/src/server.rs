@@ -163,6 +163,8 @@ pub fn check_state_under(state: &Path, forbidden: &[PathBuf]) -> Result<(), Stri
 }
 
 pub(crate) struct Outbox {
+    /// One writer (the account session) and one reader (the connection's writer
+    /// thread), neither holding it for long: the lock the contributing guide allows.
     st: Mutex<(VecDeque<String>, usize, bool, bool)>,
     cv: Condvar,
     limit: usize,

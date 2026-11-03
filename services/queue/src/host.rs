@@ -126,6 +126,10 @@ async fn run_one(http: &reqwest::Client, base: &str, work: &Value) {
         child.stdout.take().expect("piped"),
         child.stderr.take().expect("piped"),
     );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "known debt (CONTRIBUTING, Shared state): a job's output chunks; bound when touched"
+    )]
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
     let tx2 = tx.clone();
     tokio::spawn(async move {

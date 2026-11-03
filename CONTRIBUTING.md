@@ -76,8 +76,17 @@ capability is the exception ([decision 0004](docs/decisions/0004-nix-not-nixos.m
   fixed capacity (as `Events` and `Series` do), and says what happens when it's
   full: the sender waits (backpressure, where waiting can't deadlock), the item
   is refused with an answer (`busy`), the consumer is cut off and resumes
-  (`slow_consumer`), or the run stops naming the limit. A channel is never
-  `channel()` or `unbounded_channel()`.
+  (`slow_consumer`), or the run stops naming the limit.
+- A channel is bounded: `std::sync::mpsc::sync_channel` or
+  `tokio::sync::mpsc::channel(n)`, never `std::sync::mpsc::channel` or
+  `tokio::sync::mpsc::unbounded_channel` (oneshot channels are fine). Clippy
+  enforces it (`clippy.toml`, `disallowed-methods`), in tests too. A known
+  exception carries `#[expect(clippy::disallowed_methods, reason = "…")]` where
+  it's made.
+- Services get supervisor limits by default: `resources` in the
+  `tinytrader.services` module (memory, CPU, tasks, open files, restart loops,
+  a capped journal) and memory caps plus log rotation in Compose files.
+- Disk is bounded by the store's thresholds, never by deleting data.
 
 ## Shared state
 
@@ -90,10 +99,12 @@ capability is the exception ([decision 0004](docs/decisions/0004-nix-not-nixos.m
   queue); say so where it's declared. A global lock over shared work (one for a
   whole store's filing, say) is a defect to shard or replace with an owner.
 - Read-mostly counters and flags are atomics; values set once are `OnceLock`s.
-- Services get supervisor limits by default: `resources` in the
-  `tinytrader.services` module (memory, CPU, tasks, open files, restart loops,
-  a capped journal) and memory caps plus log rotation in Compose files.
-- Disk is bounded by the store's thresholds, never by deleting data.
+- Known debt, to fix when the code is touched (not yet compliant):
+  - `services/store`: the global `filing` mutex over all filing (decision 0024
+    proposes a lock per day).
+  - `services/databento-jobs`, `libs/fleet`, `services/alpaca-account`,
+    `libs/observe`, `services/relay` (its hub): shared state behind mutexes.
+  - `services/queue`: a job's output chunks on an unbounded channel.
 
 ## Toolchain
 
