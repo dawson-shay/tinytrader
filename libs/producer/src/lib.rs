@@ -482,6 +482,8 @@ impl StoreProducer {
                             && !meta.symbols.is_empty()
                             && !meta.symbols.contains(&self.query.symbol))
                     {
+                        // A sidecar is hashed for the pins too, then dropped.
+                        digest.keep();
                         drop(dec);
                         self.reading.push((f.clone(), digest, false));
                         continue;
@@ -555,6 +557,9 @@ impl StoreProducer {
     /// Finishes the day being read: drains and checks each file's hash.
     fn end_day(&mut self) -> Result<(), String> {
         // Dropping the day's decoders drains their files and publishes the hashes.
+        for (_, digest, _) in &self.reading {
+            digest.keep();
+        }
         self.state = State::Next;
         let reading = std::mem::take(&mut self.reading);
         let pin = self.pins.last_mut().ok_or("no day being read")?;
@@ -601,15 +606,7 @@ impl StoreProducer {
 
 impl DecodeRecordRef for StoreProducer {
     fn decode_record_ref(&mut self) -> dbn::Result<Option<RecordRef<'_>>> {
-        let next = self.advance();
-        if next.is_err() {
-            // The run stops: the day's files aren't read to their ends for hashes.
-            for (_, digest, _) in &self.reading {
-                digest.abandon();
-            }
-            self.state = State::Done;
-        }
-        self.cur = next.map_err(fail)?;
+        self.cur = self.advance().map_err(fail)?;
         Ok(self.cur.as_ref().map(RecordBuf::as_rec_ref))
     }
 }

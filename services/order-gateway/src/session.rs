@@ -826,8 +826,12 @@ impl<B: Broker> Session<B> {
         }
     }
 
-    pub(crate) fn run(mut self, rx: &Receiver<Input>) -> Result<(), String> {
-        let result = self.run_inner(rx);
+    pub(crate) fn run(
+        mut self,
+        rx: &Receiver<Input>,
+        urgent: &Receiver<Input>,
+    ) -> Result<(), String> {
+        let result = self.run_inner(rx, urgent);
         let msg = match &result {
             Ok(()) => "the process is stopping".to_string(),
             Err(e) => format!("fatal: {e}"),
@@ -838,57 +842,72 @@ impl<B: Broker> Session<B> {
         result
     }
 
-    fn run_inner(&mut self, rx: &Receiver<Input>) -> Result<(), String> {
+    fn run_inner(&mut self, rx: &Receiver<Input>, urgent: &Receiver<Input>) -> Result<(), String> {
         self.reconcile(true)?;
         self.run_startup_reconcile()?;
         loop {
-            match rx.recv_timeout(Duration::from_millis(20)) {
-                Ok(Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
-                Ok(Input::Hello {
-                    id,
-                    client,
-                    outbox,
-                    resume,
-                    cancel_on_disconnect,
-                }) => {
-                    self.hello(id, client, outbox, resume, cancel_on_disconnect)?;
+            // The urgent inputs (kill, unkill, flatten, clear) first, every time: they
+            // never wait behind the inbox.
+            while let Ok(input) = urgent.try_recv() {
+                if self.input(Ok(input))? {
+                    return Ok(());
                 }
-                Ok(Input::Request { id, request }) => {
-                    let name = match &request {
-                        Ok((_, op)) => op_name(op),
-                        Err((_, op, _)) => op.as_str(),
-                    };
-                    if matches!(name, "submit" | "cancel")
-                        && let Some(c) = self.conns.iter().find(|c| c.id == id)
-                    {
-                        *self.handled.entry(c.client).or_default() += 1;
-                    }
-                    self.request(id, request)?;
+            }
+            if self.input(rx.recv_timeout(Duration::from_millis(20)))? {
+                return Ok(());
+            }
+            self.clock()?;
+            self.tick()?;
+        }
+    }
+
+    /// Handles one input; whether the session is to stop.
+    fn input(&mut self, input: Result<Input, RecvTimeoutError>) -> Result<bool, String> {
+        match input {
+            Ok(Input::Shutdown) | Err(RecvTimeoutError::Disconnected) => return Ok(true),
+            Ok(Input::Hello {
+                id,
+                client,
+                outbox,
+                resume,
+                cancel_on_disconnect,
+            }) => {
+                self.hello(id, client, outbox, resume, cancel_on_disconnect)?;
+            }
+            Ok(Input::Request { id, request }) => {
+                let name = match &request {
+                    Ok((_, op)) => op_name(op),
+                    Err((_, op, _)) => op.as_str(),
+                };
+                if matches!(name, "submit" | "cancel")
+                    && let Some(c) = self.conns.iter().find(|c| c.id == id)
+                {
+                    *self.handled.entry(c.client).or_default() += 1;
                 }
-                Ok(Input::Closed(id)) => self.closed(id)?,
-                Ok(Input::Clock {
+                self.request(id, request)?;
+            }
+            Ok(Input::Closed(id)) => self.closed(id)?,
+            Ok(Input::Clock {
+                client,
+                orders,
+                to,
+                deadline,
+                reply,
+            }) => match self.cfg.clients.iter().position(|c| c.name == client) {
+                Some(client) => self.clocks.push_back(ClockWait {
                     client,
                     orders,
                     to,
                     deadline,
                     reply,
-                }) => match self.cfg.clients.iter().position(|c| c.name == client) {
-                    Some(client) => self.clocks.push_back(ClockWait {
-                        client,
-                        orders,
-                        to,
-                        deadline,
-                        reply,
-                    }),
-                    None => {
-                        let _ = reply.send(Err(format!("no client {client}")));
-                    }
-                },
-                Err(RecvTimeoutError::Timeout) => {}
-            }
-            self.clock()?;
-            self.tick()?;
+                }),
+                None => {
+                    let _ = reply.send(Err(format!("no client {client}")));
+                }
+            },
+            Err(RecvTimeoutError::Timeout) => {}
         }
+        Ok(false)
     }
 
     /// Runs the waiting clock advances whose order messages have all been handled, in
@@ -952,6 +971,11 @@ impl<B: Broker> Session<B> {
         resume: Option<u64>,
         cod: bool,
     ) -> Result<(), String> {
+        // Its connection is gone (it gave up waiting for the welcome): nothing to do,
+        // and its client's cancel-on-disconnect timer stays armed.
+        if outbox.closed() {
+            return Ok(());
+        }
         let (resume_obj, lines) = match resume {
             None => (Obj::new().s("resume", "none").done(), Vec::new()),
             Some(n) => {
@@ -3545,5 +3569,97 @@ mod tests {
         let r = reason(s.refusal("alice", "wse-", &es("wse-f3", 3)));
         assert_eq!(r["detail"]["cap"], "future_qty", "{r}");
         assert_eq!(s.refusal("alice", "wse-", &es("wse-f4", 2)), None);
+    }
+
+    fn journal_text(s: &Session<Stub>) -> String {
+        std::fs::read_dir(s.cfg.state.join("journal"))
+            .unwrap()
+            .map(|e| std::fs::read_to_string(e.unwrap().path()).unwrap())
+            .collect()
+    }
+
+    /// A hello the session reaches after its connection gave up (closed): no
+    /// connection is registered, and the client's cancel-on-disconnect timer stays.
+    #[test]
+    fn a_hello_answered_late_leaves_cancel_on_disconnect_armed() {
+        let (mut s, _) = session("late-hello", None);
+        s.cfg.clients.push(ClientSpec {
+            name: "alice".into(),
+            role: Role::Trade,
+            prefix: "wse-".into(),
+            token: "token".into(),
+        });
+        s.cod_timers.push(("alice".into(), Instant::now()));
+        let ob = Arc::new(crate::server::Outbox::new(1 << 20));
+        ob.close(None);
+        s.hello(7, 0, ob, None, true).unwrap();
+        assert!(s.conns.iter().all(|c| c.id != 7));
+        assert_eq!(s.cod_timers.len(), 1, "the timer stays armed");
+        s.closed(7).unwrap();
+    }
+
+    /// The urgent inputs go first: a kill on the urgent channel is handled before
+    /// the submits already in the inbox, so none of them is sent.
+    #[test]
+    fn a_kill_goes_ahead_of_the_inbox() {
+        let (mut s, _) = session("urgent-kill", None);
+        s.b.account_ok = true;
+        for (name, role, prefix) in [("alice", Role::Trade, "wse-"), ("ops", Role::Admin, "ops-")] {
+            s.cfg.clients.push(ClientSpec {
+                name: name.into(),
+                role,
+                prefix: prefix.into(),
+                token: "token".into(),
+            });
+        }
+        s.cfg.profile.underlyings = vec!["SPY".into()];
+        for (id, client) in [(1, 0), (2, 1)] {
+            let ob = Arc::new(crate::server::Outbox::new(1 << 20));
+            ob.push("{}".into());
+            s.hello(id, client, ob, None, false).unwrap();
+        }
+        let (tx, rx) = std::sync::mpsc::sync_channel(16);
+        let (utx, urx) = std::sync::mpsc::sync_channel(4);
+        for k in 0..5 {
+            let intent = serde_json::json!({"client_order_id":format!("wse-{k}"),"shape":"single",
+                "instrument":{"class":"option","symbol":"SPY261005P00570000"},"side":"buy",
+                "effect":"open","qty":1,"type":"limit","limit_price":"1.00","time_in_force":"day"});
+            tx.send(super::Input::Request {
+                id: 1,
+                request: Ok((format!("r{k}"), crate::protocol::Op::Submit(intent))),
+            })
+            .unwrap();
+        }
+        tx.send(super::Input::Shutdown).unwrap();
+        utx.send(super::Input::Request {
+            id: 2,
+            request: Ok((
+                "k1".into(),
+                crate::protocol::Op::Kill {
+                    level: KillLevel::HaltAll,
+                    reason: "test".into(),
+                },
+            )),
+        })
+        .unwrap();
+        s.run_inner(&rx, &urx).unwrap();
+        let j = journal_text(&s);
+        assert!(j.contains("halt_all"), "{j}");
+        let submits: Vec<&str> = j
+            .lines()
+            .filter(|l| l.contains(r#""kind":"submit""#))
+            .collect();
+        assert!(
+            submits.iter().all(|l| !l.contains(r#""phase":"sent""#)),
+            "a submit behind the kill was sent: {j}"
+        );
+        assert_eq!(
+            submits
+                .iter()
+                .filter(|l| l.contains(r#""reason":"killed""#))
+                .count(),
+            5,
+            "{j}"
+        );
     }
 }
