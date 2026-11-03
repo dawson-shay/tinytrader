@@ -23,8 +23,8 @@
 //!    day orders expire, and the session sends `end` with the outcome and the audit
 //!    hash, and writes the run record.
 use crate::config::{Config, Sandbox};
-use crate::protocol::{self, FromStrategy};
-use dbn::encode::DbnMetadataEncoder;
+use crate::protocol;
+use crate::transport::{self, SessionSocket, Transport};
 use dbn::{Metadata, SType, Schema};
 use order_gateway::{
     ClientSpec, Clock, Config as GatewayConfig, Feed, Gateway, Profile, Role, SimBroker, Timing,
@@ -32,8 +32,8 @@ use order_gateway::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::io::{BufWriter, Write};
+use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -112,8 +112,8 @@ pub struct Session {
     cfg: Config,
     cfg_text: String,
     dir: PathBuf,
-    control: TcpListener,
-    data: TcpListener,
+    /// How the session reaches its strategy (decision 0029): 0022's sockets.
+    transport: Box<dyn Transport>,
     venues: Vec<Venue>,
     merge: Merge<StoreProducer>,
 }
@@ -159,26 +159,6 @@ pub(crate) fn day_ns(day: &str) -> Option<u64> {
     u64::try_from(era * 146_097 + doe - 719_468)
         .ok()?
         .checked_mul(DAY)
-}
-
-/// Accepts one connection before `deadline`.
-fn accept(l: &TcpListener, deadline: Instant, what: &str) -> Result<TcpStream, String> {
-    l.set_nonblocking(true).map_err(|e| e.to_string())?;
-    loop {
-        match l.accept() {
-            Ok((s, _)) => {
-                s.set_nonblocking(false).map_err(|e| e.to_string())?;
-                return Ok(s);
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
-                    return Err(format!("no {what} connection in time"));
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-    }
 }
 
 impl Session {
@@ -291,14 +271,14 @@ impl Session {
                 .map(|v| (v.name.clone(), v.gateway.addr()))
                 .collect(),
         };
+        let wait = Duration::from_secs(cfg.ready_timeout_s);
         Ok(Self {
             calendar_sha: calendar.map(|c| c.1),
             ready,
             cfg,
             cfg_text: cfg_text.to_owned(),
             dir: dir.to_owned(),
-            control,
-            data,
+            transport: Box::new(SessionSocket::new(control, data, wait)),
             venues,
             merge: Merge::new(sources),
         })
@@ -430,6 +410,10 @@ impl Session {
         let mut state = Run::default();
         let started = self.start_strategy(&mut state);
         let result = started.and_then(|()| self.serve(&mut audit, &mut state));
+        // The data stream ends with the run, before its end is sent; the control
+        // connection stays open until the strategy, the record and the venues are
+        // done.
+        self.transport.close_data();
         let flushed = audit.log.flush().map_err(|e| format!("audit.log: {e}"));
         let reason = result
             .err()
@@ -446,14 +430,11 @@ impl Session {
             steps: state.steps,
             records: state.records,
         };
-        if let Some(c) = &mut state.control {
-            let _ = protocol::send(
-                c,
-                &json!({"type": "end", "status": outcome.status, "reason": outcome.reason,
-                        "audit": outcome.audit, "steps": outcome.steps, "records": outcome.records,
-                        "reports": state.reports}),
-            );
-        }
+        self.transport.end(
+            &json!({"type": "end", "status": outcome.status, "reason": outcome.reason,
+                    "audit": outcome.audit, "steps": outcome.steps, "records": outcome.records,
+                    "reports": state.reports}),
+        );
         self.wait_strategy(&mut state);
         // The venues stop whatever happens to the record.
         let recorded = self.record(&outcome, &state);
@@ -529,50 +510,18 @@ impl Session {
             .map(|d| d + DAY - 1)
             .ok_or("no last day")?;
         // The strategy: control first, then data.
-        let ctl = accept(&self.control, deadline, "control")?;
-        ctl.set_read_timeout(Some(wait))
-            .map_err(|e| e.to_string())?;
-        ctl.set_write_timeout(Some(wait))
-            .map_err(|e| e.to_string())?;
-        let mut reader = BufReader::new(ctl.try_clone().map_err(|e| e.to_string())?);
-        st.control = Some(ctl);
-        let hello = protocol::read(&mut reader)?;
-        let FromStrategy::Hello {
-            strategy,
-            revision,
-            token,
-        } = hello
-        else {
-            return Err("the strategy's first message must be hello".into());
-        };
-        if st.token.is_some() && token != st.token {
+        let hello = self.transport.hello(deadline)?;
+        if st.token.is_some() && hello.token != st.token {
             return Err("the control connection isn't from the strategy the session started (no TT_SESSION_TOKEN)".into());
         }
+        let (strategy, revision) = (hello.strategy, hello.revision);
         st.strategy = Some((strategy.clone(), revision.clone()));
         audit.update(format!("hello {strategy} {revision}\n"));
         let w = self.welcome();
-        protocol::send(st.control.as_mut().ok_or("no control")?, &w)?;
-        let data = accept(&self.data, deadline, "data")?;
-        data.set_read_timeout(Some(wait))
-            .map_err(|e| e.to_string())?;
-        // A strategy that stops reading its data ends the run, never blocks it.
-        data.set_write_timeout(Some(wait))
-            .map_err(|e| e.to_string())?;
-        let mut join = String::new();
-        BufReader::new(data.try_clone().map_err(|e| e.to_string())?)
-            .read_line(&mut join)
-            .map_err(|e| format!("data join: {e}"))?;
-        let j: Value = serde_json::from_str(&join).map_err(|e| format!("data join: {e}"))?;
-        if j["protocol"] != "tinytrader.relay/1" {
-            return Err("the data join must name tinytrader.relay/1".into());
-        }
-        let mut out = BufWriter::new(data);
-        DbnMetadataEncoder::new(&mut out)
-            .encode(&self.metadata())
-            .map_err(|e| e.to_string())?;
-        out.flush().map_err(|e| e.to_string())?;
-        let first_timers = match protocol::read(&mut reader)? {
-            FromStrategy::Ready {
+        let metadata = self.metadata();
+        let first = self.transport.open(&w, &metadata, deadline)?;
+        let first_timers = match first {
+            transport::Ready {
                 as_of: 0,
                 sent,
                 timers,
@@ -645,50 +594,48 @@ impl Session {
             st.steps += 1;
             st.records += n;
             as_of = t;
-            let step = json!({"type": "step", "step": st.steps, "as_of": t, "records": n,
-                              "timers": due, "reports": reports});
             audit.update(format!(
                 "step {} {t} {spans:?} {due:?} {events}\n",
                 st.steps
             ));
-            protocol::send(st.control.as_mut().ok_or("no control")?, &step)?;
-            out.write_all(&bytes)
-                .and_then(|()| out.flush())
-                .map_err(|e| format!("data: {e}"))?;
-            match protocol::read(&mut reader)? {
-                FromStrategy::Ready {
-                    as_of: a,
-                    sent: s,
-                    timers: new,
-                } => {
-                    if a != t {
-                        return Err(format!("ready for {a}, but the step was {t}"));
-                    }
-                    for (venue, count) in s {
-                        let Some(prev) = sent.get_mut(&venue) else {
-                            return Err(format!("ready names venue {venue}, which isn't one"));
-                        };
-                        if count < *prev {
-                            return Err(format!("ready's sent for {venue} went back"));
-                        }
-                        *prev = count;
-                    }
-                    for (at, id) in new {
-                        if at <= t {
-                            return Err(format!("timer {id} at {at} isn't after the step at {t}"));
-                        }
-                        if at > last {
-                            return Err(format!(
-                                "timer {id} at {at} is after the last day ends at {last}"
-                            ));
-                        }
-                        timer_seq += 1;
-                        timers.insert((at, timer_seq), id);
-                    }
-                    audit.update(format!("ready {t} {sent:?} {timers:?}\n"));
-                }
-                FromStrategy::Hello { .. } => return Err("hello only once".into()),
+            self.transport.step(&transport::Step {
+                step: st.steps,
+                as_of: t,
+                records: n,
+                bytes: &bytes,
+                timers: &due,
+                reports: &reports,
+            })?;
+            let transport::Ready {
+                as_of: a,
+                sent: s,
+                timers: new,
+            } = self.transport.ready()?;
+            if a != t {
+                return Err(format!("ready for {a}, but the step was {t}"));
             }
+            for (venue, count) in s {
+                let Some(prev) = sent.get_mut(&venue) else {
+                    return Err(format!("ready names venue {venue}, which isn't one"));
+                };
+                if count < *prev {
+                    return Err(format!("ready's sent for {venue} went back"));
+                }
+                *prev = count;
+            }
+            for (at, id) in new {
+                if at <= t {
+                    return Err(format!("timer {id} at {at} isn't after the step at {t}"));
+                }
+                if at > last {
+                    return Err(format!(
+                        "timer {id} at {at} is after the last day ends at {last}"
+                    ));
+                }
+                timer_seq += 1;
+                timers.insert((at, timer_seq), id);
+            }
+            audit.update(format!("ready {t} {sent:?} {timers:?}\n"));
         }
         // The rest of the last day, so day orders expire at the close.
         let end = last.max(as_of);
@@ -871,7 +818,6 @@ impl Audit {
 
 #[derive(Default)]
 struct Run {
-    control: Option<TcpStream>,
     strategy: Option<(String, String)>,
     steps: u64,
     records: u64,
