@@ -53,7 +53,10 @@ impl Actor for Toy {
         let mut timers = Vec::new();
         if step.as_of == T0 {
             let intent = r#"{"client_order_id":"s-1","shape":"single","instrument":{"class":"option","symbol":"SPY261027C00580000"},"side":"buy","effect":"open","qty":1,"type":"limit","limit_price":"1.25","time_in_force":"day"}"#;
-            orders.send("submit", &format!(r#"{{"request_id":"r1","intent":{intent}}}"#))?;
+            orders.send(
+                "submit",
+                &format!(r#"{{"request_id":"r1","intent":{intent}}}"#),
+            )?;
             timers.push((T0 + 2 * MIN + MIN / 2, "check".to_owned()));
         }
         Ok(timers)

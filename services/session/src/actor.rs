@@ -4,9 +4,9 @@
 //! the gateway's own admission path: an in-process client
 //! ([`order_gateway::LocalClient`]) or a TCP one.
 use crate::protocol::PROTOCOL;
+use dbn::RecordRef;
 use dbn::decode::dbn::RecordDecoder;
 use dbn::decode::{DbnDecoder, DecodeRecordRef};
-use dbn::RecordRef;
 use order_gateway::LocalClient;
 use order_gateway::client::Client;
 use serde_json::{Value, json};
@@ -56,7 +56,10 @@ impl ActorStep {
     ///
     /// # Errors
     /// Bytes that aren't DBN records, or `f`'s own error.
-    pub fn records(&self, mut f: impl FnMut(RecordRef<'_>) -> Result<(), String>) -> Result<(), String> {
+    pub fn records(
+        &self,
+        mut f: impl FnMut(RecordRef<'_>) -> Result<(), String>,
+    ) -> Result<(), String> {
         let mut dec = RecordDecoder::new(&self.bytes[..]);
         while let Some(r) = dec.decode_record_ref().map_err(|e| e.to_string())? {
             f(r)?;
@@ -169,12 +172,19 @@ impl Context {
     /// Each venue's order messages sent so far: `ready.sent`.
     #[must_use]
     pub fn sent(&self) -> Vec<(String, u64)> {
-        self.orders.iter().map(|(v, o)| (v.clone(), o.sent)).collect()
+        self.orders
+            .iter()
+            .map(|(v, o)| (v.clone(), o.sent))
+            .collect()
     }
 }
 
 fn timers_json(t: &[(u64, String)]) -> Value {
-    Value::Array(t.iter().map(|(at, id)| json!({"at": at, "id": id})).collect())
+    Value::Array(
+        t.iter()
+            .map(|(at, id)| json!({"at": at, "id": id}))
+            .collect(),
+    )
 }
 
 fn sent_json(sent: &[(String, u64)]) -> Value {
@@ -202,7 +212,10 @@ pub fn run_socket(
     };
     let recv = |r: &mut BufReader<TcpStream>| -> Result<Value, String> {
         let mut line = String::new();
-        if r.read_line(&mut line).map_err(|e| format!("control: {e}"))? == 0 {
+        if r.read_line(&mut line)
+            .map_err(|e| format!("control: {e}"))?
+            == 0
+        {
             return Err("the session closed the control connection".into());
         }
         serde_json::from_str(&line).map_err(|e| format!("control: {e}"))
@@ -218,10 +231,18 @@ pub fn run_socket(
     if welcome["type"] != "welcome" {
         return Err(format!("expected a welcome, got {welcome}"));
     }
-    let data_addr = welcome["data"].as_str().ok_or("the welcome has no data address")?;
+    let data_addr = welcome["data"]
+        .as_str()
+        .ok_or("the welcome has no data address")?;
     let mut data = TcpStream::connect(data_addr).map_err(|e| format!("data: {e}"))?;
-    data.write_all(format!("{}\n", json!({"protocol": "tinytrader.relay/1", "client": strategy})).as_bytes())
-        .map_err(|e| format!("data: {e}"))?;
+    data.write_all(
+        format!(
+            "{}\n",
+            json!({"protocol": "tinytrader.relay/1", "client": strategy})
+        )
+        .as_bytes(),
+    )
+    .map_err(|e| format!("data: {e}"))?;
     let mut dec = DbnDecoder::new(BufReader::new(data)).map_err(|e| format!("data: {e}"))?;
     let mut orders = BTreeMap::new();
     for (venue, o) in welcome["orders"].as_object().into_iter().flatten() {

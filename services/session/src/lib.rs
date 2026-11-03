@@ -4,7 +4,9 @@
 //! account as an ordinary gateway, and advances everything in lockstep on the
 //! strategy's `ready` (`tinytrader.session/1`). It ends with a run record and an
 //! audit hash: the same configuration and strategy give the same hash.
+pub mod actor;
 pub mod config;
+pub mod example;
 pub mod fixture;
 pub mod protocol;
 pub mod run;

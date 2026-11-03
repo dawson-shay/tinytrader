@@ -405,7 +405,26 @@ impl Session {
     /// # Errors
     /// Only when the run record can't be written; a run that fails part way is an
     /// `incomplete` outcome.
-    pub fn run(mut self) -> Result<Outcome, String> {
+    pub fn run(self) -> Result<Outcome, String> {
+        self.run_transport()
+    }
+
+    /// Runs `actor` in process (0029's `inproc` transport) instead of waiting for a
+    /// strategy on the sockets: the same lockstep, rules, venues and audit, its
+    /// orders through each venue's gateway in process.
+    ///
+    /// # Errors
+    /// A config that also starts a strategy process, or a run record that can't be
+    /// written; a run that fails part way is an `incomplete` outcome.
+    pub fn run_inproc(mut self, actor: Box<dyn crate::actor::Actor>) -> Result<Outcome, String> {
+        if self.cfg.strategy.is_some() {
+            return Err("a run with an in-process actor starts no strategy process: take [strategy] out of its config".into());
+        }
+        self.transport = Box::new(transport::InProc::new(actor));
+        self.run_transport()
+    }
+
+    fn run_transport(mut self) -> Result<Outcome, String> {
         let mut audit = Audit::create(&self.dir.join("audit.log"))?;
         let mut state = Run::default();
         let started = self.start_strategy(&mut state);
@@ -519,7 +538,17 @@ impl Session {
         audit.update(format!("hello {strategy} {revision}\n"));
         let w = self.welcome();
         let metadata = self.metadata();
-        let first = self.transport.open(&w, &metadata, deadline)?;
+        let gateways: Vec<(String, &order_gateway::Gateway)> = self
+            .venues
+            .iter()
+            .map(|v| (v.name.clone(), &v.gateway))
+            .collect();
+        let first = self.transport.open(&transport::RunInfo {
+            welcome: &w,
+            metadata: &metadata,
+            deadline,
+            venues: &gateways,
+        })?;
         let first_timers = match first {
             transport::Ready {
                 as_of: 0,
@@ -610,7 +639,7 @@ impl Session {
                 as_of: a,
                 sent: s,
                 timers: new,
-            } = self.transport.ready()?;
+            } = self.transport.ready(Instant::now() + wait)?;
             if a != t {
                 return Err(format!("ready for {a}, but the step was {t}"));
             }

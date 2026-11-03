@@ -573,8 +573,10 @@ impl LocalClient {
             return Err("the connection is closed".into());
         }
         if line.len() >= MAX_LINE {
-            self.ob
-                .close(Some(error_line("line_too_long", "line exceeds 65536 bytes")));
+            self.ob.close(Some(error_line(
+                "line_too_long",
+                "line exceeds 65536 bytes",
+            )));
             return Err("line exceeds 65536 bytes".into());
         }
         if self.sh.line(&self.ob, self.client, self.id, line) {

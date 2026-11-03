@@ -309,6 +309,8 @@ pub struct InProc {
     name: (String, String),
     asks: Option<SyncSender<Ask>>,
     answers: Option<Receiver<Answer>>,
+    /// The last step's time, which its `ready` answers for.
+    as_of: u64,
 }
 
 impl InProc {
@@ -321,6 +323,7 @@ impl InProc {
             name,
             asks: None,
             answers: None,
+            as_of: 0,
         }
     }
 
@@ -418,6 +421,7 @@ impl Transport for InProc {
             .flatten()
             .filter_map(|(k, v)| Some((k.clone(), v.as_u64()?)))
             .collect();
+        self.as_of = step.as_of;
         let ask = Ask::Step(ActorStep {
             step: step.step,
             as_of: step.as_of,
@@ -434,8 +438,8 @@ impl Transport for InProc {
     }
 
     fn ready(&mut self, deadline: Instant) -> Result<Ready, ActorError> {
-        // The step's time is the session's; the actor answers only its timers.
-        self.ready_from(u64::MAX, deadline)
+        // An in-process actor answers the step it was given: its time is the step's.
+        self.ready_from(self.as_of, deadline)
     }
 
     fn close_data(&mut self) {}

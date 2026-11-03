@@ -160,6 +160,30 @@ Join as for a relay: `{"protocol":"tinytrader.relay/1","client":NAME}`. The sess
 
 With one source, the header's schema is that source's. With several, it's unset (mixed), and each record's rtype says what it is.
 
+## A Rust strategy in process
+
+A strategy written in Rust implements `session::actor::Actor` and can run
+either way (decision 0029), with the same run to the audit hash:
+
+- **In process:** `Session::run_inproc(Box::new(actor))`, in place of
+  `Session::run`. The session calls the actor with each step on a thread of
+  its own. Its orders go to each venue's gateway through an in-process client
+  (`Gateway::connect_local`), which takes a TCP connection's path: the same
+  authentication, welcome, parsing, inbox and admission, so nothing is `busy`
+  under the session's clock. Its `ready.sent` is counted for it, from the
+  submits and cancels it sends. A run config with `[strategy]` is refused: an
+  in-process run starts no strategy process.
+- **Over the sockets:** `session::actor::run_socket(actor, control, token)`
+  speaks this page's protocols as a client: `hello`, the data stream, each
+  venue's gateway over TCP, and a `ready` for every step.
+
+An actor's step has its records as DBN record bytes (`ActorStep::records`
+decodes them in order), the timers due, and each venue's last report
+sequence number. It reads its venue's reports up to that number before it
+acts, as a socket strategy does. `session::example::Toy` is the fixture's toy
+written this way. Run in process and over the sockets, it reproduces the
+golden audit hash and `run.json` recorded from the socket toy.
+
 ## The run record and the audit hash
 
 `run.json` (`tinytrader.session-run/1`) holds:
