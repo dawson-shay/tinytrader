@@ -224,6 +224,11 @@ impl OrderState {
 /// Whether a broker status ends an order of this time in force. `done_for_day` ends a day
 /// order only: a good-til-canceled or closing order in it may still be live, and an unknown
 /// time in force fails closed. Stopped and suspended never end an order.
+/// A client's order messages done: handled by the session, or answered `busy`.
+fn order_messages(handled: &HashMap<usize, u64>, refused: &[AtomicU64], client: usize) -> u64 {
+    handled.get(&client).copied().unwrap_or(0) + refused.get(client).map_or(0, |n| n.load(SeqCst))
+}
+
 fn settled(status: &str, tif: Option<&str>) -> bool {
     match status {
         "done_for_day" => tif == Some("day"),
@@ -575,6 +580,9 @@ pub(crate) struct Session<B: Broker> {
     /// Order messages (submits and cancels, valid or not) handled per client, by its
     /// index in the configuration, for clocks.
     handled: HashMap<usize, u64>,
+    /// Per client: order messages the server answered `busy`, never handled here,
+    /// which a clock wait counts as handled too.
+    pub(crate) refused: Arc<Vec<AtomicU64>>,
     /// Clock advances waiting for requests, in arrival order.
     clocks: VecDeque<ClockWait>,
     /// Order events journaled (submit, cancel, order, activity).
@@ -622,6 +630,7 @@ impl<B: Broker> Session<B> {
             last_kill_check: Instant::now(),
             last_seq,
             handled: HashMap::new(),
+            refused: Arc::new(Vec::new()),
             clocks: VecDeque::new(),
             order_events: 0,
         };
@@ -887,22 +896,23 @@ impl<B: Broker> Session<B> {
     /// holds up the ones behind it nor runs after its caller has given up.
     fn clock(&mut self) -> Result<(), String> {
         let now = Instant::now();
-        let handled = &self.handled;
+        let (handled, refused) = (&self.handled, &self.refused);
+        let done = |c: usize| order_messages(handled, refused, c);
         self.clocks.retain(|w| {
             // A wait whose order messages have all arrived runs, whatever the time.
-            if now < w.deadline || handled.get(&w.client).copied().unwrap_or(0) >= w.orders {
+            if now < w.deadline || done(w.client) >= w.orders {
                 return true;
             }
             let _ = w.reply.send(Err(format!(
                 "no advance to {}: waited for {} order messages, {} arrived",
                 w.to,
                 w.orders,
-                handled.get(&w.client).copied().unwrap_or(0)
+                done(w.client)
             )));
             false
         });
         while let Some(w) = self.clocks.front() {
-            if self.handled.get(&w.client).copied().unwrap_or(0) < w.orders {
+            if order_messages(&self.handled, &self.refused, w.client) < w.orders {
                 return Ok(());
             }
             let Some(w) = self.clocks.pop_front() else {
@@ -914,7 +924,7 @@ impl<B: Broker> Session<B> {
                     Ok(Advanced {
                         market_ts,
                         last_seq: self.last_seq.load(SeqCst),
-                        handled: self.handled.get(&w.client).copied().unwrap_or(0),
+                        handled: order_messages(&self.handled, &self.refused, w.client),
                         order_events: self.order_events,
                     })
                 }

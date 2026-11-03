@@ -601,7 +601,15 @@ impl StoreProducer {
 
 impl DecodeRecordRef for StoreProducer {
     fn decode_record_ref(&mut self) -> dbn::Result<Option<RecordRef<'_>>> {
-        self.cur = self.advance().map_err(fail)?;
+        let next = self.advance();
+        if next.is_err() {
+            // The run stops: the day's files aren't read to their ends for hashes.
+            for (_, digest, _) in &self.reading {
+                digest.abandon();
+            }
+            self.state = State::Done;
+        }
+        self.cur = next.map_err(fail)?;
         Ok(self.cur.as_ref().map(RecordBuf::as_rec_ref))
     }
 }

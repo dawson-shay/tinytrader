@@ -2,7 +2,7 @@
 //! connection, and the bounded outbound queue (`slow_consumer` on overflow).
 use crate::broker::Broker;
 use crate::journal::Journal;
-use crate::protocol::{Line, LineError, MAX_LINE, Obj, error_line, parse_line};
+use crate::protocol::{Line, LineError, MAX_LINE, Obj, Op, error_line, parse_line};
 use crate::session::{Input, Session};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -163,7 +163,7 @@ pub fn check_state_under(state: &Path, forbidden: &[PathBuf]) -> Result<(), Stri
 }
 
 pub(crate) struct Outbox {
-    st: Mutex<(VecDeque<String>, usize, bool)>,
+    st: Mutex<(VecDeque<String>, usize, bool, bool)>,
     cv: Condvar,
     limit: usize,
 }
@@ -177,7 +177,7 @@ enum Pop {
 impl Outbox {
     fn new(limit: usize) -> Self {
         Self {
-            st: Mutex::new((VecDeque::new(), 0, false)),
+            st: Mutex::new((VecDeque::new(), 0, false, false)),
             cv: Condvar::new(),
             limit,
         }
@@ -200,17 +200,31 @@ impl Outbox {
                 "outbound queue overflow; resume to recover",
             ));
             g.2 = true;
+            g.3 = true;
             self.cv.notify_all();
             return false;
         }
         g.1 += size;
         g.0.extend(lines);
+        g.3 = true;
         self.cv.notify_all();
         true
+    }
+
+    /// Waits until the session has written to it (its welcome) or it's closed (its
+    /// hello refused), at most `wait`; whether it was written to and is open.
+    fn wait_started(&self, wait: Duration) -> bool {
+        let g = self.st.lock().unwrap_or_else(PoisonError::into_inner);
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, wait, |g| !g.3 && !g.2)
+            .unwrap_or_else(PoisonError::into_inner);
+        g.3 && !g.2
     }
     /// Queues a final line (if any) after the pending ones and closes.
     pub(crate) fn close(&self, last: Option<String>) {
         let mut g = self.st.lock().unwrap_or_else(PoisonError::into_inner);
+        g.3 = true;
         if !g.2 {
             g.0.extend(last);
             g.2 = true;
@@ -306,6 +320,9 @@ struct Shared {
     timing: Timing,
     last_seq: Arc<AtomicU64>,
     tx: SyncSender<Input>,
+    /// Per client: order messages (submits, cancels) answered `busy`, which a session's
+    /// clock counts as handled.
+    refused: Arc<Vec<AtomicU64>>,
 }
 
 /// Inputs the account session may have waiting: past it, a request is answered
@@ -320,8 +337,27 @@ impl Shared {
     }
 
     /// A request: queued if there's room, else answered `busy` on the connection,
-    /// with nothing sent to the broker.
-    fn request(&self, ob: &Outbox, input: Input) {
+    /// with nothing sent to the broker. A safety request (cancel, kill, unkill,
+    /// flatten, clear) is never refused: it waits for room.
+    fn request(&self, ob: &Outbox, client: usize, input: Input) {
+        let safety = matches!(
+            &input,
+            Input::Request {
+                request: Ok((
+                    _,
+                    Op::Cancel(_)
+                        | Op::Kill { .. }
+                        | Op::Unkill
+                        | Op::Flatten { .. }
+                        | Op::ClearOrder { .. }
+                )),
+                ..
+            }
+        );
+        if safety {
+            let _ = self.tx.send(input);
+            return;
+        }
         match self.tx.try_send(input) {
             Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(Input::Request { request, .. })) => {
@@ -329,6 +365,11 @@ impl Shared {
                     Ok((rid, op)) => (rid.clone(), crate::session::op_name(op).to_owned()),
                     Err((rid, op, _)) => (rid.clone().unwrap_or_default(), op.clone()),
                 };
+                if matches!(op.as_str(), "submit" | "cancel")
+                    && let Some(n) = self.refused.get(client)
+                {
+                    n.fetch_add(1, SeqCst);
+                }
                 ob.push(crate::protocol::request_error(
                     &rid,
                     &op,
@@ -381,6 +422,14 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
         resume: hello.resume_after,
         cancel_on_disconnect: hello.cancel_on_disconnect,
     });
+    // No request is read until the session has answered the hello, so nothing (a
+    // `busy`, say) goes out before the welcome, or to a client it refuses.
+    if !ob.wait_started(sh.timing.hello) {
+        return fatal(
+            "hello_timeout",
+            "the account didn't answer the hello in time",
+        );
+    }
     let _ = stream.set_read_timeout(Some(sh.timing.idle));
     loop {
         match read_line(&mut r, &mut buf) {
@@ -399,6 +448,7 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
             Ok(Line::Heartbeat) => {}
             Ok(Line::Request { request_id, op }) => sh.request(
                 &ob,
+                client,
                 Input::Request {
                     id,
                     request: Ok((request_id, op)),
@@ -418,6 +468,7 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
                 invalid,
             }) => sh.request(
                 &ob,
+                client,
                 Input::Request {
                     id,
                     request: Err((request_id, op, invalid)),
@@ -527,13 +578,17 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let last_seq = Arc::new(AtomicU64::new(journal.last_seq));
     let (tx, rx) = sync_channel(INBOX);
+    let refused: Arc<Vec<AtomicU64>> =
+        Arc::new(cfg.clients.iter().map(|_| AtomicU64::new(0)).collect());
     let shared = Arc::new(Shared {
         clients: cfg.clients.clone(),
         timing: cfg.timing.clone(),
         last_seq: Arc::clone(&last_seq),
         tx: tx.clone(),
+        refused: Arc::clone(&refused),
     });
-    let session = Session::new(cfg, broker, journal, &recovered, last_seq);
+    let mut session = Session::new(cfg, broker, journal, &recovered, last_seq);
+    session.refused = refused;
     let session = thread::spawn(move || session.run(&rx));
     let stop = Arc::new(AtomicBool::new(false));
     let accept_stop = Arc::clone(&stop);
@@ -577,14 +632,15 @@ mod inbox_tests {
             timing: crate::server::Timing::default(),
             last_seq: Arc::new(AtomicU64::new(0)),
             tx,
+            refused: Arc::new(vec![AtomicU64::new(0)]),
         };
         let ob = Outbox::new(1 << 20);
         let req = |rid: &str| Input::Request {
             id: 1,
             request: Ok((rid.to_owned(), Op::Account)),
         };
-        sh.request(&ob, req("r1"));
-        sh.request(&ob, req("r2"));
+        sh.request(&ob, 0, req("r1"));
+        sh.request(&ob, 0, req("r2"));
         let Pop::Line(line) = ob.pop(Duration::from_millis(10)) else {
             panic!("no answer for the second request");
         };
@@ -599,5 +655,89 @@ mod inbox_tests {
         );
         assert!(matches!(rx.try_recv(), Ok(Input::Request { .. })));
         assert!(rx.try_recv().is_err(), "only the first was queued");
+    }
+
+    fn shared(cap: usize) -> (Shared, std::sync::mpsc::Receiver<Input>) {
+        let (tx, rx) = sync_channel(cap);
+        let sh = Shared {
+            clients: Vec::new(),
+            timing: crate::server::Timing::default(),
+            last_seq: Arc::new(AtomicU64::new(0)),
+            tx,
+            refused: Arc::new(vec![AtomicU64::new(0)]),
+        };
+        (sh, rx)
+    }
+
+    fn request(rid: &str, op: Op) -> Input {
+        Input::Request {
+            id: 1,
+            request: Ok((rid.to_owned(), op)),
+        }
+    }
+
+    /// A safety request waits for room rather than being refused, and a retry of a
+    /// refused request with the same id is queued once there's room. A refused
+    /// submit counts toward a session clock's order messages.
+    #[test]
+    fn safety_requests_wait_and_refused_ones_can_retry() {
+        let (sh, rx) = shared(1);
+        let sh = Arc::new(sh);
+        let ob = Arc::new(Outbox::new(1 << 20));
+        sh.request(&ob, 0, request("r1", Op::Account));
+        sh.request(&ob, 0, request("r2", Op::Submit(serde_json::json!({}))));
+        assert!(
+            matches!(ob.pop(Duration::from_millis(10)), Pop::Line(_)),
+            "r2 busy"
+        );
+        assert_eq!(sh.refused[0].load(std::sync::atomic::Ordering::SeqCst), 1);
+        let (sh2, ob2) = (Arc::clone(&sh), Arc::clone(&ob));
+        let flatten = std::thread::spawn(move || {
+            sh2.request(
+                &ob2,
+                0,
+                request(
+                    "r3",
+                    Op::Flatten {
+                        reason: "test".into(),
+                    },
+                ),
+            );
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!flatten.is_finished(), "a safety request waits for room");
+        assert!(
+            matches!(ob.pop(Duration::from_millis(10)), Pop::Idle),
+            "and isn't refused"
+        );
+        let ids = |i: Input| match i {
+            Input::Request {
+                request: Ok((rid, _)),
+                ..
+            } => rid,
+            _ => String::new(),
+        };
+        assert_eq!(ids(rx.recv().unwrap()), "r1");
+        flatten.join().unwrap();
+        assert_eq!(ids(rx.recv().unwrap()), "r3");
+        // r2 again, with room: queued.
+        sh.request(&ob, 0, request("r2", Op::Submit(serde_json::json!({}))));
+        assert_eq!(ids(rx.recv().unwrap()), "r2");
+    }
+
+    /// A connection reads no request until its welcome is written; a hello refused,
+    /// or never answered, ends it.
+    #[test]
+    fn requests_wait_for_the_welcome() {
+        let ob = Outbox::new(1 << 20);
+        assert!(
+            !ob.wait_started(Duration::from_millis(10)),
+            "never answered"
+        );
+        ob.push("{\"type\":\"welcome\"}".into());
+        assert!(ob.wait_started(Duration::from_millis(10)));
+        let refused = Outbox::new(1 << 20);
+        refused.close(Some("{\"type\":\"error\"}".into()));
+        assert!(!refused.wait_started(Duration::from_millis(10)));
     }
 }

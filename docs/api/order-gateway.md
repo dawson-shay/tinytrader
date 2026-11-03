@@ -103,8 +103,12 @@ S→C error      {code, message}  fatal errors close the connection after sendin
   - A `submit` response always precedes every event for that order.
 - **Slow consumers:**
   - If the queue overflows, the gateway sends `error{slow_consumer}` and closes the connection.
-- **Inbound**, every connection's requests share the account's inbox, which holds 1,024. When it's full, a request is answered at once with `outcome: error`, `code: busy`, and never reaches the account; a client's hello and its disconnect wait for room.
   - Nothing is lost: the client reconnects with `resume_after_seq` and the journal replays the suffix. This is a deliberate difference from the market-data relay.
+- **Inbound, the account's inbox** holds 1,024 requests from all connections:
+  - When it's full, a request is answered at once with `outcome: error`, `code: busy`. It never reached the account and nothing was sent; retry it, with the same `request_id`. A `busy` answer isn't journaled or replayed.
+  - Cancels and the admin's safety requests (`kill`, `unkill`, `flatten`, `clear_order`) are never answered `busy`: they wait for room.
+  - A connection's requests are read only once its welcome is written, so nothing reaches a client before its welcome.
+  - Under a session's clock, a submit or cancel answered `busy` counts as handled, so the step's advance doesn't wait for it.
 - **Responses are not replayed.** Every outcome a client needs after a reconnect is also a journaled event (`submit`, `cancel`). A client that lost its connection before reading a response recovers the outcome from the replay.
 - **Heartbeats** carry `last_seq`, so an idle client can confirm it is caught up.
 
@@ -590,7 +594,7 @@ The same resync runs after every `trade_updates` reconnect, with two differences
 | `not_found` | `cancel` target unknown to the journal and the broker |
 | `broker_error` | A query failed, with `http_status`, `code` and `message` |
 | `throttled`, `not_ready` | A query was refused by the budget or the state |
-| `busy` | The account's inbox is full (1,024 requests waiting, `detail.inbox`): the request never reached the account, and nothing was sent to the broker. Retry it. |
+| `busy` | The account's inbox is full (1,024 requests waiting, `detail.inbox`): the request never reached the account, and nothing was sent to the broker. Retry it with the same `request_id`. Never for a cancel or a safety request. |
 | `unsupported` | The operation is not available for this broker kind |
 
 **`not_sent.reason`** for `submit` and `cancel`:
