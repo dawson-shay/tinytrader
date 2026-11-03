@@ -1,0 +1,178 @@
+{
+  "audit": "83b75201ef94993c6dd12cd0e05b9edfbad6e545fe53d4f13e543d3131ecf451",
+  "reason": null,
+  "received": [
+    {
+      "as_of": 1793059200000000000,
+      "records": 1,
+      "reports": {
+        "options": 4
+      },
+      "step": 1,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109600000000000,
+      "records": 1,
+      "reports": {
+        "options": 4
+      },
+      "step": 2,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109660000000000,
+      "records": 1,
+      "reports": {
+        "options": 9
+      },
+      "step": 3,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109720000000000,
+      "records": 1,
+      "reports": {
+        "options": 10
+      },
+      "step": 4,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109750000000000,
+      "records": 0,
+      "reports": {
+        "options": 10
+      },
+      "step": 5,
+      "timers": [
+        "check"
+      ],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109780000000000,
+      "records": 1,
+      "reports": {
+        "options": 10
+      },
+      "step": 6,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109840000000000,
+      "records": 1,
+      "reports": {
+        "options": 10
+      },
+      "step": 7,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109900000000000,
+      "records": 1,
+      "reports": {
+        "options": 10
+      },
+      "step": 8,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "audit": "83b75201ef94993c6dd12cd0e05b9edfbad6e545fe53d4f13e543d3131ecf451",
+      "reason": null,
+      "records": 7,
+      "reports": {
+        "options": 10
+      },
+      "status": "complete",
+      "steps": 8,
+      "type": "end"
+    }
+  ],
+  "records": 7,
+  "run": {
+    "audit": "83b75201ef94993c6dd12cd0e05b9edfbad6e545fe53d4f13e543d3131ecf451",
+    "calendar_sha256": null,
+    "days": [
+      "2026-10-27"
+    ],
+    "format": "tinytrader.session-run/1",
+    "lockstep": {
+      "batch": "instant",
+      "strategy_latency_ms": 0
+    },
+    "merge": {
+      "order": "(ts, class, rank, position)",
+      "ranks": [
+        "opra"
+      ]
+    },
+    "mode": "backtest",
+    "reason": null,
+    "records": 7,
+    "seed": 0,
+    "sources": [
+      {
+        "clamped": 0,
+        "dataset": "OPRA.PILLAR",
+        "days": [
+          {
+            "day": "2026-10-27",
+            "files": [
+              {
+                "bytes": 205,
+                "name": "opra-pillar-20261027.cbbo-1m.dbn.zst",
+                "sha256": "a68e7105d6d4d84e34d8cd335a0541fb33572dc5bc473f1f81798629a45078e2",
+                "used": true,
+                "verified": true
+              }
+            ],
+            "missing": null,
+            "partial": false
+          }
+        ],
+        "expiries_within_days": null,
+        "latency_offset_ns": 0,
+        "name": "opra",
+        "reading": [],
+        "records": 7,
+        "schema": "cbbo-1m",
+        "symbol": "SPY.OPT"
+      }
+    ],
+    "status": "complete",
+    "steps": 8,
+    "strategy": {
+      "name": "toy",
+      "revision": "test"
+    },
+    "strategy_process": null,
+    "venues": [
+      {
+        "model": "tinytrader-sim/9",
+        "name": "options",
+        "quotes": [
+          "opra"
+        ],
+        "script": {
+          "expiry": {
+            "settle": false
+          },
+          "fee_per_contract": "0.65",
+          "seed": 14575324489130542917,
+          "strategy_latency_ms": 0
+        },
+        "sent": 1
+      }
+    ]
+  },
+  "status": "complete",
+  "steps": 8
+}

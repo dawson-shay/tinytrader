@@ -139,6 +139,8 @@ struct Seen {
     steps: Vec<(u64, u64, Vec<String>)>,
     fills: Vec<(String, u64)>,
     end: Value,
+    /// Every control message after the welcome: the steps and the end.
+    received: Vec<Value>,
 }
 
 /// How the toy misbehaves, if it does.
@@ -153,6 +155,8 @@ enum Fault {
     NoRead,
     /// Says it sent no orders after sending one.
     Undercount,
+    /// Sends a second hello where its first ready belongs.
+    HelloAsReady,
 }
 
 /// Buys one call at 1.25 on the 10:00 step, sets a timer for 10:02:30, and answers
@@ -185,18 +189,33 @@ fn toy(control: std::net::SocketAddr, fault: Fault) -> Seen {
     .unwrap();
     let welcome: Value = serde_json::from_str(&gw.line().unwrap().unwrap()).unwrap();
     assert_eq!(welcome["type"], "welcome");
+    if fault == Fault::HelloAsReady {
+        send(
+            &mut ctl,
+            &json!({"type": "hello", "protocol": "tinytrader.session/1", "strategy": "toy", "revision": "test"}),
+        );
+        let end = recv(&mut cr);
+        return Seen {
+            steps: Vec::new(),
+            fills: Vec::new(),
+            end: end.clone(),
+            received: vec![end],
+        };
+    }
     send(&mut ctl, &json!({"type": "ready", "as_of": 0, "sent": {}}));
     let (mut seen, mut last_seq, mut sent) = (
         Seen {
             steps: Vec::new(),
             fills: Vec::new(),
             end: Value::Null,
+            received: Vec::new(),
         },
         0,
         0,
     );
     loop {
         let step = recv(&mut cr);
+        seen.received.push(step.clone());
         if step["type"] == "end" {
             seen.end = step;
             return seen;
@@ -204,6 +223,7 @@ fn toy(control: std::net::SocketAddr, fault: Fault) -> Seen {
         let as_of = step["as_of"].as_u64().unwrap();
         if fault == Fault::NoRead {
             seen.end = recv(&mut cr);
+            seen.received.push(seen.end.clone());
             return seen;
         }
         for _ in 0..step["records"].as_u64().unwrap() {
@@ -235,6 +255,7 @@ fn toy(control: std::net::SocketAddr, fault: Fault) -> Seen {
         if stall_at == Some(n) {
             // Never answers; the session gives up.
             let end = recv(&mut cr);
+            seen.received.push(end.clone());
             seen.end = end;
             return seen;
         }
@@ -438,5 +459,93 @@ fn the_calendar_closes_a_holiday() {
     assert_eq!(
         rec["venues"][0]["script"]["calendar"][0]["date"],
         "2026-10-26"
+    );
+}
+
+/// A timeout's text is the platform's: would block (os error 35 on macOS, 11 on
+/// Linux) or timed out (60, 110). Only those read as `<io timeout>`; any other
+/// error (a reset, a broken pipe) is kept verbatim, so a refactor that turns a
+/// timeout into one is caught.
+fn normalised_reason(r: &str) -> String {
+    const TIMEOUTS: [&str; 4] = [
+        "Resource temporarily unavailable (os error 35)",
+        "Resource temporarily unavailable (os error 11)",
+        "Operation timed out (os error 60)",
+        "Connection timed out (os error 110)",
+    ];
+    match r.split_once(": ") {
+        Some((what, rest)) if TIMEOUTS.contains(&rest) => format!("{what}: <io timeout>"),
+        _ => r.to_owned(),
+    }
+}
+
+/// `run.json` without what depends on where and when it ran: the session id, the
+/// config's hash and the holdings' paths; and its reason as [`normalised_reason`].
+fn normalised(rec: &mut Value) {
+    let o = rec.as_object_mut().unwrap();
+    o.remove("session");
+    o.remove("config_sha256");
+    for src in o["sources"].as_array_mut().unwrap() {
+        src.as_object_mut().unwrap().remove("holdings");
+    }
+    if let Some(r) = o["reason"].as_str() {
+        o["reason"] = json!(normalised_reason(r));
+    }
+}
+
+/// A run's golden record: its outcome, `run.json`, and every control message the
+/// strategy received after the welcome.
+fn golden_record(o: &session::Outcome, seen: &Seen, dir: &Path) -> Value {
+    let mut rec: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("run.json")).unwrap()).unwrap();
+    normalised(&mut rec);
+    let mut received = seen.received.clone();
+    for m in &mut received {
+        if let Some(r) = m["reason"].as_str() {
+            m["reason"] = json!(normalised_reason(r));
+        }
+    }
+    json!({
+        "audit": o.audit,
+        "status": o.status,
+        "reason": o.reason.as_deref().map(normalised_reason),
+        "steps": o.steps,
+        "records": o.records,
+        "received": received,
+        "run": rec,
+    })
+}
+
+/// The session fixtures' golden records, recorded from `main` before the actor
+/// transports (decision 0029): the toy run, and each way it fails. A refactor of
+/// the lockstep must reproduce them exactly. `SESSION_GOLDEN_WRITE=1` records
+/// them again, and fails, so a re-recording is never taken for a pass.
+#[test]
+fn the_fixtures_match_their_golden_records() {
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let write = std::env::var("SESSION_GOLDEN_WRITE").is_ok_and(|v| v == "1");
+    let cases = [
+        ("toy", 30, Fault::None, 0),
+        ("stall", 1, Fault::Stall(3), 0),
+        ("no-read", 1, Fault::NoRead, 30_000),
+        ("undercount", 5, Fault::Undercount, 0),
+        ("far-timer", 30, Fault::FarTimer, 0),
+        ("hello-as-ready", 5, Fault::HelloAsReady, 0),
+    ];
+    for (name, timeout, fault, extra) in cases {
+        let (o, seen, dir) = run_with(&format!("golden-{name}"), timeout, fault, extra);
+        let got = golden_record(&o, &seen, &dir);
+        let file = golden.join(format!("{name}.json"));
+        if write {
+            std::fs::create_dir_all(&golden).unwrap();
+            std::fs::write(&file, serde_json::to_string_pretty(&got).unwrap() + "\n").unwrap();
+            continue;
+        }
+        let want: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(got, want, "{name}");
+    }
+    assert!(
+        !write,
+        "golden records re-recorded; unset SESSION_GOLDEN_WRITE and run again"
     );
 }
