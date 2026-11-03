@@ -466,9 +466,16 @@ fn the_toy_run_matches_its_golden_record() {
     if std::env::var_os("SESSION_GOLDEN_WRITE").is_some() {
         std::fs::create_dir_all(&golden).unwrap();
         std::fs::write(&audit_file, format!("{}\n", o.audit)).unwrap();
-        std::fs::write(&run_file, serde_json::to_string_pretty(&rec).unwrap() + "\n").unwrap();
+        std::fs::write(
+            &run_file,
+            serde_json::to_string_pretty(&rec).unwrap() + "\n",
+        )
+        .unwrap();
     }
-    assert_eq!(o.audit, std::fs::read_to_string(&audit_file).unwrap().trim());
+    assert_eq!(
+        o.audit,
+        std::fs::read_to_string(&audit_file).unwrap().trim()
+    );
     let want: Value = serde_json::from_str(&std::fs::read_to_string(&run_file).unwrap()).unwrap();
     assert_eq!(rec, want);
 }

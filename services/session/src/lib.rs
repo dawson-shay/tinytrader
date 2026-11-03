@@ -9,6 +9,7 @@ pub mod fixture;
 pub mod protocol;
 pub mod run;
 pub mod sandbox;
+pub mod transport;
 pub mod watch;
 
 pub use config::Config;
