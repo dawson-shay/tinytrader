@@ -121,7 +121,7 @@ fn options_and_shares_fill_from_minute_quotes() {
     let mut c = Conn::open(&gw, "reactor", None);
     let welcome = serde_json::from_str::<Value>(&c.lines[0]).unwrap();
     let pins = &welcome["pins"]["broker"];
-    assert_eq!(pins["model"], "tinytrader-sim/8");
+    assert_eq!(pins["model"], "tinytrader-sim/9");
     assert_eq!(pins["quotes"]["source"], "session");
     mappings(&feed);
     // At first neither fills: the spread's natural is 0.92 - 0.53 = 0.39 credit, short
@@ -675,17 +675,16 @@ fn same_day_shorts_are_liquidated_at_the_venues_time() {
     clock
         .advance("reactor", 1, T0 + 5 * H + 46 * 60 * S, WAIT)
         .unwrap();
-    // The broker's order arrives as `foreign`; its fill as a FILL activity.
-    let f = c
-        .until(|v| v["kind"] == "activity" && v["activity_type"] == "FILL")
-        .pop()
-        .unwrap();
-    assert_eq!(f["broker_raw"]["price"], "0.33", "{f}");
-    assert_eq!(f["broker_raw"]["symbol"], PUT_A);
+    // The broker's order arrives as `foreign`; its fill as `foreign_fill`.
+    let f = c.until(|v| v["kind"] == "foreign_fill").pop().unwrap();
+    assert_eq!(f["price"], "0.33", "{f}");
     assert_eq!(
-        f["broker_raw"]["transaction_time_ns"],
-        T0 + 5 * H + 45 * 60 * S
+        (f["symbol"].as_str(), f["side"].as_str(), f["qty"].as_u64()),
+        (Some(PUT_A), Some("buy"), Some(1)),
+        "{f}"
     );
+    assert_eq!(f["price_basis"], "fill", "{f}");
+    assert_eq!(f["ts_broker"], T0 + 5 * H + 45 * 60 * S);
     let (r, _) = c.req("positions", "r2", "");
     let syms: Vec<(&str, i64)> = r["positions"]
         .as_array()

@@ -251,7 +251,10 @@ impl Config {
                 .iter()
                 .find(|r| order_gateway::future_multiplier(r).is_none())
             {
-                return Err(format!("venue {}: {bad:?} isn't a known futures root", v.name));
+                return Err(format!(
+                    "venue {}: {bad:?} isn't a known futures root",
+                    v.name
+                ));
             }
             if v.max_future_qty == Some(0) {
                 return Err(format!("venue {}: max_future_qty is at least 1", v.name));
