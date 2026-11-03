@@ -72,9 +72,13 @@ pub trait Transport {
     /// # Errors
     /// No answer in time, a malformed one, or a second hello.
     fn ready(&mut self) -> Result<Ready, String>;
+    /// The run's data is over: closes the data stream. The run's end follows.
+    fn close_data(&mut self);
     /// Tells the actor the run has ended, if it can still be told.
     fn end(&mut self, end: &Value);
 }
+
+const HELLO_AGAIN: &str = "hello only once";
 
 /// 0022's transport: a control and a data listener on TCP.
 pub struct SessionSocket {
@@ -118,7 +122,7 @@ impl SessionSocket {
                 sent,
                 timers,
             }),
-            FromStrategy::Hello { .. } => Err("hello only once".into()),
+            FromStrategy::Hello { .. } => Err(HELLO_AGAIN.into()),
         }
     }
 }
@@ -193,7 +197,12 @@ impl Transport for SessionSocket {
             .map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())?;
         self.out = Some(out);
-        self.read_ready()
+        match self.read_ready() {
+            Err(e) if e == HELLO_AGAIN => {
+                Err("the strategy's first ready must be ready{as_of: 0}, sending nothing".into())
+            }
+            r => r,
+        }
     }
 
     fn step(&mut self, step: &Step<'_>) -> Result<(), String> {
@@ -209,6 +218,10 @@ impl Transport for SessionSocket {
 
     fn ready(&mut self) -> Result<Ready, String> {
         self.read_ready()
+    }
+
+    fn close_data(&mut self) {
+        self.out = None;
     }
 
     fn end(&mut self, end: &Value) {

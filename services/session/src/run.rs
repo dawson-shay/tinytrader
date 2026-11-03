@@ -113,7 +113,7 @@ pub struct Session {
     cfg_text: String,
     dir: PathBuf,
     /// How the session reaches its strategy (decision 0029): 0022's sockets.
-    transport: Option<SessionSocket>,
+    transport: Box<dyn Transport>,
     venues: Vec<Venue>,
     merge: Merge<StoreProducer>,
 }
@@ -278,7 +278,7 @@ impl Session {
             cfg,
             cfg_text: cfg_text.to_owned(),
             dir: dir.to_owned(),
-            transport: Some(SessionSocket::new(control, data, wait)),
+            transport: Box::new(SessionSocket::new(control, data, wait)),
             venues,
             merge: Merge::new(sources),
         })
@@ -408,9 +408,12 @@ impl Session {
     pub fn run(mut self) -> Result<Outcome, String> {
         let mut audit = Audit::create(&self.dir.join("audit.log"))?;
         let mut state = Run::default();
-        let mut transport = self.transport.take().ok_or("the session has already run")?;
         let started = self.start_strategy(&mut state);
-        let result = started.and_then(|()| self.serve(&mut transport, &mut audit, &mut state));
+        let result = started.and_then(|()| self.serve(&mut audit, &mut state));
+        // The data stream ends with the run, before its end is sent; the control
+        // connection stays open until the strategy, the record and the venues are
+        // done.
+        self.transport.close_data();
         let flushed = audit.log.flush().map_err(|e| format!("audit.log: {e}"));
         let reason = result
             .err()
@@ -427,12 +430,11 @@ impl Session {
             steps: state.steps,
             records: state.records,
         };
-        transport.end(
+        self.transport.end(
             &json!({"type": "end", "status": outcome.status, "reason": outcome.reason,
                     "audit": outcome.audit, "steps": outcome.steps, "records": outcome.records,
                     "reports": state.reports}),
         );
-        drop(transport);
         self.wait_strategy(&mut state);
         // The venues stop whatever happens to the record.
         let recorded = self.record(&outcome, &state);
@@ -496,12 +498,7 @@ impl Session {
         m
     }
 
-    fn serve(
-        &mut self,
-        tr: &mut dyn Transport,
-        audit: &mut Audit,
-        st: &mut Run,
-    ) -> Result<(), String> {
+    fn serve(&mut self, audit: &mut Audit, st: &mut Run) -> Result<(), String> {
         let wait = Duration::from_secs(self.cfg.ready_timeout_s);
         let deadline = Instant::now() + wait;
         // The last instant of the last day: nothing is stepped after it.
@@ -513,7 +510,7 @@ impl Session {
             .map(|d| d + DAY - 1)
             .ok_or("no last day")?;
         // The strategy: control first, then data.
-        let hello = tr.hello(deadline)?;
+        let hello = self.transport.hello(deadline)?;
         if st.token.is_some() && hello.token != st.token {
             return Err("the control connection isn't from the strategy the session started (no TT_SESSION_TOKEN)".into());
         }
@@ -521,7 +518,8 @@ impl Session {
         st.strategy = Some((strategy.clone(), revision.clone()));
         audit.update(format!("hello {strategy} {revision}\n"));
         let w = self.welcome();
-        let first = tr.open(&w, &self.metadata(), deadline)?;
+        let metadata = self.metadata();
+        let first = self.transport.open(&w, &metadata, deadline)?;
         let first_timers = match first {
             transport::Ready {
                 as_of: 0,
@@ -600,7 +598,7 @@ impl Session {
                 "step {} {t} {spans:?} {due:?} {events}\n",
                 st.steps
             ));
-            tr.step(&transport::Step {
+            self.transport.step(&transport::Step {
                 step: st.steps,
                 as_of: t,
                 records: n,
@@ -612,7 +610,7 @@ impl Session {
                 as_of: a,
                 sent: s,
                 timers: new,
-            } = tr.ready()?;
+            } = self.transport.ready()?;
             if a != t {
                 return Err(format!("ready for {a}, but the step was {t}"));
             }
