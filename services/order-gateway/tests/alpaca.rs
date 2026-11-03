@@ -28,6 +28,17 @@ fn rig_with(name: &str, profile: impl FnOnce(&mut Profile)) -> Rig {
 
 /// Starts a gateway on `state` against `fake`, once the stream has listened `listening` times.
 fn boot(fake: Fake, state: PathBuf, listening: usize, profile: impl FnOnce(&mut Profile)) -> Rig {
+    boot_kept(fake, state, listening, profile, None)
+}
+
+/// As [`boot`], keeping an ended foreign order's fill record for `keep`.
+fn boot_kept(
+    fake: Fake,
+    state: PathBuf,
+    listening: usize,
+    profile: impl FnOnce(&mut Profile),
+    keep: Option<Duration>,
+) -> Rig {
     let creds = Credentials::from_env_text(&format!(
         "export APCA_API_KEY_ID={KEY}\nAPCA_API_SECRET_KEY=\"{SECRET}\"\n"
     ))
@@ -41,6 +52,9 @@ fn boot(fake: Fake, state: PathBuf, listening: usize, profile: impl FnOnce(&mut 
     let mut cfg = config(state.clone());
     cfg.account = "alpaca-paper-test".into();
     cfg.profile.max_open = 10;
+    if let Some(k) = keep {
+        cfg.timing.foreign_keep = k;
+    }
     profile(&mut cfg.profile);
     let gw = start(cfg, broker).unwrap();
     fake.wait_listening(listening);
@@ -201,6 +215,7 @@ fn broker_refusals_map_status_and_code() {
         avg: None,
         limit: "1.00".into(),
         status: "canceled".into(),
+        tif: String::new(),
     };
     st.orders.push(dashboard);
     drop(st);
@@ -1259,6 +1274,168 @@ fn an_mleg_broker_order_reports_each_leg_once() {
     assert_eq!(
         (ff[1]["symbol"].as_str(), ff[1]["price"].as_str()),
         (Some(PUT_B), Some("0.12"))
+    );
+    r.gw.stop().unwrap();
+}
+
+/// Shorter than a day, for the tests of ended orders' records.
+const KEEP: Duration = Duration::from_millis(200);
+
+/// A GTC broker order through `done_for_day` stays live: its record is kept past the
+/// keep period, and its next fill is reported, once.
+#[test]
+fn a_gtc_order_through_done_for_day_keeps_its_record() {
+    let r = boot_kept(
+        Fake::start(),
+        root("foreign-fills-gtc"),
+        1,
+        |_| {},
+        Some(KEEP),
+    );
+    let _c = ready(&r.gw, "reactor");
+    r.fake.appear(&format!(
+        r#"{{"client_order_id":"gtc-1","symbol":"{PUT_A}","qty":"2","side":"buy","type":"limit","limit_price":"0.30","time_in_force":"gtc"}}"#
+    ));
+    r.fake.fill("gtc-1", 1, "0.30");
+    wait_journaled(&r.state, "foreign_fill", 1);
+    r.fake.event("gtc-1", "done_for_day", "done_for_day");
+    std::thread::sleep(KEEP * 2);
+    // Another broker order's update prunes what's due.
+    broker_buy(&r.fake, "liq-7", PUT_B, 1);
+    r.fake.fill("liq-7", 1, "0.12");
+    wait_journaled(&r.state, "foreign_fill", 2);
+    assert!(
+        journaled(&r.state, "foreign_done")
+            .iter()
+            .all(|v| v["broker_order_id"]
+                != journaled(&r.state, "foreign_fill")[0]["broker_order_id"])
+    );
+    r.fake.fill("gtc-1", 1, "0.29");
+    let ff = wait_journaled(&r.state, "foreign_fill", 3);
+    let gtc: Vec<_> = ff
+        .iter()
+        .filter(|v| v["client_order_id"] == "gtc-1")
+        .collect();
+    assert_eq!(gtc.len(), 2, "{ff:?}");
+    assert_eq!(
+        (gtc[1]["qty"].as_u64(), gtc[1]["price"].as_str()),
+        (Some(1), Some("0.29"))
+    );
+    r.gw.stop().unwrap();
+}
+
+/// More fills than the execution ids kept: each reported once, and none again
+/// after a restart.
+#[test]
+fn seventy_fills_are_each_reported_once() {
+    let r = rig("foreign-fills-seventy");
+    let _c = ready(&r.gw, "reactor");
+    broker_buy(&r.fake, "liq-8", PUT_A, 70);
+    for _ in 0..70 {
+        r.fake.fill("liq-8", 1, "0.33");
+    }
+    wait_journaled(&r.state, "foreign_fill", 70);
+    let before = resyncs(&r.state);
+    let r = restart(r, 2);
+    wait_resyncs(&r.state, before + 2);
+    assert_eq!(journaled(&r.state, "foreign_fill").len(), 70);
+    r.gw.stop().unwrap();
+}
+
+/// A stream execution whose order shows nothing more filled is said
+/// (`foreign_fill_lag`); the stream's copy of a fill REST reported first isn't.
+#[test]
+fn lag_is_said_only_when_it_is_one() {
+    let r = rig("foreign-fills-lag");
+    let _c = ready(&r.gw, "reactor");
+    broker_buy(&r.fake, "liq-9", PUT_A, 2);
+    r.fake.event("liq-9", "new", "new");
+    wait_journaled(&r.state, "foreign", 1);
+    r.fake.fill_lagging("liq-9", 1, "0.33");
+    let lag = wait_journaled(&r.state, "foreign_fill_lag", 1);
+    assert_eq!(lag[0]["reason"], "cumulative_lags", "{}", lag[0]);
+    assert_eq!(journaled(&r.state, "foreign_fill").len(), 0);
+    // REST first (a restart), then the stream's copy: no lag.
+    broker_buy(&r.fake, "liq-10", PUT_B, 1);
+    {
+        let mut st = r.fake.lock();
+        let o = st.orders.iter_mut().find(|o| o.cid == "liq-10").unwrap();
+        o.filled = 1;
+        o.avg = Some("0.12".into());
+        o.status = "filled".into();
+    }
+    let before = resyncs(&r.state);
+    let r = restart(r, 2);
+    wait_resyncs(&r.state, before + 2);
+    wait_journaled(&r.state, "foreign_fill", 1);
+    {
+        let mut st = r.fake.lock();
+        let o = st.orders.iter_mut().find(|o| o.cid == "liq-10").unwrap();
+        o.filled = 0;
+    }
+    r.fake.fill("liq-10", 1, "0.12");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        journaled(&r.state, "foreign_fill_lag").len(),
+        1,
+        "only the true lag"
+    );
+    assert_eq!(journaled(&r.state, "foreign_fill").len(), 1);
+    r.gw.stop().unwrap();
+}
+
+/// Two legs filled under one execution id are both reported.
+#[test]
+fn legs_sharing_an_execution_id_are_both_reported() {
+    let r = rig("foreign-fills-shared-exec");
+    let _c = ready(&r.gw, "reactor");
+    r.fake.appear(&format!(
+        r#"{{"client_order_id":"liq-11","order_class":"mleg","qty":"1","type":"market","time_in_force":"day","legs":[{{"symbol":"{PUT_A}","ratio_qty":"1","side":"buy","position_intent":"buy_to_close"}},{{"symbol":"{PUT_B}","ratio_qty":"1","side":"sell","position_intent":"sell_to_close"}}]}}"#
+    ));
+    r.fake
+        .mleg_fill_one_exec("liq-11", 1, "0.21", &["0.33", "0.12"]);
+    let ff = wait_journaled(&r.state, "foreign_fill", 2);
+    let syms: Vec<_> = ff.iter().map(|v| v["symbol"].as_str().unwrap()).collect();
+    assert_eq!(syms, vec![PUT_A, PUT_B]);
+    r.gw.stop().unwrap();
+}
+
+/// A restart after longer than the keep period: the records rebuilt from the
+/// journal are kept, so a REST relisting of an ended order reports nothing again.
+#[test]
+fn a_long_restart_reports_nothing_again() {
+    let r = boot_kept(
+        Fake::start(),
+        root("foreign-fills-long"),
+        1,
+        |_| {},
+        Some(KEEP),
+    );
+    let _c = ready(&r.gw, "reactor");
+    broker_buy(&r.fake, "liq-12", PUT_A, 1);
+    r.fake.fill("liq-12", 1, "0.33");
+    wait_journaled(&r.state, "foreign_fill", 1);
+    wait_journaled(&r.state, "foreign_done", 1);
+    let Rig { fake, gw, state } = r;
+    gw.stop().unwrap();
+    std::thread::sleep(KEEP * 3);
+    let before = resyncs(&state);
+    let r = boot_kept(fake, state, 2, |_| {}, Some(KEEP));
+    wait_resyncs(&r.state, before + 2);
+    // Another order's update would prune what's due.
+    broker_buy(&r.fake, "liq-13", PUT_B, 1);
+    r.fake.fill("liq-13", 1, "0.12");
+    wait_journaled(&r.state, "foreign_fill", 2);
+    let before = resyncs(&r.state);
+    let r = restart(r, 3);
+    wait_resyncs(&r.state, before + 2);
+    let ff = journaled(&r.state, "foreign_fill");
+    assert_eq!(
+        ff.iter()
+            .filter(|v| v["client_order_id"] == "liq-12")
+            .count(),
+        1,
+        "{ff:?}"
     );
     r.gw.stop().unwrap();
 }

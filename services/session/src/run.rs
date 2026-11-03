@@ -737,6 +737,7 @@ impl Session {
                             | "activity"
                             | "foreign_fill"
                             | "foreign_fill_lag"
+                            | "foreign_done"
                     )
                 ) {
                     continue;

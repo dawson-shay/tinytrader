@@ -24,7 +24,7 @@
   "type": "limit",
   "side": "{{SIDE}}",
   "position_intent": {{INTENT}},
-  "time_in_force": "day",
+  "time_in_force": "{{TIF}}",
   "limit_price": "{{LIMIT}}",
   "stop_price": null,
   "status": "{{STATUS}}",
