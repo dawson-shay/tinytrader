@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -305,16 +305,39 @@ struct Shared {
     clients: Vec<ClientSpec>,
     timing: Timing,
     last_seq: Arc<AtomicU64>,
-    tx: Mutex<Sender<Input>>,
+    tx: SyncSender<Input>,
 }
 
+/// Inputs the account session may have waiting: past it, a request is answered
+/// `busy` at once and never reaches the session.
+pub(crate) const INBOX: usize = 1024;
+
 impl Shared {
+    /// A connection's lifecycle (hello, closed): waits for room, as the session
+    /// must see it.
     fn send(&self, input: Input) {
-        let _ = self
-            .tx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send(input);
+        let _ = self.tx.send(input);
+    }
+
+    /// A request: queued if there's room, else answered `busy` on the connection,
+    /// with nothing sent to the broker.
+    fn request(&self, ob: &Outbox, input: Input) {
+        match self.tx.try_send(input) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(Input::Request { request, .. })) => {
+                let (rid, op) = match &request {
+                    Ok((rid, op)) => (rid.clone(), crate::session::op_name(op).to_owned()),
+                    Err((rid, op, _)) => (rid.clone().unwrap_or_default(), op.clone()),
+                };
+                ob.push(crate::protocol::request_error(
+                    &rid,
+                    &op,
+                    "busy",
+                    &Obj::new().n("inbox", INBOX).done(),
+                ));
+            }
+            Err(TrySendError::Full(_)) => {}
+        }
     }
 }
 
@@ -374,10 +397,13 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
         }
         match parse_line(&buf) {
             Ok(Line::Heartbeat) => {}
-            Ok(Line::Request { request_id, op }) => sh.send(Input::Request {
-                id,
-                request: Ok((request_id, op)),
-            }),
+            Ok(Line::Request { request_id, op }) => sh.request(
+                &ob,
+                Input::Request {
+                    id,
+                    request: Ok((request_id, op)),
+                },
+            ),
             Ok(Line::Hello(_)) => {
                 fatal("hello_required", "hello only once");
                 break;
@@ -390,10 +416,13 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
                 request_id,
                 op,
                 invalid,
-            }) => sh.send(Input::Request {
-                id,
-                request: Err((request_id, op, invalid)),
-            }),
+            }) => sh.request(
+                &ob,
+                Input::Request {
+                    id,
+                    request: Err((request_id, op, invalid)),
+                },
+            ),
         }
     }
     sh.send(Input::Closed(id));
@@ -402,7 +431,7 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
 /// A running account process.
 pub struct Gateway {
     addr: SocketAddr,
-    tx: Sender<Input>,
+    tx: SyncSender<Input>,
     stop: Arc<AtomicBool>,
     session: JoinHandle<Result<(), String>>,
 }
@@ -411,7 +440,7 @@ pub struct Gateway {
 /// market time advances the broker through this, never through a client connection.
 #[derive(Clone)]
 pub struct Clock {
-    tx: Sender<Input>,
+    tx: SyncSender<Input>,
 }
 
 impl Clock {
@@ -432,7 +461,7 @@ impl Clock {
         to: u64,
         wait: Duration,
     ) -> Result<crate::session::Advanced, String> {
-        let (reply, rx) = channel();
+        let (reply, rx) = sync_channel(1);
         self.tx
             .send(Input::Clock {
                 client: client.to_owned(),
@@ -497,12 +526,12 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
         TcpListener::bind(cfg.listen).map_err(|e| format!("bind {}: {e}", cfg.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let last_seq = Arc::new(AtomicU64::new(journal.last_seq));
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(INBOX);
     let shared = Arc::new(Shared {
         clients: cfg.clients.clone(),
         timing: cfg.timing.clone(),
         last_seq: Arc::clone(&last_seq),
-        tx: Mutex::new(tx.clone()),
+        tx: tx.clone(),
     });
     let session = Session::new(cfg, broker, journal, &recovered, last_seq);
     let session = thread::spawn(move || session.run(&rx));
@@ -526,4 +555,49 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
         stop,
         session,
     })
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::{Outbox, Pop, Shared};
+    use crate::protocol::Op;
+    use crate::session::Input;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    /// With the inbox full, a request is answered `busy` on its connection at once,
+    /// and nothing more is queued.
+    #[test]
+    fn a_full_inbox_answers_busy() {
+        let (tx, rx) = sync_channel(1);
+        let sh = Shared {
+            clients: Vec::new(),
+            timing: crate::server::Timing::default(),
+            last_seq: Arc::new(AtomicU64::new(0)),
+            tx,
+        };
+        let ob = Outbox::new(1 << 20);
+        let req = |rid: &str| Input::Request {
+            id: 1,
+            request: Ok((rid.to_owned(), Op::Account)),
+        };
+        sh.request(&ob, req("r1"));
+        sh.request(&ob, req("r2"));
+        let Pop::Line(line) = ob.pop(Duration::from_millis(10)) else {
+            panic!("no answer for the second request");
+        };
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            (v["request_id"].as_str(), v["op"].as_str()),
+            (Some("r2"), Some("account"))
+        );
+        assert_eq!(
+            (v["outcome"].as_str(), v["code"].as_str()),
+            (Some("error"), Some("busy"))
+        );
+        assert!(matches!(rx.try_recv(), Ok(Input::Request { .. })));
+        assert!(rx.try_recv().is_err(), "only the first was queued");
+    }
 }

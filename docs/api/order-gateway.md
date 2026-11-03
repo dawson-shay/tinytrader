@@ -103,6 +103,7 @@ S→C error      {code, message}  fatal errors close the connection after sendin
   - A `submit` response always precedes every event for that order.
 - **Slow consumers:**
   - If the queue overflows, the gateway sends `error{slow_consumer}` and closes the connection.
+- **Inbound**, every connection's requests share the account's inbox, which holds 1,024. When it's full, a request is answered at once with `outcome: error`, `code: busy`, and never reaches the account; a client's hello and its disconnect wait for room.
   - Nothing is lost: the client reconnects with `resume_after_seq` and the journal replays the suffix. This is a deliberate difference from the market-data relay.
 - **Responses are not replayed.** Every outcome a client needs after a reconnect is also a journaled event (`submit`, `cancel`). A client that lost its connection before reading a response recovers the outcome from the replay.
 - **Heartbeats** carry `last_seq`, so an idle client can confirm it is caught up.
@@ -589,6 +590,7 @@ The same resync runs after every `trade_updates` reconnect, with two differences
 | `not_found` | `cancel` target unknown to the journal and the broker |
 | `broker_error` | A query failed, with `http_status`, `code` and `message` |
 | `throttled`, `not_ready` | A query was refused by the budget or the state |
+| `busy` | The account's inbox is full (1,024 requests waiting, `detail.inbox`): the request never reached the account, and nothing was sent to the broker. Retry it. |
 | `unsupported` | The operation is not available for this broker kind |
 
 **`not_sent.reason`** for `submit` and `cancel`:

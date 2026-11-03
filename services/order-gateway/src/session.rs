@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The requester recorded on a `cleared` line made by the gateway itself.
@@ -57,7 +57,7 @@ pub(crate) enum Input {
         orders: u64,
         to: u64,
         deadline: Instant,
-        reply: Sender<Result<Advanced, String>>,
+        reply: SyncSender<Result<Advanced, String>>,
     },
     Shutdown,
 }
@@ -84,7 +84,7 @@ struct ClockWait {
     orders: u64,
     to: u64,
     deadline: Instant,
-    reply: Sender<Result<Advanced, String>>,
+    reply: SyncSender<Result<Advanced, String>>,
 }
 
 struct Conn {
@@ -505,7 +505,7 @@ fn broker_error_obj(kind: &str, e: &BrokerError) -> Obj {
         .raw("broker_raw", &e.raw)
 }
 
-fn op_name(op: &Op) -> &'static str {
+pub(crate) fn op_name(op: &Op) -> &'static str {
     match op {
         Op::Submit(_) => "submit",
         Op::Cancel(_) => "cancel",

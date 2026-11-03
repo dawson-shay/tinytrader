@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::sync::mpsc::{Receiver, channel};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
 use trading::{Credentials, Endpoints, LegSpec, Order, TradeUpdate, compact, elements, member};
 
@@ -86,7 +86,9 @@ impl AlpacaPaper {
     /// stream starts down; `StreamUp` follows the first `listening`.
     #[must_use]
     pub fn new(endpoints: Endpoints, creds: Credentials, opts: AlpacaOptions) -> Self {
-        let (tx, updates) = channel();
+        // Bounded: a session that falls behind holds the stream's reader, and the
+        // socket pushes back on the broker.
+        let (tx, updates) = sync_channel(4096);
         let _ = tx.send(Update::StreamDown);
         let stream = stream::spawn(
             endpoints.stream().to_owned(),
