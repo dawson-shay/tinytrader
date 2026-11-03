@@ -330,8 +330,11 @@ async fn work(a: &App, id: &str) {
         let result = match built {
             Ok((m, c, out)) => {
                 let filed = async {
-                    // Main filed on an earlier pass: only its conditions are left.
-                    if !main_held {
+                    // Main filed on an earlier pass: only its conditions are left, and
+                    // only if they were built against that main.
+                    if main_held {
+                        day::check_binding(&a.http, &a.store, run.feed, &sym, &d, &c).await?;
+                    } else {
                         day::file(&a.http, &a.store, a.store_token.as_deref(), &m).await?;
                     }
                     day::file(&a.http, &a.store, a.store_token.as_deref(), &c).await
@@ -345,6 +348,19 @@ async fn work(a: &App, id: &str) {
                     a.observer.set_state(State::Degraded, &format!("{}; waiting", e.message));
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     return;
+                }
+                // Conditions that don't bind to the held main: kept, for a person to
+                // look at and decide.
+                if let Err(e) = &filed
+                    && e.unbound
+                {
+                    a.observer.record_error(&format!("{sym} {d}: {}", e.message));
+                    a.events.push(format!("conditions unbound {sym} {d}"), e.message.clone());
+                    let note = e.message.clone();
+                    set_run(a, id, |r| {
+                        r.days.insert(key, DayRecord { state: "conditions_unbound".into(), trades: None, quotes: None, pages: None, bytes: None, note });
+                    });
+                    continue;
                 }
                 // The store keeps what it filed; the spool goes either way.
                 day::clear_spool(run.feed, &sym, &d, &spool);
@@ -376,7 +392,7 @@ async fn work(a: &App, id: &str) {
         }
     }
     set_run(a, id, |r| {
-        let failed = r.days.values().filter(|d| d.state == "failed").count();
+        let failed = r.days.values().filter(|d| d.state == "failed" || d.state == "conditions_unbound").count();
         r.state = if failed > 0 { "failed".into() } else { "done".into() };
         r.note = if failed > 0 { format!("{failed} days failed; queue the run again to retry them") } else { String::new() };
     });

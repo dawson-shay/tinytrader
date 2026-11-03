@@ -335,6 +335,66 @@ pub fn spooled(feed: Feed, symbol: &str, day: &str, dir: &Path) -> Option<(PathB
     Some((main_dir, cond_dir, outcome))
 }
 
+/// What a conditions batch says it belongs to: the main file's SHA-256, from its
+/// `binding.json`.
+fn bound_main(cond_dir: &Path) -> Result<String, String> {
+    let b: Value = serde_json::from_slice(&std::fs::read(cond_dir.join("binding.json")).map_err(|e| format!("binding.json: {e}"))?)
+        .map_err(|e| format!("binding.json: {e}"))?;
+    b["main"]["sha256"].as_str().map(str::to_owned).ok_or_else(|| "binding.json names no main sha256".into())
+}
+
+/// Before conditions are filed alone (their main filed on an earlier pass), check
+/// that they were built against the main the store holds: the binding's main
+/// SHA-256 against the held file's. The store doesn't check this itself. `Err`
+/// with `unbound` if they differ (the provider's data changed since main was
+/// filed), naming both hashes, so a person decides; nothing is filed then.
+pub async fn check_binding(
+    http: &reqwest::Client,
+    store: &str,
+    feed: Feed,
+    symbol: &str,
+    day: &str,
+    cond_dir: &Path,
+) -> Result<(), FileError> {
+    let want = bound_main(cond_dir)?;
+    let pattern = format!("*/{}/{symbol}/{}/{day}.dbn.zst", feed.dataset(), feed.schema().as_str());
+    let list: Value = http
+        .get(format!("{store}/files"))
+        .query(&[("pattern", pattern.as_str()), ("provider", "alpaca")])
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("store: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("store: {e}"))?;
+    let names: Vec<&str> = list["files"].as_array().map(|f| f.iter().filter_map(|x| x["name"].as_str()).collect()).unwrap_or_default();
+    let [name] = names.as_slice() else {
+        return Err(format!("the store lists {} files for the held main {pattern}, not one", names.len()).into());
+    };
+    let bytes = http
+        .get(format!("{store}/files/{name}"))
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| format!("store: {e}"))?
+        .bytes()
+        .await
+        .map_err(|e| format!("store: {e}"))?;
+    let held = format!("{:x}", Sha256::digest(&bytes));
+    if held == want {
+        Ok(())
+    } else {
+        Err(FileError {
+            busy: false,
+            unbound: true,
+            message: format!(
+                "conditions built against main sha256 {want}, but the store holds {name} with sha256 {held}: the provider's data changed since main was filed; not filed"
+            ),
+        })
+    }
+}
+
 /// Removes a day's spool: its batch folders and its marker.
 pub fn clear_spool(feed: Feed, symbol: &str, day: &str, dir: &Path) {
     let _ = std::fs::remove_file(complete_marker(feed, symbol, day, dir));
@@ -349,18 +409,20 @@ pub fn clear_spool(feed: Feed, symbol: &str, day: &str, dir: &Path) {
 #[derive(Debug)]
 pub struct FileError {
     pub busy: bool,
+    /// Conditions that don't belong to the main the store holds.
+    pub unbound: bool,
     pub message: String,
 }
 
 impl From<String> for FileError {
     fn from(message: String) -> Self {
-        Self { busy: false, message }
+        Self { busy: false, unbound: false, message }
     }
 }
 
 impl From<&str> for FileError {
     fn from(message: &str) -> Self {
-        Self { busy: false, message: message.to_owned() }
+        Self { busy: false, unbound: false, message: message.to_owned() }
     }
 }
 
@@ -407,7 +469,7 @@ pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batc
             break r;
         }
         if std::time::Instant::now() + wait > until {
-            return Err(FileError { busy: true, message: format!("the store stayed busy filing {id}") });
+            return Err(FileError { busy: true, unbound: false, message: format!("the store stayed busy filing {id}") });
         }
         tokio::time::sleep(wait).await;
         wait = (wait * 2).min(std::time::Duration::from_secs(60));
@@ -478,7 +540,7 @@ mod filing_tests {
 
 #[cfg(test)]
 mod spool_tests {
-    use super::{Feed, build, clear_spool, spooled};
+    use super::{Feed, build, check_binding, clear_spool, spooled};
     use crate::fetch::{Alpaca, Pace};
     use axum::routing::get;
 
@@ -549,4 +611,47 @@ mod spool_tests {
         assert!(spooled(Feed::Sip, "SPY", DAY, &dir).is_none());
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    /// A fake store holding `main` as the day's filed main file.
+    async fn store_holding(main: Vec<u8>) -> String {
+        let name = "data/Alpaca/ALPACA.SIP/SPY/cmbp-1/2026-10-01.dbn.zst";
+        let main = std::sync::Arc::new(main);
+        let app = axum::Router::new()
+            .route("/files", get(move || async move { axum::Json(serde_json::json!({ "files": [{ "name": name }] })) }))
+            .route("/files/{*name}", get(move || async move { (*main).clone() }));
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn main_file(m: &std::path::Path) -> Vec<u8> {
+        let p = std::fs::read_dir(m).unwrap().flatten().map(|e| e.path()).find(|p| p.to_string_lossy().ends_with(".dbn.zst")).unwrap();
+        std::fs::read(p).unwrap()
+    }
+
+    /// Conditions rebuilt against the same main the store holds bind to it.
+    #[tokio::test]
+    async fn conditions_built_against_the_held_main_bind() {
+        let dir = scratch("bound");
+        let (m, c, _) = build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let store = store_holding(main_file(&m)).await;
+        check_binding(&reqwest::Client::new(), &store, Feed::Sip, "SPY", DAY, &c).await.unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The held main differs from the one the conditions were built against (the
+    /// provider's data changed): unbound, naming both hashes.
+    #[tokio::test]
+    async fn conditions_against_another_main_are_unbound() {
+        let dir = scratch("unbound");
+        let (_, c, _) = build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let store = store_holding(b"another main".to_vec()).await;
+        let e = check_binding(&reqwest::Client::new(), &store, Feed::Sip, "SPY", DAY, &c).await.unwrap_err();
+        assert!(e.unbound && !e.busy, "{e:?}");
+        let other = format!("{:x}", <sha2::Sha256 as sha2::Digest>::digest(b"another main"));
+        assert!(e.message.contains(&other), "{}", e.message);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
+
