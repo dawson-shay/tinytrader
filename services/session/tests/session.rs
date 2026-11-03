@@ -440,3 +440,35 @@ fn the_calendar_closes_a_holiday() {
         "2026-10-26"
     );
 }
+
+/// `run.json` without what depends on where and when it ran: the session id, the
+/// config's hash and the holdings' paths.
+fn normalised(rec: &mut Value) {
+    let o = rec.as_object_mut().unwrap();
+    o.remove("session");
+    o.remove("config_sha256");
+    for src in o["sources"].as_array_mut().unwrap() {
+        src.as_object_mut().unwrap().remove("holdings");
+    }
+}
+
+/// The toy run's audit hash and `run.json`, as recorded from `main` before the
+/// actor transports (decision 0029): a refactor of the lockstep must reproduce
+/// them exactly. `SESSION_GOLDEN_WRITE=1` records them again.
+#[test]
+fn the_toy_run_matches_its_golden_record() {
+    let (o, _, dir) = run("golden", 30, Fault::None);
+    let mut rec: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("run.json")).unwrap()).unwrap();
+    normalised(&mut rec);
+    let golden = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/golden");
+    let (audit_file, run_file) = (golden.join("toy.audit"), golden.join("toy.run.json"));
+    if std::env::var_os("SESSION_GOLDEN_WRITE").is_some() {
+        std::fs::create_dir_all(&golden).unwrap();
+        std::fs::write(&audit_file, format!("{}\n", o.audit)).unwrap();
+        std::fs::write(&run_file, serde_json::to_string_pretty(&rec).unwrap() + "\n").unwrap();
+    }
+    assert_eq!(o.audit, std::fs::read_to_string(&audit_file).unwrap().trim());
+    let want: Value = serde_json::from_str(&std::fs::read_to_string(&run_file).unwrap()).unwrap();
+    assert_eq!(rec, want);
+}

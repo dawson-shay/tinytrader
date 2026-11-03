@@ -1,0 +1,76 @@
+{
+  "audit": "83b75201ef94993c6dd12cd0e05b9edfbad6e545fe53d4f13e543d3131ecf451",
+  "calendar_sha256": null,
+  "days": [
+    "2026-10-27"
+  ],
+  "format": "tinytrader.session-run/1",
+  "lockstep": {
+    "batch": "instant",
+    "strategy_latency_ms": 0
+  },
+  "merge": {
+    "order": "(ts, class, rank, position)",
+    "ranks": [
+      "opra"
+    ]
+  },
+  "mode": "backtest",
+  "reason": null,
+  "records": 7,
+  "seed": 0,
+  "sources": [
+    {
+      "clamped": 0,
+      "dataset": "OPRA.PILLAR",
+      "days": [
+        {
+          "day": "2026-10-27",
+          "files": [
+            {
+              "bytes": 205,
+              "name": "opra-pillar-20261027.cbbo-1m.dbn.zst",
+              "sha256": "a68e7105d6d4d84e34d8cd335a0541fb33572dc5bc473f1f81798629a45078e2",
+              "used": true,
+              "verified": true
+            }
+          ],
+          "missing": null,
+          "partial": false
+        }
+      ],
+      "expiries_within_days": null,
+      "latency_offset_ns": 0,
+      "name": "opra",
+      "reading": [],
+      "records": 7,
+      "schema": "cbbo-1m",
+      "symbol": "SPY.OPT"
+    }
+  ],
+  "status": "complete",
+  "steps": 8,
+  "strategy": {
+    "name": "toy",
+    "revision": "test"
+  },
+  "strategy_process": null,
+  "venues": [
+    {
+      "model": "tinytrader-sim/9",
+      "name": "options",
+      "quotes": [
+        "opra"
+      ],
+      "script": {
+        "expiry": {
+          "settle": false
+        },
+        "fee_per_contract": "0.65",
+        "seed": 14575324489130542917,
+        "strategy_latency_ms": 0
+      },
+      "sent": 1
+    }
+  ]
+}
