@@ -497,6 +497,9 @@ async fn rig_with(name: &str, setup: impl FnOnce(&mut Jobs)) -> Rig {
         cost: Duration::from_secs(2),
         submit: Duration::from_millis(300),
     });
+    // No floor of free space for the cache: the test machine's disk is its own.
+    jobs.cache_min_free = 0;
+    jobs.cache_min_free_pct = 0;
     setup(&mut jobs);
     let jobs = Arc::new(jobs);
     Rig {
@@ -2710,6 +2713,194 @@ async fn a_restart_resumes_unfinished_cache_requests() {
     assert_eq!(cache_done(&r, "OPRA-S1").await, ("cached".into(), None));
     assert!(lock(&r.jobs.caching).get("OPRA-S2").is_none());
     assert!(!folder.join("OPRA-S2/REQUESTED").exists());
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A cache folder for a test, emptied.
+fn cache_folder(name: &str) -> PathBuf {
+    let f = std::env::temp_dir().join(format!(
+        "tinytrader-jobs-cache-{name}-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&f);
+    f
+}
+
+/// Until `id`'s cache state starts with `prefix`.
+async fn cache_state(r: &Rig, id: &str, prefix: &str) -> String {
+    for _ in 0..500 {
+        if let Some(t) = lock(&r.jobs.caching).get(id)
+            && t.state.starts_with(prefix)
+        {
+            return t.state.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!(
+        "{id} never reached {prefix}: {:?}",
+        lock(&r.jobs.caching).get(id).map(|t| t.state.clone())
+    );
+}
+
+/// Too little room on the cache's volume: the download waits, showing why, and
+/// never starts; with room again it runs.
+#[tokio::test]
+async fn a_cache_download_waits_for_disk_rather_than_fill_it() {
+    let folder = cache_folder("disk");
+    let dir = folder.clone();
+    let r = rig_with("cache-disk", move |j| {
+        j.cache_dir = Some(dir);
+    })
+    .await;
+    cache_job(&r, "OPRA-D1", DBN_BYTES_SHA256);
+    set_floor(&r, u64::MAX / 4);
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-D1".into())).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    let state = cache_state(&r, "OPRA-D1", "waiting for disk").await;
+    assert!(state.contains("keeping"), "{state}");
+    assert!(
+        !folder
+            .join("OPRA-D1")
+            .join(format!(
+                "opra-pillar-{}.tcbbo.dbn.zst",
+                DAY.replace('-', "")
+            ))
+            .exists()
+    );
+    set_floor(&r, 0);
+    assert_eq!(cache_done(&r, "OPRA-D1").await, ("cached".into(), None));
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// The floor of free space, changed under a running rig.
+fn set_floor(r: &Rig, bytes: u64) {
+    r.jobs
+        .cache_floor_for_tests
+        .store(bytes, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A job that can't be listed for now waits at the back of the queue: the one
+/// behind it runs meanwhile. One that has expired fails at once, with why.
+#[tokio::test]
+async fn a_stalled_or_dead_cache_job_never_holds_up_the_rest() {
+    let folder = cache_folder("round");
+    let dir = folder.clone();
+    let r = rig_with("cache-round", move |j| j.cache_dir = Some(dir)).await;
+    // Done, but its files can't be listed yet: transient.
+    r.fake.add(job(
+        "OPRA-T1",
+        json!("SPY.OPT"),
+        "parent",
+        whole_day(),
+        "done",
+    ));
+    cache_job(&r, "OPRA-T2", DBN_BYTES_SHA256);
+    for id in ["OPRA-T1", "OPRA-T2"] {
+        let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(id.into())).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+    }
+    assert_eq!(cache_done(&r, "OPRA-T2").await, ("cached".into(), None));
+    assert!(
+        cache_state(&r, "OPRA-T1", "retrying")
+            .await
+            .contains("list files")
+    );
+    // Its files appear: it's cached on a later turn.
+    cache_job(&r, "OPRA-T1", DBN_BYTES_SHA256);
+    assert_eq!(cache_done(&r, "OPRA-T1").await, ("cached".into(), None));
+    // Expired once asked for: failed, with the reason, not retried.
+    // Done when asked for, with no files listed yet, so it can't finish first.
+    r.fake.add(job(
+        "OPRA-T3",
+        json!("SPY.OPT"),
+        "parent",
+        whole_day(),
+        "done",
+    ));
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-T3".into())).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    {
+        let mut f = lock(&r.fake.s);
+        f.files.remove("OPRA-T3");
+        f.jobs.retain(|j| j.id != "OPRA-T3");
+    }
+    r.fake.add(job(
+        "OPRA-T3",
+        json!("SPY.OPT"),
+        "parent",
+        whole_day(),
+        "expired",
+    ));
+    let (state, err) = cache_done(&r, "OPRA-T3").await;
+    assert_eq!(state, "failed");
+    assert!(err.unwrap().contains("expired"));
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// The queue's bound is real: with 256 waiting, the next is refused as busy,
+/// its marker not left behind.
+#[tokio::test]
+async fn a_full_cache_queue_answers_busy() {
+    let folder = cache_folder("full");
+    let dir = folder.clone();
+    let r = rig_with("cache-full", move |j| {
+        j.cache_dir = Some(dir);
+        j.yield_to = vec![("relay".into(), j.store.clone())];
+    })
+    .await;
+    // Capture is live: the first request waits, the rest stay queued.
+    lock(&r.store).health = "ready";
+    let ids: Vec<String> = (0..=CACHE_QUEUE + 1)
+        .map(|n| format!("OPRA-F{n}"))
+        .collect();
+    for id in &ids {
+        cache_job(&r, id, DBN_BYTES_SHA256);
+    }
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(ids[0].clone())).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    cache_state(&r, &ids[0], "waiting").await;
+    for id in &ids[1..=CACHE_QUEUE] {
+        let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(id.clone())).await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{id}");
+    }
+    let last = &ids[CACHE_QUEUE + 1];
+    let (code, Json(v)) = cache(AxState(r.jobs.clone()), UrlPath(last.clone())).await;
+    assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert!(!folder.join(last).join("REQUESTED").exists());
+    let (_, Json(v)) = cache_list(AxState(r.jobs.clone())).await;
+    assert_eq!(v["queued"], CACHE_QUEUE);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// More interrupted requests than the queue holds: all are queued again, as
+/// room comes, and all are cached.
+#[tokio::test]
+async fn a_restart_resumes_more_requests_than_the_queue_holds() {
+    let folder = cache_folder("resume-many");
+    let ids: Vec<String> = (0..CACHE_QUEUE + 40)
+        .map(|n| format!("OPRA-M{n}"))
+        .collect();
+    for (n, id) in ids.iter().enumerate() {
+        std::fs::create_dir_all(folder.join(id)).unwrap();
+        std::fs::write(
+            folder.join(id).join("REQUESTED"),
+            format!(r#"{{"requested_at": {n}}}"#),
+        )
+        .unwrap();
+    }
+    let dir = folder.clone();
+    let r = rig_with("cache-resume-many", move |j| j.cache_dir = Some(dir)).await;
+    for id in &ids {
+        cache_job(&r, id, DBN_BYTES_SHA256);
+    }
+    resume_caching(&r.jobs);
+    for id in &ids {
+        assert_eq!(cache_done(&r, id).await, ("cached".into(), None), "{id}");
+    }
+    assert!(
+        ids.iter()
+            .all(|id| !folder.join(id).join("REQUESTED").exists())
+    );
     let _ = std::fs::remove_dir_all(&folder);
 }
 
