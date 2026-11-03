@@ -2,7 +2,7 @@
 
 - **Status:** Proposed
 - **Date:** 2026-11-03
-- **Builds on:** [0018](0018-store-merge.md) (the store's merge),
+- **Builds on:** [0018](0018-partial-coverage.md) (partial coverage and the store's merge),
   [0024](0024-crate-layout.md) section 8 (filing throughput: R4a done, R4b
   deferred)
 
