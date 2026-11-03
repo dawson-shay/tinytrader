@@ -155,6 +155,8 @@ enum Fault {
     NoRead,
     /// Says it sent no orders after sending one.
     Undercount,
+    /// Sends a second hello where its first ready belongs.
+    HelloAsReady,
 }
 
 /// Buys one call at 1.25 on the 10:00 step, sets a timer for 10:02:30, and answers
@@ -187,6 +189,19 @@ fn toy(control: std::net::SocketAddr, fault: Fault) -> Seen {
     .unwrap();
     let welcome: Value = serde_json::from_str(&gw.line().unwrap().unwrap()).unwrap();
     assert_eq!(welcome["type"], "welcome");
+    if fault == Fault::HelloAsReady {
+        send(
+            &mut ctl,
+            &json!({"type": "hello", "protocol": "tinytrader.session/1", "strategy": "toy", "revision": "test"}),
+        );
+        let end = recv(&mut cr);
+        return Seen {
+            steps: Vec::new(),
+            fills: Vec::new(),
+            end: end.clone(),
+            received: vec![end],
+        };
+    }
     send(&mut ctl, &json!({"type": "ready", "as_of": 0, "sent": {}}));
     let (mut seen, mut last_seq, mut sent) = (
         Seen {
@@ -507,6 +522,7 @@ fn the_fixtures_match_their_golden_records() {
         ("no-read", 1, Fault::NoRead, 30_000),
         ("undercount", 5, Fault::Undercount, 0),
         ("far-timer", 30, Fault::FarTimer, 0),
+        ("hello-as-ready", 5, Fault::HelloAsReady, 0),
     ];
     for (name, timeout, fault, extra) in cases {
         let (o, seen, dir) = run_with(&format!("golden-{name}"), timeout, fault, extra);
