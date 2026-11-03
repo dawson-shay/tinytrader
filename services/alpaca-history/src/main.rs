@@ -323,7 +323,11 @@ async fn work(a: &App, id: &str) {
         let _ = std::fs::create_dir_all(&spool);
         // A complete spool kept from an earlier pass is filed as it was built; only
         // without one is the day fetched again.
-        let built = match day::spooled(run.feed, &sym, &d, &spool) {
+        let kept = {
+            let (feed, sym, d, spool) = (run.feed, sym.clone(), d.clone(), spool.clone());
+            tokio::task::spawn_blocking(move || day::spooled(feed, &sym, &d, &spool)).await.ok().flatten()
+        };
+        let built = match kept {
             Some(kept) => Ok(kept),
             None => day::build(&a.alpaca, run.feed, &sym, &d, &spool).await,
         };
@@ -349,14 +353,32 @@ async fn work(a: &App, id: &str) {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     return;
                 }
+                // Couldn't check the conditions against the held main yet: the day
+                // waits for the run to be queued again, its spool kept.
+                if let Err(e) = &filed
+                    && e.later
+                {
+                    a.events.push(format!("deferred {sym} {d}"), e.message.clone());
+                    let note = format!("{}; the spool is kept, and queuing the run again tries it", e.message);
+                    set_run(a, id, |r| {
+                        r.days.insert(key, DayRecord { state: "deferred".into(), trades: None, quotes: None, pages: None, bytes: None, note });
+                    });
+                    continue;
+                }
                 // Conditions that don't bind to the held main: kept, for a person to
-                // look at and decide.
+                // look at and decide. Queuing the run again would only repeat it.
                 if let Err(e) = &filed
                     && e.unbound
                 {
                     a.observer.record_error(&format!("{sym} {d}: {}", e.message));
                     a.events.push(format!("conditions unbound {sym} {d}"), e.message.clone());
-                    let note = e.message.clone();
+                    let note = format!(
+                        "{}. A person must decide: the rebuilt batches are kept in {} and {}; compare them with the held day (GET /coverage?provider=alpaca&dataset={}&symbol={sym}&start={d}&end={d}). Queuing the run again repeats the mismatch.",
+                        e.message,
+                        m.display(),
+                        c.display(),
+                        run.feed.dataset()
+                    );
                     set_run(a, id, |r| {
                         r.days.insert(key, DayRecord { state: "conditions_unbound".into(), trades: None, quotes: None, pages: None, bytes: None, note });
                     });
@@ -392,9 +414,20 @@ async fn work(a: &App, id: &str) {
         }
     }
     set_run(a, id, |r| {
-        let failed = r.days.values().filter(|d| d.state == "failed" || d.state == "conditions_unbound").count();
-        r.state = if failed > 0 { "failed".into() } else { "done".into() };
-        r.note = if failed > 0 { format!("{failed} days failed; queue the run again to retry them") } else { String::new() };
+        let count = |s: &str| r.days.values().filter(|d| d.state == s).count();
+        let (failed, unbound, deferred) = (count("failed"), count("conditions_unbound"), count("deferred"));
+        r.state = if failed + unbound + deferred > 0 { "failed".into() } else { "done".into() };
+        let mut notes = Vec::new();
+        if failed > 0 {
+            notes.push(format!("{failed} days failed; queue the run again to retry them"));
+        }
+        if deferred > 0 {
+            notes.push(format!("{deferred} days deferred with their spools kept; queue the run again once the store can answer for them"));
+        }
+        if unbound > 0 {
+            notes.push(format!("{unbound} days' conditions don't bind to the held main; a person must decide (see each day's note)"));
+        }
+        r.note = notes.join("; ");
     });
 }
 
