@@ -327,6 +327,15 @@ async fn work(a: &App, id: &str) {
                     day::file(&a.http, &a.store, a.store_token.as_deref(), &c).await
                 }
                 .await;
+                // A busy store: the day is tried again on the next pass, its spool
+                // kept, as for a rate limit.
+                if let Err(e) = &filed
+                    && e.busy
+                {
+                    a.observer.set_state(State::Degraded, &format!("{}; waiting", e.message));
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    return;
+                }
                 // The store keeps what it filed; the spool copies go either way.
                 for dir in [&m, &c] {
                     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -336,7 +345,7 @@ async fn work(a: &App, id: &str) {
                     }
                     let _ = std::fs::remove_dir(dir);
                 }
-                filed.map(|_| out).map_err(|e| (false, e))
+                filed.map(|_| out).map_err(|e| (false, e.message))
             }
             Err(Failure::RateLimited) => Err((true, "rate limited".to_owned())),
             Err(e) => Err((false, e.to_string())),

@@ -7,7 +7,7 @@
 | **Versioning** | Unversioned paths; changes are additive (new fields, new endpoints). |
 | **Auth** | Reads are open. Writes need `Authorization: Bearer <token>` when `STORE_WRITE_TOKEN` (or `STORE_WRITE_TOKEN_FILE`) is set, and are refused from a web page of another origin ([write token](#write-token)). |
 | **Errors** | `{"error": "..."}` with the HTTP status (`400`, `401`, `403`, `404`, `409`, `422`, `500`, `503`, `507`). |
-| **Writes** | Filing, importing, adopting and applying conditions run one at a time, in the order asked (decision 0030: one filer owns them). Its queue holds 64; a write asked past that is answered `503 {"error": "busy: the store's filing queue is full; try again"}` and nothing is done: retry it. |
+| **Writes** | Filing, importing, adopting and applying conditions run one at a time, in the order asked (decision 0030: one filer owns them). Its queue holds 64; a write asked past that is answered `503 {"error": "busy: the store's filing queue is full; try again"}` and nothing is done: retry it. If the filer itself fails, the store logs why and exits (status 70), for its supervisor to start it again (launchd's `KeepAlive` on macOS, systemd on Linux), which redoes its scan and recovery from disk; a write asked meanwhile is answered `503 {"error": "the filer stopped; the store is restarting"}`. |
 | **Health** | `/health`, `/metrics`, `/describe`, `/events` ([observe](observe.md)); `degraded` when a volume is missing or past its critical threshold. |
 | **Stability** | `/catalog`, `/files` and `/files/{volume}/{path}` are **stable**; the write endpoints are **experimental** (their clients are tinytrader's own services). |
 
