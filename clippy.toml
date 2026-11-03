@@ -1,0 +1,8 @@
+# The contributing guide's resource-bounds rule, enforced: every channel is
+# bounded. Use std::sync::mpsc::sync_channel or tokio::sync::mpsc::channel(n)
+# (oneshot channels are fine). Tests aren't exempt. A known exception carries an
+# #[expect(clippy::disallowed_methods, reason = "...")] where it's made.
+disallowed-methods = [
+    { path = "std::sync::mpsc::channel", reason = "unbounded: use sync_channel(capacity) and say what happens when it's full" },
+    { path = "tokio::sync::mpsc::unbounded_channel", reason = "unbounded: use channel(capacity) and say what happens when it's full" },
+]

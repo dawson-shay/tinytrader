@@ -374,7 +374,7 @@ fn fake_store(busy: u32) -> (String, Arc<AtomicU32>) {
             ),
         )
         .with_state(state);
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async move {
@@ -551,7 +551,7 @@ fn store_with(coverage: serde_json::Value, files: Vec<(&str, Vec<u8>)>) -> Strin
             }),
         )
         .with_state(Arc::new((coverage, files)));
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         tokio::runtime::Runtime::new()
             .unwrap()
