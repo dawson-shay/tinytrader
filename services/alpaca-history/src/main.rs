@@ -305,25 +305,35 @@ async fn work(a: &App, id: &str) {
             return;
         }
         let (main, cond) = run.feed.batches(&sym, &d);
-        match held(a).await {
+        let main_held = match held(a).await {
             Ok(h) if h.contains(&main) && h.contains(&cond) => {
+                day::clear_spool(run.feed, &sym, &d, &spool);
                 set_run(a, id, |r| {
                     r.days.insert(key, DayRecord { state: "held".into(), trades: None, quotes: None, pages: None, bytes: None, note: String::new() });
                 });
                 continue;
             }
-            Ok(_) => {}
+            Ok(h) => h.contains(&main),
             Err(e) => {
                 a.observer.set_state(State::Degraded, &e);
                 return;
             }
-        }
+        };
         a.observer.set_state(State::Ready, &format!("{} {sym} {d}", run.feed.name()));
         let _ = std::fs::create_dir_all(&spool);
-        let result = match day::build(&a.alpaca, run.feed, &sym, &d, &spool).await {
+        // A complete spool kept from an earlier pass is filed as it was built; only
+        // without one is the day fetched again.
+        let built = match day::spooled(run.feed, &sym, &d, &spool) {
+            Some(kept) => Ok(kept),
+            None => day::build(&a.alpaca, run.feed, &sym, &d, &spool).await,
+        };
+        let result = match built {
             Ok((m, c, out)) => {
                 let filed = async {
-                    day::file(&a.http, &a.store, a.store_token.as_deref(), &m).await?;
+                    // Main filed on an earlier pass: only its conditions are left.
+                    if !main_held {
+                        day::file(&a.http, &a.store, a.store_token.as_deref(), &m).await?;
+                    }
                     day::file(&a.http, &a.store, a.store_token.as_deref(), &c).await
                 }
                 .await;
@@ -336,15 +346,8 @@ async fn work(a: &App, id: &str) {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                     return;
                 }
-                // The store keeps what it filed; the spool copies go either way.
-                for dir in [&m, &c] {
-                    if let Ok(rd) = std::fs::read_dir(dir) {
-                        for e in rd.flatten() {
-                            let _ = std::fs::remove_file(e.path());
-                        }
-                    }
-                    let _ = std::fs::remove_dir(dir);
-                }
+                // The store keeps what it filed; the spool goes either way.
+                day::clear_spool(run.feed, &sym, &d, &spool);
                 filed.map(|_| out).map_err(|e| (false, e.message))
             }
             Err(Failure::RateLimited) => Err((true, "rate limited".to_owned())),

@@ -57,7 +57,7 @@ impl Feed {
 }
 
 /// What a day came to.
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, serde::Serialize, Deserialize)]
 pub struct Outcome {
     pub trades: usize,
     pub quotes: usize,
@@ -195,6 +195,11 @@ fn write_batches(
     let d = day.replace('-', "");
     let schema = feed.schema();
     let (main_dir, cond_dir) = (dir.join(&main_id), dir.join(&cond_id));
+    // Not complete until both batches are written and checked.
+    let marker = complete_marker(feed, symbol, day, dir);
+    if marker.exists() {
+        std::fs::remove_file(&marker).map_err(|e| e.to_string())?;
+    }
     for p in [&main_dir, &cond_dir] {
         // A leftover from an interrupted attempt is rebuilt from scratch.
         if p.exists() {
@@ -295,7 +300,48 @@ fn write_batches(
         std::fs::write(dir.join("manifest.json"), serde_json::to_vec_pretty(&manifest).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())?;
     }
+    std::fs::write(&marker, serde_json::to_vec_pretty(&outcome).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
     Ok((main_dir, cond_dir, outcome))
+}
+
+/// The file that says a day's spool is complete: both batches written and checked
+/// against their pages. It holds the day's [`Outcome`].
+fn complete_marker(feed: Feed, symbol: &str, day: &str, dir: &Path) -> PathBuf {
+    dir.join(format!("{}.complete.json", feed.batches(symbol, day).0))
+}
+
+/// A day's complete spool, kept from an earlier pass (the store was busy): its two
+/// batch folders and outcome, if the marker is there and every file still matches
+/// its manifest. Filing from it files exactly what was built, without asking
+/// Alpaca again, so a day whose data changed upstream since isn't refused.
+pub fn spooled(feed: Feed, symbol: &str, day: &str, dir: &Path) -> Option<(PathBuf, PathBuf, Outcome)> {
+    let marker = complete_marker(feed, symbol, day, dir);
+    let outcome: Outcome = serde_json::from_slice(&std::fs::read(&marker).ok()?).ok()?;
+    let (main_id, cond_id) = feed.batches(symbol, day);
+    let (main_dir, cond_dir) = (dir.join(main_id), dir.join(cond_id));
+    let intact = |d: &Path| -> Option<()> {
+        let m: Value = serde_json::from_slice(&std::fs::read(d.join("manifest.json")).ok()?).ok()?;
+        for f in m["files"].as_array()? {
+            let bytes = std::fs::read(d.join(f["filename"].as_str()?)).ok()?;
+            let hash = format!("sha256:{:x}", Sha256::digest(&bytes));
+            if f["size"].as_u64()? != bytes.len() as u64 || f["hash"].as_str()? != hash {
+                return None;
+            }
+        }
+        Some(())
+    };
+    intact(&main_dir)?;
+    intact(&cond_dir)?;
+    Some((main_dir, cond_dir, outcome))
+}
+
+/// Removes a day's spool: its batch folders and its marker.
+pub fn clear_spool(feed: Feed, symbol: &str, day: &str, dir: &Path) {
+    let _ = std::fs::remove_file(complete_marker(feed, symbol, day, dir));
+    let (main_id, cond_id) = feed.batches(symbol, day);
+    for d in [dir.join(main_id), dir.join(cond_id)] {
+        let _ = std::fs::remove_dir_all(d);
+    }
 }
 
 /// A filing that didn't happen: the store busy past the wait (`busy`: try the day
@@ -429,3 +475,78 @@ mod filing_tests {
     }
 }
 
+
+#[cfg(test)]
+mod spool_tests {
+    use super::{Feed, build, clear_spool, spooled};
+    use crate::fetch::{Alpaca, Pace};
+    use axum::routing::get;
+
+    const DAY: &str = "2026-10-01";
+
+    /// A fake Alpaca with one trade and one quote for `DAY`.
+    async fn alpaca() -> Alpaca {
+        let app = axum::Router::new()
+            .route(
+                "/v2/stocks/SPY/trades",
+                get(|| async {
+                    r#"{"trades":[{"t":"2026-10-01T13:30:00.5Z","x":"V","p":774.51,"s":100,"i":7,"c":["@","I"],"z":"B"}],"next_page_token":null}"#
+                }),
+            )
+            .route(
+                "/v2/stocks/SPY/quotes",
+                get(|| async {
+                    r#"{"quotes":[{"t":"2026-10-01T13:30:00.4Z","bp":774.5,"bs":2,"bx":"Q","ap":774.6,"as":3,"ax":"Q","c":["R"],"z":"B"}],"next_page_token":null}"#
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        Alpaca { http: reqwest::Client::new(), data: format!("http://{addr}"), key_id: "k".into(), secret: "s".into(), pace: Pace::new(10_000) }
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("alpaca-spool-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[tokio::test]
+    async fn a_complete_spool_is_found_and_a_damaged_one_is_not() {
+        let dir = scratch("complete");
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).is_none(), "nothing spooled yet");
+        let (m, c, out) = build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let (km, kc, kept) = spooled(Feed::Sip, "SPY", DAY, &dir).expect("the built day is kept");
+        assert_eq!((km, kc), (m.clone(), c));
+        assert_eq!((kept.trades, kept.quotes, kept.pages, kept.bytes), (out.trades, out.quotes, out.pages, out.bytes));
+        // A file changed since it was built: not filed from the spool.
+        let data = std::fs::read_dir(&m)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".dbn.zst"))
+            .unwrap();
+        let original = std::fs::read(&data).unwrap();
+        std::fs::write(&data, b"changed").unwrap();
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).is_none());
+        std::fs::write(&data, &original).unwrap();
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).is_some());
+        clear_spool(Feed::Sip, "SPY", DAY, &dir);
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).is_none());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "the spool is gone");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Batches without their marker (a build interrupted after writing them) aren't
+    /// a complete spool.
+    #[tokio::test]
+    async fn batches_without_their_marker_are_not_complete() {
+        let dir = scratch("unmarked");
+        build(&alpaca().await, Feed::Sip, "SPY", DAY, &dir).await.unwrap();
+        let marker = dir.join(format!("{}.complete.json", Feed::Sip.batches("SPY", DAY).0));
+        std::fs::remove_file(marker).unwrap();
+        assert!(spooled(Feed::Sip, "SPY", DAY, &dir).is_none());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
