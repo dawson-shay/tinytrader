@@ -1,0 +1,108 @@
+{
+  "audit": "895534c105264e759fc539a807f72c1313e18a61fdfb663b70a42fcc3c8d9539",
+  "reason": "timer far at 1793232000000000000 is after the last day ends at 1793145599999999999",
+  "received": [
+    {
+      "as_of": 1793059200000000000,
+      "records": 1,
+      "reports": {
+        "options": 4
+      },
+      "step": 1,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "as_of": 1793109600000000000,
+      "records": 1,
+      "reports": {
+        "options": 4
+      },
+      "step": 2,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "audit": "895534c105264e759fc539a807f72c1313e18a61fdfb663b70a42fcc3c8d9539",
+      "reason": "timer far at 1793232000000000000 is after the last day ends at 1793145599999999999",
+      "records": 2,
+      "reports": null,
+      "status": "incomplete",
+      "steps": 2,
+      "type": "end"
+    }
+  ],
+  "records": 2,
+  "run": {
+    "audit": "895534c105264e759fc539a807f72c1313e18a61fdfb663b70a42fcc3c8d9539",
+    "calendar_sha256": null,
+    "days": [
+      "2026-10-27"
+    ],
+    "format": "tinytrader.session-run/1",
+    "lockstep": {
+      "batch": "instant",
+      "strategy_latency_ms": 0
+    },
+    "merge": {
+      "order": "(ts, class, rank, position)",
+      "ranks": [
+        "opra"
+      ]
+    },
+    "mode": "backtest",
+    "reason": "timer far at 1793232000000000000 is after the last day ends at 1793145599999999999",
+    "records": 2,
+    "seed": 0,
+    "sources": [
+      {
+        "clamped": 0,
+        "dataset": "OPRA.PILLAR",
+        "days": [
+          {
+            "day": "2026-10-27",
+            "files": [],
+            "missing": null,
+            "partial": false
+          }
+        ],
+        "expiries_within_days": null,
+        "latency_offset_ns": 0,
+        "name": "opra",
+        "reading": [
+          "opra-pillar-20261027.cbbo-1m.dbn.zst"
+        ],
+        "records": 2,
+        "schema": "cbbo-1m",
+        "symbol": "SPY.OPT"
+      }
+    ],
+    "status": "incomplete",
+    "steps": 2,
+    "strategy": {
+      "name": "toy",
+      "revision": "test"
+    },
+    "strategy_process": null,
+    "venues": [
+      {
+        "model": "tinytrader-sim/9",
+        "name": "options",
+        "quotes": [
+          "opra"
+        ],
+        "script": {
+          "expiry": {
+            "settle": false
+          },
+          "fee_per_contract": "0.65",
+          "seed": 14575324489130542917,
+          "strategy_latency_ms": 0
+        },
+        "sent": null
+      }
+    ]
+  },
+  "status": "incomplete",
+  "steps": 2
+}

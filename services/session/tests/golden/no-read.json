@@ -1,0 +1,98 @@
+{
+  "audit": "6f4f88daea217df97bfeb1e60c79ea7653b89103f8076607ea192690be5ac39c",
+  "reason": "data: <io timeout>",
+  "received": [
+    {
+      "as_of": 1793059200000000000,
+      "records": 30001,
+      "reports": {
+        "options": 4
+      },
+      "step": 1,
+      "timers": [],
+      "type": "step"
+    },
+    {
+      "audit": "6f4f88daea217df97bfeb1e60c79ea7653b89103f8076607ea192690be5ac39c",
+      "reason": "data: <io timeout>",
+      "records": 30001,
+      "reports": null,
+      "status": "incomplete",
+      "steps": 1,
+      "type": "end"
+    }
+  ],
+  "records": 30001,
+  "run": {
+    "audit": "6f4f88daea217df97bfeb1e60c79ea7653b89103f8076607ea192690be5ac39c",
+    "calendar_sha256": null,
+    "days": [
+      "2026-10-27"
+    ],
+    "format": "tinytrader.session-run/1",
+    "lockstep": {
+      "batch": "instant",
+      "strategy_latency_ms": 0
+    },
+    "merge": {
+      "order": "(ts, class, rank, position)",
+      "ranks": [
+        "opra"
+      ]
+    },
+    "mode": "backtest",
+    "reason": "data: <io timeout>",
+    "records": 30001,
+    "seed": 0,
+    "sources": [
+      {
+        "clamped": 0,
+        "dataset": "OPRA.PILLAR",
+        "days": [
+          {
+            "day": "2026-10-27",
+            "files": [],
+            "missing": null,
+            "partial": false
+          }
+        ],
+        "expiries_within_days": null,
+        "latency_offset_ns": 0,
+        "name": "opra",
+        "reading": [
+          "opra-pillar-20261027.cbbo-1m.dbn.zst"
+        ],
+        "records": 30001,
+        "schema": "cbbo-1m",
+        "symbol": "SPY.OPT"
+      }
+    ],
+    "status": "incomplete",
+    "steps": 1,
+    "strategy": {
+      "name": "toy",
+      "revision": "test"
+    },
+    "strategy_process": null,
+    "venues": [
+      {
+        "model": "tinytrader-sim/9",
+        "name": "options",
+        "quotes": [
+          "opra"
+        ],
+        "script": {
+          "expiry": {
+            "settle": false
+          },
+          "fee_per_contract": "0.65",
+          "seed": 14575324489130542917,
+          "strategy_latency_ms": 0
+        },
+        "sent": null
+      }
+    ]
+  },
+  "status": "incomplete",
+  "steps": 1
+}
