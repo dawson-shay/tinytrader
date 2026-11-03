@@ -106,9 +106,10 @@ S→C error      {code, message}  fatal errors close the connection after sendin
   - Nothing is lost: the client reconnects with `resume_after_seq` and the journal replays the suffix. This is a deliberate difference from the market-data relay.
 - **Inbound, the account's inbox** holds 1,024 requests from all connections:
   - When it's full, a request is answered at once with `outcome: error`, `code: busy`. It never reached the account and nothing was sent; retry it, with the same `request_id`. A `busy` answer isn't journaled or replayed.
-  - The admin's safety requests (`kill`, `unkill`, `flatten`, `clear_order`) never wait behind it: they go on an urgent channel the account takes first, before anything in the inbox. A cancel is never answered `busy` either: it waits for room, behind its own client's earlier requests.
+  - The admin's `kill`, `flatten` and `clear_order` never wait behind it: they go on an urgent channel the account takes first, so a kill refuses what's queued behind it as it comes up. An `unkill` and a cancel keep their places in the inbox (an urgent unkill would let a queued backlog through), and are never answered `busy`: they wait for room.
+  - Under a session's clock nothing is answered `busy`: a request waits for room, since whether the inbox was full would depend on timing, and a run must repeat.
+  - A request still queued when its connection closes is dropped, never run.
   - A connection's requests are read only once its welcome is written, so nothing reaches a client before its welcome. A hello the account doesn't answer within the hello timeout ends the connection (`hello_timeout`); the account then ignores it, and the client's cancel-on-disconnect timer stays armed.
-  - Under a session's clock, a submit or cancel answered `busy` counts as handled, so the step's advance doesn't wait for it.
 - **Responses are not replayed.** Every outcome a client needs after a reconnect is also a journaled event (`submit`, `cancel`). A client that lost its connection before reading a response recovers the outcome from the replay.
 - **Heartbeats** carry `last_seq`, so an idle client can confirm it is caught up.
 

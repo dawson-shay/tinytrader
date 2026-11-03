@@ -325,9 +325,11 @@ struct Shared {
     timing: Timing,
     last_seq: Arc<AtomicU64>,
     tx: SyncSender<Input>,
-    /// The urgent inputs (kill, unkill, flatten, clear_order), which the session takes
-    /// before anything in the inbox.
+    /// The urgent inputs (kill, flatten, clear_order), which the session takes before
+    /// anything in the inbox.
     urgent: SyncSender<Input>,
+    /// A session clocks the broker: requests wait for room rather than get `busy`.
+    lockstep: bool,
     /// Per client: order messages (submits, cancels) answered `busy`, which a session's
     /// clock counts as handled.
     refused: Arc<Vec<AtomicU64>>,
@@ -358,16 +360,19 @@ impl Shared {
             } => Some(op),
             _ => None,
         };
-        // Urgent: ahead of the inbox. A cancel keeps its place behind its client's
-        // submits, but never gets `busy`: it waits for room.
+        // Urgent: ahead of the inbox (a kill refuses what's queued behind it as it
+        // comes up). An unkill and a cancel keep their places, in order, but never get
+        // `busy`: they wait for room.
         if matches!(
             op,
-            Some(Op::Kill { .. } | Op::Unkill | Op::Flatten { .. } | Op::ClearOrder { .. })
+            Some(Op::Kill { .. } | Op::Flatten { .. } | Op::ClearOrder { .. })
         ) {
             let _ = self.urgent.send(input);
             return;
         }
-        if matches!(op, Some(Op::Cancel(_))) {
+        // Under a session's clock nothing is `busy` (whether a request found the inbox
+        // full would depend on timing, and a run must repeat): it waits for room.
+        if self.lockstep || matches!(op, Some(Op::Cancel(_) | Op::Unkill)) {
             let _ = self.tx.send(input);
             return;
         }
@@ -613,6 +618,7 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
         last_seq: Arc::clone(&last_seq),
         tx: tx.clone(),
         urgent,
+        lockstep: broker.session_clocked(),
         refused: Arc::clone(&refused),
     });
     let mut session = Session::new(cfg, broker, journal, &recovered, last_seq);
@@ -661,6 +667,7 @@ mod inbox_tests {
             last_seq: Arc::new(AtomicU64::new(0)),
             tx,
             urgent: sync_channel(URGENT).0,
+            lockstep: false,
             refused: Arc::new(vec![AtomicU64::new(0)]),
         };
         let ob = Outbox::new(1 << 20);
@@ -701,6 +708,7 @@ mod inbox_tests {
             last_seq: Arc::new(AtomicU64::new(0)),
             tx,
             urgent,
+            lockstep: false,
             refused: Arc::new(vec![AtomicU64::new(0)]),
         };
         (sh, rx, urgent_rx)
@@ -788,5 +796,33 @@ mod inbox_tests {
         let refused = Outbox::new(1 << 20);
         refused.close(Some("{\"type\":\"error\"}".into()));
         assert!(!refused.wait_started(Duration::from_millis(10)));
+    }
+
+    /// Under a session's clock a full inbox makes a request wait (a run must repeat,
+    /// and `busy` would depend on timing); an unkill waits in the inbox, in order.
+    #[test]
+    fn lockstep_and_unkill_wait_for_room() {
+        for (lockstep, op) in [
+            (true, Op::Submit(serde_json::json!({}))),
+            (false, Op::Unkill),
+        ] {
+            let (mut sh, rx, urgent) = shared(1);
+            sh.lockstep = lockstep;
+            let sh = Arc::new(sh);
+            let ob = Arc::new(Outbox::new(1 << 20));
+            sh.request(&ob, 0, request("r1", Op::Account));
+            let (sh2, ob2) = (Arc::clone(&sh), Arc::clone(&ob));
+            let waiting = std::thread::spawn(move || sh2.request(&ob2, 0, request("r2", op)));
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiting.is_finished(), "waits for room");
+            assert!(
+                matches!(ob.pop(Duration::from_millis(10)), Pop::Idle),
+                "not busy"
+            );
+            assert!(urgent.try_recv().is_err(), "not ahead of the inbox");
+            assert_eq!(rid(rx.recv().unwrap()), "r1");
+            waiting.join().unwrap();
+            assert_eq!(rid(rx.recv().unwrap()), "r2");
+        }
     }
 }

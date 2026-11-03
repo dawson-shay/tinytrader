@@ -879,10 +879,17 @@ impl<B: Broker> Session<B> {
                     Ok((_, op)) => op_name(op),
                     Err((_, op, _)) => op.as_str(),
                 };
+                let conn = self.conns.iter().find(|c| c.id == id);
                 if matches!(name, "submit" | "cancel")
-                    && let Some(c) = self.conns.iter().find(|c| c.id == id)
+                    && let Some(c) = conn
                 {
                     *self.handled.entry(c.client).or_default() += 1;
+                }
+                // A request from a connection that has since closed is dropped: no one
+                // would hear its answer, and a reconnecting client learns from the
+                // journal that it never ran.
+                if conn.is_some_and(|c| c.outbox.closed()) {
+                    return Ok(false);
                 }
                 self.request(id, request)?;
             }
@@ -3661,5 +3668,31 @@ mod tests {
             5,
             "{j}"
         );
+    }
+
+    /// A request still queued from a connection that has closed is dropped: it
+    /// never runs.
+    #[test]
+    fn a_closed_connections_queued_request_is_dropped() {
+        let (mut s, _) = session("closed-conn-request", None);
+        s.cfg.clients.push(ClientSpec {
+            name: "alice".into(),
+            role: Role::Trade,
+            prefix: "wse-".into(),
+            token: "token".into(),
+        });
+        let ob = Arc::new(crate::server::Outbox::new(1 << 20));
+        ob.push("{}".into());
+        s.hello(1, 0, Arc::clone(&ob), None, false).unwrap();
+        ob.close(None);
+        let intent = serde_json::json!({"client_order_id":"wse-gone","shape":"single",
+            "instrument":{"class":"option","symbol":"SPY261005P00570000"},"side":"buy",
+            "effect":"open","qty":1,"type":"limit","limit_price":"1.00","time_in_force":"day"});
+        s.input(Ok(super::Input::Request {
+            id: 1,
+            request: Ok(("r1".into(), crate::protocol::Op::Submit(intent))),
+        }))
+        .unwrap();
+        assert!(!journal_text(&s).contains("wse-gone"));
     }
 }
