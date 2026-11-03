@@ -325,7 +325,22 @@ async fn work(a: &App, id: &str) {
         // without one is the day fetched again.
         let kept = {
             let (feed, sym, d, spool) = (run.feed, sym.clone(), d.clone(), spool.clone());
-            tokio::task::spawn_blocking(move || day::spooled(feed, &sym, &d, &spool)).await.ok().flatten()
+            tokio::task::spawn_blocking(move || day::spooled(feed, &sym, &d, &spool))
+                .await
+                .unwrap_or_else(|e| Err(format!("reading the spool failed: {e}")))
+        };
+        // A spool that couldn't be read (not one that's damaged) isn't rebuilt over:
+        // the day waits.
+        let kept = match kept {
+            Ok(k) => k,
+            Err(e) => {
+                a.events.push(format!("deferred {sym} {d}"), e.clone());
+                let note = format!("{e}; the spool is kept, and queuing the run again tries it");
+                set_run(a, id, |r| {
+                    r.days.insert(key, DayRecord { state: "deferred".into(), trades: None, quotes: None, pages: None, bytes: None, note });
+                });
+                continue;
+            }
         };
         let built = match kept {
             Some(kept) => Ok(kept),
