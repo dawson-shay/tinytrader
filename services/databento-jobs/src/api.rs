@@ -17,6 +17,56 @@ use databento::historical::metadata::{
 
 pub type Fut<'a, T> = Pin<Box<dyn Future<Output = Result<T, String>> + Send + 'a>>;
 
+/// A failed call, with the HTTP status Databento answered when it answered one:
+/// decisions are made on the status, never on the message's text (which carries
+/// request and job ids, whose digits can look like any status).
+#[derive(Debug, Clone)]
+pub struct CallError {
+    pub status: Option<u16>,
+    pub message: String,
+}
+
+impl CallError {
+    /// A status that asking again won't change: a 4xx other than 408 and 429.
+    #[must_use]
+    pub fn permanent(&self) -> bool {
+        self.status
+            .is_some_and(|s| (400..500).contains(&s) && s != 408 && s != 429)
+    }
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl From<String> for CallError {
+    fn from(message: String) -> Self {
+        Self {
+            status: None,
+            message,
+        }
+    }
+}
+
+impl From<databento::Error> for CallError {
+    fn from(e: databento::Error) -> Self {
+        let status = match &e {
+            databento::Error::Api(a) => Some(a.status_code.as_u16()),
+            databento::Error::Http(h) => h.status().map(|s| s.as_u16()),
+            _ => None,
+        };
+        Self {
+            status,
+            message: e.to_string(),
+        }
+    }
+}
+
+/// A call whose failure carries its HTTP status.
+pub type Checked<'a, T> = Pin<Box<dyn Future<Output = Result<T, CallError>> + Send + 'a>>;
+
 pub trait Databento: Send + Sync {
     fn list_jobs<'a>(&'a self, p: &'a ListJobsParams) -> Fut<'a, Vec<BatchJobShort>>;
     fn job<'a>(&'a self, id: &'a str) -> Fut<'a, BatchJob>;
@@ -31,6 +81,14 @@ pub trait Databento: Send + Sync {
         &'a self,
         p: &'a GetDatasetConditionParams,
     ) -> Fut<'a, Vec<DatasetConditionDetail>>;
+    /// [`Self::job`], its failure with the HTTP status. By default, none.
+    fn job_checked<'a>(&'a self, id: &'a str) -> Checked<'a, BatchJob> {
+        Box::pin(async move { self.job(id).await.map_err(CallError::from) })
+    }
+    /// [`Self::files`], its failure with the HTTP status. By default, none.
+    fn files_checked<'a>(&'a self, id: &'a str) -> Checked<'a, Vec<BatchFileDesc>> {
+        Box::pin(async move { self.files(id).await.map_err(CallError::from) })
+    }
 }
 
 /// Every job in every state over the account's whole history: what was
@@ -97,6 +155,18 @@ impl Databento for Live {
     fn files<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<BatchFileDesc>> {
         call!(self, |c| c.batch().list_files(id))
     }
+    fn job_checked<'a>(&'a self, id: &'a str) -> Checked<'a, BatchJob> {
+        Box::pin(async move {
+            let mut c = self.client().await;
+            c.batch().get_job_details(id).await.map_err(CallError::from)
+        })
+    }
+    fn files_checked<'a>(&'a self, id: &'a str) -> Checked<'a, Vec<BatchFileDesc>> {
+        Box::pin(async move {
+            let mut c = self.client().await;
+            c.batch().list_files(id).await.map_err(CallError::from)
+        })
+    }
     fn submit<'a>(&'a self, p: &'a SubmitJobParams) -> Fut<'a, BatchJob> {
         call!(self, |c| c.batch().submit_job(p))
     }
@@ -160,6 +230,15 @@ fn within<'a, T: 'a>(d: Duration, f: Fut<'a, T>) -> Fut<'a, T> {
     })
 }
 
+fn within_checked<'a, T: 'a>(d: Duration, f: Checked<'a, T>) -> Checked<'a, T> {
+    Box::pin(async move {
+        tokio::time::timeout(d, f).await.map_err(|_| CallError {
+            status: None,
+            message: format!("no answer from Databento in {} s", d.as_secs_f64()),
+        })?
+    })
+}
+
 impl Databento for Timed {
     fn list_jobs<'a>(&'a self, p: &'a ListJobsParams) -> Fut<'a, Vec<BatchJobShort>> {
         within(self.read, self.inner.list_jobs(p))
@@ -169,6 +248,12 @@ impl Databento for Timed {
     }
     fn files<'a>(&'a self, id: &'a str) -> Fut<'a, Vec<BatchFileDesc>> {
         within(self.read, self.inner.files(id))
+    }
+    fn job_checked<'a>(&'a self, id: &'a str) -> Checked<'a, BatchJob> {
+        within_checked(self.read, self.inner.job_checked(id))
+    }
+    fn files_checked<'a>(&'a self, id: &'a str) -> Checked<'a, Vec<BatchFileDesc>> {
+        within_checked(self.read, self.inner.files_checked(id))
     }
     fn submit<'a>(&'a self, p: &'a SubmitJobParams) -> Fut<'a, BatchJob> {
         within(self.submit, self.inner.submit(p))

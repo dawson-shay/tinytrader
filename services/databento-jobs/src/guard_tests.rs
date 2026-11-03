@@ -75,6 +75,8 @@ struct FakeState {
     stop_at: Option<(usize, bool)>,
     /// Each job's files, as Databento lists them.
     files: HashMap<String, Vec<BatchFileDesc>>,
+    /// Listing these jobs' files fails with this HTTP status and message.
+    files_fail: HashMap<String, (Option<u16>, String)>,
     costed: Vec<(Vec<String>, had::Window)>,
     /// Errors the next prices answer with, in turn.
     cost_errors: std::collections::VecDeque<String>,
@@ -107,6 +109,14 @@ fn not_faked<'a, T: Send + 'a>() -> Fut<'a, T> {
 }
 
 impl api::Databento for Fake {
+    fn files_checked<'a>(&'a self, id: &'a str) -> api::Checked<'a, Vec<BatchFileDesc>> {
+        Box::pin(async move {
+            if let Some((status, message)) = lock(&self.s).files_fail.get(id).cloned() {
+                return Err(api::CallError { status, message });
+            }
+            self.files(id).await.map_err(api::CallError::from)
+        })
+    }
     fn list_jobs<'a>(&'a self, p: &'a ListJobsParams) -> Fut<'a, Vec<BatchJobShort>> {
         Box::pin(async move {
             let mut s = lock(&self.s);
@@ -2834,6 +2844,44 @@ async fn a_stalled_or_dead_cache_job_never_holds_up_the_rest() {
     let (state, err) = cache_done(&r, "OPRA-T3").await;
     assert_eq!(state, "failed");
     assert!(err.unwrap().contains("expired"));
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// Permanent or not is decided on the HTTP status, never the error's text: a
+/// 404 fails the job, while a message that merely contains "404" and "429" (a
+/// job id, a request id) with no status is tried again.
+#[tokio::test]
+async fn a_listing_error_is_judged_by_its_status_not_its_text() {
+    let folder = cache_folder("status");
+    let dir = folder.clone();
+    let r = rig_with("cache-status", move |j| j.cache_dir = Some(dir)).await;
+    cache_job(&r, "OPRA-20240401-X404", DBN_BYTES_SHA256);
+    cache_job(&r, "OPRA-GONE", DBN_BYTES_SHA256);
+    {
+        let mut f = lock(&r.fake.s);
+        f.files_fail.insert(
+            "OPRA-20240401-X404".into(),
+            (
+                None,
+                "req-4290400 failed: connection reset; job OPRA-20240401-X404".into(),
+            ),
+        );
+        f.files_fail
+            .insert("OPRA-GONE".into(), (Some(404), "not found".into()));
+    }
+    for id in ["OPRA-20240401-X404", "OPRA-GONE"] {
+        let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(id.into())).await;
+        assert_eq!(code, StatusCode::ACCEPTED);
+    }
+    let (state, err) = cache_done(&r, "OPRA-GONE").await;
+    assert_eq!(state, "failed");
+    assert!(err.unwrap().contains("404"));
+    cache_state(&r, "OPRA-20240401-X404", "retrying").await;
+    lock(&r.fake.s).files_fail.remove("OPRA-20240401-X404");
+    assert_eq!(
+        cache_done(&r, "OPRA-20240401-X404").await,
+        ("cached".into(), None)
+    );
     let _ = std::fs::remove_dir_all(&folder);
 }
 

@@ -2859,37 +2859,26 @@ enum CacheError {
     Permanent(String),
 }
 
-/// Whether Databento's answer was a client error that asking again won't
-/// change (400, 401, 403, 404, 410, 422; never 429). The client reports its
-/// errors as text, which carries the status.
-fn client_error(e: &str) -> bool {
-    !e.contains("429")
-        && [
-            "400",
-            "401",
-            "403",
-            "404",
-            "410",
-            "422",
-            "not found",
-            "expired",
-        ]
-        .iter()
-        .any(|c| e.to_ascii_lowercase().contains(c))
-}
-
 /// Why a job's files couldn't be listed: permanent if the job has expired, is
-/// no longer done, or Databento says no (a 4xx); otherwise transient.
-async fn listing_error(jobs: &Jobs, job: &str, e: String) -> CacheError {
-    match jobs.db.job(job).await {
+/// no longer done, or Databento answered a status that asking again won't
+/// change (a 4xx but 408 and 429); otherwise transient. Decided on the job's
+/// state and the HTTP status, never on the error's text.
+async fn listing_error(jobs: &Jobs, job: &str, e: api::CallError) -> CacheError {
+    match jobs.db.job_checked(job).await {
         Ok(j) if j.state == JobState::Expired => {
             CacheError::Permanent(format!("the job has expired: {e}"))
         }
         Ok(j) if j.state != JobState::Done => {
             CacheError::Permanent(format!("the job is no longer done: {e}"))
         }
-        Err(e2) if client_error(&e2) => CacheError::Permanent(format!("the job: {e2}")),
-        _ if client_error(&e) => CacheError::Permanent(format!("list files: {e}")),
+        Err(e2) if e2.permanent() => CacheError::Permanent(format!(
+            "the job: Databento answered {}: {e2}",
+            e2.status.unwrap_or_default()
+        )),
+        _ if e.permanent() => CacheError::Permanent(format!(
+            "list files: Databento answered {}: {e}",
+            e.status.unwrap_or_default()
+        )),
         _ => CacheError::Transient(format!("list files: {e}")),
     }
 }
@@ -2962,7 +2951,7 @@ async fn fetch_to_cache(
 ) -> Result<usize, CacheError> {
     use CacheError::{Permanent, Transient};
     use std::os::unix::fs::PermissionsExt as _;
-    let files = match jobs.db.files(job).await {
+    let files = match jobs.db.files_checked(job).await {
         Ok(f) => f,
         Err(e) => return Err(listing_error(jobs, job, e).await),
     };
