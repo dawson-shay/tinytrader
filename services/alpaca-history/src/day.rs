@@ -298,10 +298,36 @@ fn write_batches(
     Ok((main_dir, cond_dir, outcome))
 }
 
+/// A filing that didn't happen: the store busy past the wait (`busy`: try the day
+/// again later, keeping its spool), or a refusal or error.
+#[derive(Debug)]
+pub struct FileError {
+    pub busy: bool,
+    pub message: String,
+}
+
+impl From<String> for FileError {
+    fn from(message: String) -> Self {
+        Self { busy: false, message }
+    }
+}
+
+impl From<&str> for FileError {
+    fn from(message: &str) -> Self {
+        Self { busy: false, message: message.to_owned() }
+    }
+}
+
+/// How long a busy store (its filing queue full, 503) is waited for, asking again
+/// longer apart each time.
+const BUSY_WAIT: std::time::Duration =
+    if cfg!(test) { std::time::Duration::from_millis(300) } else { std::time::Duration::from_secs(15 * 60) };
+
 /// Hand a batch folder to the store: every file into its incoming area
 /// (checked by size and SHA-256 on arrival), then file it. `token` is the
-/// store's write token, when it requires one.
-pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batch_dir: &Path) -> Result<Value, String> {
+/// store's write token, when it requires one. A busy store (503) is waited for,
+/// up to `BUSY_WAIT`; past that the error is `busy`.
+pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batch_dir: &Path) -> Result<Value, FileError> {
     let write = |req: reqwest::RequestBuilder| match token {
         Some(t) => req.bearer_auth(t),
         None => req,
@@ -321,17 +347,85 @@ pub async fn file(http: &reqwest::Client, store: &str, token: Option<&str>, batc
             .await
             .map_err(|e| format!("store: {e}"))?;
         if !r.status().is_success() {
-            return Err(format!("store refused {name}: {} {}", r.status(), r.text().await.unwrap_or_default()));
+            return Err(format!("store refused {name}: {} {}", r.status(), r.text().await.unwrap_or_default()).into());
         }
     }
-    let r = write(http.post(format!("{store}/incorporate/alpaca/{id}")))
-        .send()
-        .await
-        .map_err(|e| format!("store: {e}"))?;
+    let until = std::time::Instant::now() + BUSY_WAIT;
+    let mut wait = std::time::Duration::from_millis(if cfg!(test) { 10 } else { 5_000 });
+    let r = loop {
+        let r = write(http.post(format!("{store}/incorporate/alpaca/{id}")))
+            .send()
+            .await
+            .map_err(|e| format!("store: {e}"))?;
+        if r.status() != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            break r;
+        }
+        if std::time::Instant::now() + wait > until {
+            return Err(FileError { busy: true, message: format!("the store stayed busy filing {id}") });
+        }
+        tokio::time::sleep(wait).await;
+        wait = (wait * 2).min(std::time::Duration::from_secs(60));
+    };
     let status = r.status();
     let v: Value = r.json().await.unwrap_or(Value::Null);
     if !status.is_success() {
-        return Err(format!("store didn't file {id}: {status} {v}"));
+        return Err(format!("store didn't file {id}: {status} {v}").into());
     }
     Ok(v)
 }
+
+#[cfg(test)]
+mod filing_tests {
+    use super::file;
+    use axum::routing::{post, put};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// A store answering incorporate 503 `busy` times, then filing.
+    async fn store(busy: u32) -> String {
+        let left = Arc::new(AtomicU32::new(busy));
+        let app = axum::Router::new().route("/incoming/alpaca/{id}/{name}", put(|| async { "ok" })).route(
+            "/incorporate/alpaca/{id}",
+            post(move || {
+                let left = Arc::clone(&left);
+                async move {
+                    if left.load(Ordering::SeqCst) > 0 {
+                        left.fetch_sub(1, Ordering::SeqCst);
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, r#"{"error":"busy"}"#);
+                    }
+                    (axum::http::StatusCode::OK, r#"{"filed":true}"#)
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        format!("http://{addr}")
+    }
+
+    fn batch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("ah-filing-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("x.dbn"), b"x").unwrap();
+        d
+    }
+
+    /// A busy store is waited for, and then the batch is filed.
+    #[tokio::test]
+    async fn a_busy_store_is_waited_for() {
+        let url = store(2).await;
+        let r = file(&reqwest::Client::new(), &url, None, &batch("wait")).await;
+        assert!(r.is_ok(), "{r:?}");
+    }
+
+    /// One busy past the wait is a `busy` error: the day is tried again, its spool
+    /// kept.
+    #[tokio::test]
+    async fn a_store_busy_past_the_wait_is_busy() {
+        let url = store(1000).await;
+        let e = file(&reqwest::Client::new(), &url, None, &batch("busy")).await.unwrap_err();
+        assert!(e.busy, "{e:?}");
+    }
+}
+

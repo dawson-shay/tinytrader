@@ -100,8 +100,6 @@ capability is the exception ([decision 0004](docs/decisions/0004-nix-not-nixos.m
   whole store's filing, say) is a defect to shard or replace with an owner.
 - Read-mostly counters and flags are atomics; values set once are `OnceLock`s.
 - Known debt, to fix when the code is touched (not yet compliant):
-  - `services/store`: the global `filing` mutex over all filing (decision 0024
-    proposes a lock per day).
   - `services/databento-jobs`, `libs/fleet`, `services/alpaca-account`,
     `libs/observe`, `services/relay` (its hub): shared state behind mutexes.
   - `services/queue`: a job's output chunks on an unbounded channel.
