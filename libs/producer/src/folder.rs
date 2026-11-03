@@ -278,6 +278,7 @@ impl Holdings for Folder {
                             .filter(|f| f.days.0 <= ymd && ymd <= f.days.1)
                             .filter(|f| f.symbol.as_ref().is_none_or(|s| s == &q.symbol))
                             .map(|f| FileRef {
+                                route: Vec::new(),
                                 name: f.name.clone(),
                                 sha256: Some(f.sha256.clone()),
                             })
@@ -346,6 +347,7 @@ impl Holdings for Folder {
                                 files: files
                                     .iter()
                                     .map(|p| FileRef {
+                                        route: Vec::new(),
                                         name: rel(p),
                                         sha256: None,
                                     })

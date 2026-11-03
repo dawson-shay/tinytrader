@@ -46,7 +46,7 @@ use dbn::{
     VersionUpgradePolicy,
 };
 use filter::DayFilter;
-use hashing::Hashed;
+use hashing::{Digest, Hashed};
 use std::collections::{BTreeSet, VecDeque};
 use std::io::{BufReader, Read};
 use std::str::FromStr;
@@ -72,6 +72,9 @@ pub struct FileRef {
     pub name: String,
     /// The SHA-256 the holdings state for it, if any.
     pub sha256: Option<String>,
+    /// Which layer of a [`Layered`] holdings planned it, outermost first; empty
+    /// elsewhere.
+    pub route: Vec<usize>,
 }
 
 /// What the holdings have for one day.
@@ -117,18 +120,13 @@ pub trait Holdings: Send {
 /// ranges, or a local copy before the store.
 pub struct Layered {
     layers: Vec<Box<dyn Holdings>>,
-    /// Which layer each planned file comes from.
-    owner: std::sync::Mutex<std::collections::HashMap<String, usize>>,
 }
 
 impl Layered {
     /// `layers` in the order they're asked.
     #[must_use]
     pub fn new(layers: Vec<Box<dyn Holdings>>) -> Self {
-        Self {
-            layers,
-            owner: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
+        Self { layers }
     }
 }
 
@@ -144,7 +142,6 @@ impl Holdings for Layered {
             .iter()
             .map(|h| h.plan(query, days))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut owner = self.owner.lock().map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         for i in 0..days.len() {
             // The first layer holding the day whole; failing that, the first holding
@@ -155,12 +152,14 @@ impl Holdings for Layered {
             let any = plans.iter().position(|p| matches!(&p[i], Day::Held { .. }));
             match whole.or(any) {
                 Some(k) => {
-                    if let Day::Held { files, .. } = &plans[k][i] {
+                    // Each file carries the layer it comes from, for `open`.
+                    let mut day = plans[k][i].clone();
+                    if let Day::Held { files, .. } = &mut day {
                         for f in files {
-                            owner.insert(f.name.clone(), k);
+                            f.route.insert(0, k);
                         }
                     }
-                    out.push(plans[k][i].clone());
+                    out.push(day);
                 }
                 None => {
                     let reasons: Vec<String> = plans
@@ -180,13 +179,18 @@ impl Holdings for Layered {
     }
 
     fn open(&self, file: &FileRef) -> Result<Box<dyn Read + Send>, String> {
-        let k = *self
-            .owner
-            .lock()
-            .map_err(|e| e.to_string())?
-            .get(&file.name)
-            .ok_or_else(|| format!("{}: not planned", file.name))?;
-        self.layers[k].open(file)
+        let (&k, rest) = file
+            .route
+            .split_first()
+            .ok_or_else(|| format!("{}: not planned here", file.name))?;
+        let layer = self
+            .layers
+            .get(k)
+            .ok_or_else(|| format!("{}: no layer {k}", file.name))?;
+        layer.open(&FileRef {
+            route: rest.to_vec(),
+            ..file.clone()
+        })
     }
 
     fn local(&self) -> bool {
@@ -242,7 +246,7 @@ pub struct StoreProducer {
     state: State,
     queued: VecDeque<RecordBuf>,
     cur: Option<RecordBuf>,
-    reading: Vec<(FileRef, Hashed, bool)>,
+    reading: Vec<(FileRef, Digest, bool)>,
     pins: Vec<DayPin>,
     /// Options expiring more than this many days after each day are left out.
     expiries_within_days: Option<u32>,
@@ -457,16 +461,16 @@ impl StoreProducer {
                         && let Some(want) = &f.sha256
                     {
                         // Checked before any of its records is released.
-                        let (got, _) = Hashed::new(self.holdings.open(f)?)
-                            .finish()
+                        let (got, _) = hashing::hash_all(self.holdings.open(f)?)
                             .map_err(|e| format!("{}: {e}", f.name))?;
                         if !got.eq_ignore_ascii_case(want) {
                             return Err(format!("{}: SHA-256 {got}, but {want} is stated", f.name));
                         }
                     }
                     let h = Hashed::new(self.holdings.open(f)?);
+                    let digest = h.digest();
                     let dec = DynDecoder::inferred_with_buffer(
-                        BufReader::new(h.clone()),
+                        BufReader::new(h),
                         VersionUpgradePolicy::UpgradeToV3,
                     )
                     .map_err(|e| format!("{}: {e}", f.name))?;
@@ -478,8 +482,10 @@ impl StoreProducer {
                             && !meta.symbols.is_empty()
                             && !meta.symbols.contains(&self.query.symbol))
                     {
+                        // A sidecar is hashed for the pins too, then dropped.
+                        digest.keep();
                         drop(dec);
-                        self.reading.push((f.clone(), h, false));
+                        self.reading.push((f.clone(), digest, false));
                         continue;
                     }
                     let to_ns = |d: time::Date| {
@@ -534,7 +540,7 @@ impl StoreProducer {
                         filtered = filtered.horizon(day, n, denied);
                     }
                     sources.push(DbnSource::new(filtered, 0));
-                    self.reading.push((f.clone(), h, true));
+                    self.reading.push((f.clone(), digest, true));
                 }
                 self.pins.push(DayPin {
                     day,
@@ -550,10 +556,15 @@ impl StoreProducer {
 
     /// Finishes the day being read: drains and checks each file's hash.
     fn end_day(&mut self) -> Result<(), String> {
+        // Dropping the day's decoders drains their files and publishes the hashes.
+        for (_, digest, _) in &self.reading {
+            digest.keep();
+        }
+        self.state = State::Next;
         let reading = std::mem::take(&mut self.reading);
         let pin = self.pins.last_mut().ok_or("no day being read")?;
-        for (f, h, used) in reading {
-            let (sha256, bytes) = h.finish().map_err(|e| format!("{}: {e}", f.name))?;
+        for (f, digest, used) in reading {
+            let (sha256, bytes) = digest.get().map_err(|e| format!("{}: {e}", f.name))?;
             let verified = match &f.sha256 {
                 Some(want) if !want.eq_ignore_ascii_case(&sha256) => {
                     return Err(format!(

@@ -2,7 +2,7 @@
 //! connection, and the bounded outbound queue (`slow_consumer` on overflow).
 use crate::broker::Broker;
 use crate::journal::Journal;
-use crate::protocol::{Line, LineError, MAX_LINE, Obj, error_line, parse_line};
+use crate::protocol::{Line, LineError, MAX_LINE, Obj, Op, error_line, parse_line};
 use crate::session::{Input, Session};
 use sha2::{Digest, Sha256};
 use std::collections::VecDeque;
@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::sync::mpsc::{Sender, channel};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -163,7 +163,7 @@ pub fn check_state_under(state: &Path, forbidden: &[PathBuf]) -> Result<(), Stri
 }
 
 pub(crate) struct Outbox {
-    st: Mutex<(VecDeque<String>, usize, bool)>,
+    st: Mutex<(VecDeque<String>, usize, bool, bool)>,
     cv: Condvar,
     limit: usize,
 }
@@ -175,9 +175,9 @@ enum Pop {
 }
 
 impl Outbox {
-    fn new(limit: usize) -> Self {
+    pub(crate) fn new(limit: usize) -> Self {
         Self {
-            st: Mutex::new((VecDeque::new(), 0, false)),
+            st: Mutex::new((VecDeque::new(), 0, false, false)),
             cv: Condvar::new(),
             limit,
         }
@@ -200,17 +200,36 @@ impl Outbox {
                 "outbound queue overflow; resume to recover",
             ));
             g.2 = true;
+            g.3 = true;
             self.cv.notify_all();
             return false;
         }
         g.1 += size;
         g.0.extend(lines);
+        g.3 = true;
         self.cv.notify_all();
         true
+    }
+
+    /// Whether it's closed.
+    pub(crate) fn closed(&self) -> bool {
+        self.st.lock().unwrap_or_else(PoisonError::into_inner).2
+    }
+
+    /// Waits until the session has written to it (its welcome) or it's closed (its
+    /// hello refused), at most `wait`; whether it was written to and is open.
+    fn wait_started(&self, wait: Duration) -> bool {
+        let g = self.st.lock().unwrap_or_else(PoisonError::into_inner);
+        let (g, _) = self
+            .cv
+            .wait_timeout_while(g, wait, |g| !g.3 && !g.2)
+            .unwrap_or_else(PoisonError::into_inner);
+        g.3 && !g.2
     }
     /// Queues a final line (if any) after the pending ones and closes.
     pub(crate) fn close(&self, last: Option<String>) {
         let mut g = self.st.lock().unwrap_or_else(PoisonError::into_inner);
+        g.3 = true;
         if !g.2 {
             g.0.extend(last);
             g.2 = true;
@@ -305,16 +324,79 @@ struct Shared {
     clients: Vec<ClientSpec>,
     timing: Timing,
     last_seq: Arc<AtomicU64>,
-    tx: Mutex<Sender<Input>>,
+    tx: SyncSender<Input>,
+    /// The urgent inputs (kill, flatten, clear_order), which the session takes before
+    /// anything in the inbox.
+    urgent: SyncSender<Input>,
+    /// A session clocks the broker: requests wait for room rather than get `busy`.
+    lockstep: bool,
+    /// Per client: order messages (submits, cancels) answered `busy`, which a session's
+    /// clock counts as handled.
+    refused: Arc<Vec<AtomicU64>>,
 }
 
+/// Inputs the account session may have waiting: past it, a request is answered
+/// `busy` at once and never reaches the session.
+pub(crate) const INBOX: usize = 1024;
+
+/// Urgent inputs the session may have waiting; a sender waits past that.
+pub(crate) const URGENT: usize = 64;
+
 impl Shared {
+    /// A connection's lifecycle (hello, closed): waits for room, as the session
+    /// must see it.
     fn send(&self, input: Input) {
-        let _ = self
-            .tx
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .send(input);
+        let _ = self.tx.send(input);
+    }
+
+    /// A request: queued if there's room, else answered `busy` on the connection,
+    /// with nothing sent to the broker. A safety request (cancel, kill, unkill,
+    /// flatten, clear) is never refused: it waits for room.
+    fn request(&self, ob: &Outbox, client: usize, input: Input) {
+        let op = match &input {
+            Input::Request {
+                request: Ok((_, op)),
+                ..
+            } => Some(op),
+            _ => None,
+        };
+        // Urgent: ahead of the inbox (a kill refuses what's queued behind it as it
+        // comes up). An unkill and a cancel keep their places, in order, but never get
+        // `busy`: they wait for room.
+        if matches!(
+            op,
+            Some(Op::Kill { .. } | Op::Flatten { .. } | Op::ClearOrder { .. })
+        ) {
+            let _ = self.urgent.send(input);
+            return;
+        }
+        // Under a session's clock nothing is `busy` (whether a request found the inbox
+        // full would depend on timing, and a run must repeat): it waits for room.
+        if self.lockstep || matches!(op, Some(Op::Cancel(_) | Op::Unkill)) {
+            let _ = self.tx.send(input);
+            return;
+        }
+        match self.tx.try_send(input) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(Input::Request { request, .. })) => {
+                let (rid, op) = match &request {
+                    Ok((rid, op)) => (rid.clone(), crate::session::op_name(op).to_owned()),
+                    Err((rid, op, _)) => (rid.clone().unwrap_or_default(), op.clone()),
+                };
+                if matches!(op.as_str(), "submit" | "cancel")
+                    && let Some(n) = self.refused.get(client)
+                {
+                    n.fetch_add(1, SeqCst);
+                }
+                ob.push(crate::protocol::request_error(
+                    &rid,
+                    &op,
+                    "busy",
+                    &Obj::new().n("inbox", INBOX).done(),
+                ));
+            }
+            Err(TrySendError::Full(_)) => {}
+        }
     }
 }
 
@@ -358,6 +440,16 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
         resume: hello.resume_after,
         cancel_on_disconnect: hello.cancel_on_disconnect,
     });
+    // From here the session holds the connection: however this ends, it hears so.
+    let _closing = Closing { sh, id };
+    // No request is read until the session has answered the hello, so nothing (a
+    // `busy`, say) goes out before the welcome, or to a client it refuses.
+    if !ob.wait_started(sh.timing.hello) {
+        return fatal(
+            "hello_timeout",
+            "the account didn't answer the hello in time",
+        );
+    }
     let _ = stream.set_read_timeout(Some(sh.timing.idle));
     loop {
         match read_line(&mut r, &mut buf) {
@@ -374,10 +466,14 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
         }
         match parse_line(&buf) {
             Ok(Line::Heartbeat) => {}
-            Ok(Line::Request { request_id, op }) => sh.send(Input::Request {
-                id,
-                request: Ok((request_id, op)),
-            }),
+            Ok(Line::Request { request_id, op }) => sh.request(
+                &ob,
+                client,
+                Input::Request {
+                    id,
+                    request: Ok((request_id, op)),
+                },
+            ),
             Ok(Line::Hello(_)) => {
                 fatal("hello_required", "hello only once");
                 break;
@@ -390,19 +486,34 @@ fn connection(stream: &TcpStream, id: u64, sh: &Shared) {
                 request_id,
                 op,
                 invalid,
-            }) => sh.send(Input::Request {
-                id,
-                request: Err((request_id, op, invalid)),
-            }),
+            }) => sh.request(
+                &ob,
+                client,
+                Input::Request {
+                    id,
+                    request: Err((request_id, op, invalid)),
+                },
+            ),
         }
     }
-    sh.send(Input::Closed(id));
+}
+
+/// Tells the session a connection has ended, when dropped.
+struct Closing<'a> {
+    sh: &'a Shared,
+    id: u64,
+}
+
+impl Drop for Closing<'_> {
+    fn drop(&mut self) {
+        self.sh.send(Input::Closed(self.id));
+    }
 }
 
 /// A running account process.
 pub struct Gateway {
     addr: SocketAddr,
-    tx: Sender<Input>,
+    tx: SyncSender<Input>,
     stop: Arc<AtomicBool>,
     session: JoinHandle<Result<(), String>>,
 }
@@ -411,7 +522,7 @@ pub struct Gateway {
 /// market time advances the broker through this, never through a client connection.
 #[derive(Clone)]
 pub struct Clock {
-    tx: Sender<Input>,
+    tx: SyncSender<Input>,
 }
 
 impl Clock {
@@ -432,7 +543,7 @@ impl Clock {
         to: u64,
         wait: Duration,
     ) -> Result<crate::session::Advanced, String> {
-        let (reply, rx) = channel();
+        let (reply, rx) = sync_channel(1);
         self.tx
             .send(Input::Clock {
                 client: client.to_owned(),
@@ -497,15 +608,22 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
         TcpListener::bind(cfg.listen).map_err(|e| format!("bind {}: {e}", cfg.listen))?;
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let last_seq = Arc::new(AtomicU64::new(journal.last_seq));
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(INBOX);
+    let (urgent, urgent_rx) = sync_channel(URGENT);
+    let refused: Arc<Vec<AtomicU64>> =
+        Arc::new(cfg.clients.iter().map(|_| AtomicU64::new(0)).collect());
     let shared = Arc::new(Shared {
         clients: cfg.clients.clone(),
         timing: cfg.timing.clone(),
         last_seq: Arc::clone(&last_seq),
-        tx: Mutex::new(tx.clone()),
+        tx: tx.clone(),
+        urgent,
+        lockstep: broker.session_clocked(),
+        refused: Arc::clone(&refused),
     });
-    let session = Session::new(cfg, broker, journal, &recovered, last_seq);
-    let session = thread::spawn(move || session.run(&rx));
+    let mut session = Session::new(cfg, broker, journal, &recovered, last_seq);
+    session.refused = refused;
+    let session = thread::spawn(move || session.run(&rx, &urgent_rx));
     let stop = Arc::new(AtomicBool::new(false));
     let accept_stop = Arc::clone(&stop);
     thread::spawn(move || {
@@ -526,4 +644,185 @@ pub fn start<B: Broker + Send + 'static>(cfg: Config, broker: B) -> Result<Gatew
         stop,
         session,
     })
+}
+
+#[cfg(test)]
+mod inbox_tests {
+    use super::{Outbox, Pop, Shared, URGENT};
+    use crate::protocol::Op;
+    use crate::session::Input;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    /// With the inbox full, a request is answered `busy` on its connection at once,
+    /// and nothing more is queued.
+    #[test]
+    fn a_full_inbox_answers_busy() {
+        let (tx, rx) = sync_channel(1);
+        let sh = Shared {
+            clients: Vec::new(),
+            timing: crate::server::Timing::default(),
+            last_seq: Arc::new(AtomicU64::new(0)),
+            tx,
+            urgent: sync_channel(URGENT).0,
+            lockstep: false,
+            refused: Arc::new(vec![AtomicU64::new(0)]),
+        };
+        let ob = Outbox::new(1 << 20);
+        let req = |rid: &str| Input::Request {
+            id: 1,
+            request: Ok((rid.to_owned(), Op::Account)),
+        };
+        sh.request(&ob, 0, req("r1"));
+        sh.request(&ob, 0, req("r2"));
+        let Pop::Line(line) = ob.pop(Duration::from_millis(10)) else {
+            panic!("no answer for the second request");
+        };
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            (v["request_id"].as_str(), v["op"].as_str()),
+            (Some("r2"), Some("account"))
+        );
+        assert_eq!(
+            (v["outcome"].as_str(), v["code"].as_str()),
+            (Some("error"), Some("busy"))
+        );
+        assert!(matches!(rx.try_recv(), Ok(Input::Request { .. })));
+        assert!(rx.try_recv().is_err(), "only the first was queued");
+    }
+
+    fn shared(
+        cap: usize,
+    ) -> (
+        Shared,
+        std::sync::mpsc::Receiver<Input>,
+        std::sync::mpsc::Receiver<Input>,
+    ) {
+        let (tx, rx) = sync_channel(cap);
+        let (urgent, urgent_rx) = sync_channel(URGENT);
+        let sh = Shared {
+            clients: Vec::new(),
+            timing: crate::server::Timing::default(),
+            last_seq: Arc::new(AtomicU64::new(0)),
+            tx,
+            urgent,
+            lockstep: false,
+            refused: Arc::new(vec![AtomicU64::new(0)]),
+        };
+        (sh, rx, urgent_rx)
+    }
+
+    fn request(rid: &str, op: Op) -> Input {
+        Input::Request {
+            id: 1,
+            request: Ok((rid.to_owned(), op)),
+        }
+    }
+
+    fn rid(i: Input) -> String {
+        match i {
+            Input::Request {
+                request: Ok((rid, _)),
+                ..
+            } => rid,
+            _ => String::new(),
+        }
+    }
+
+    /// With the inbox full: a flatten goes ahead of it, on the urgent channel; a
+    /// cancel waits for room rather than being refused; a refused submit counts
+    /// toward a session clock's order messages, and its retry with the same id is
+    /// queued once there's room.
+    #[test]
+    fn safety_requests_never_get_busy() {
+        let (sh, rx, urgent) = shared(1);
+        let sh = Arc::new(sh);
+        let ob = Arc::new(Outbox::new(1 << 20));
+        sh.request(&ob, 0, request("r1", Op::Account));
+        sh.request(&ob, 0, request("r2", Op::Submit(serde_json::json!({}))));
+        assert!(
+            matches!(ob.pop(Duration::from_millis(10)), Pop::Line(_)),
+            "r2 busy"
+        );
+        assert_eq!(sh.refused[0].load(std::sync::atomic::Ordering::SeqCst), 1);
+        sh.request(
+            &ob,
+            0,
+            request(
+                "r3",
+                Op::Flatten {
+                    reason: "test".into(),
+                },
+            ),
+        );
+        assert_eq!(rid(urgent.try_recv().unwrap()), "r3", "ahead of the inbox");
+        let (sh2, ob2) = (Arc::clone(&sh), Arc::clone(&ob));
+        let cancel = std::thread::spawn(move || {
+            sh2.request(
+                &ob2,
+                0,
+                request(
+                    "r4",
+                    Op::Cancel(crate::broker::OrderRef::Client("x".into())),
+                ),
+            );
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!cancel.is_finished(), "a cancel waits for room");
+        assert!(
+            matches!(ob.pop(Duration::from_millis(10)), Pop::Idle),
+            "and isn't refused"
+        );
+        assert_eq!(rid(rx.recv().unwrap()), "r1");
+        cancel.join().unwrap();
+        assert_eq!(rid(rx.recv().unwrap()), "r4");
+        sh.request(&ob, 0, request("r2", Op::Submit(serde_json::json!({}))));
+        assert_eq!(rid(rx.recv().unwrap()), "r2");
+    }
+
+    /// A connection reads no request until its welcome is written; a hello refused,
+    /// or never answered, ends it.
+    #[test]
+    fn requests_wait_for_the_welcome() {
+        let ob = Outbox::new(1 << 20);
+        assert!(
+            !ob.wait_started(Duration::from_millis(10)),
+            "never answered"
+        );
+        ob.push("{\"type\":\"welcome\"}".into());
+        assert!(ob.wait_started(Duration::from_millis(10)));
+        let refused = Outbox::new(1 << 20);
+        refused.close(Some("{\"type\":\"error\"}".into()));
+        assert!(!refused.wait_started(Duration::from_millis(10)));
+    }
+
+    /// Under a session's clock a full inbox makes a request wait (a run must repeat,
+    /// and `busy` would depend on timing); an unkill waits in the inbox, in order.
+    #[test]
+    fn lockstep_and_unkill_wait_for_room() {
+        for (lockstep, op) in [
+            (true, Op::Submit(serde_json::json!({}))),
+            (false, Op::Unkill),
+        ] {
+            let (mut sh, rx, urgent) = shared(1);
+            sh.lockstep = lockstep;
+            let sh = Arc::new(sh);
+            let ob = Arc::new(Outbox::new(1 << 20));
+            sh.request(&ob, 0, request("r1", Op::Account));
+            let (sh2, ob2) = (Arc::clone(&sh), Arc::clone(&ob));
+            let waiting = std::thread::spawn(move || sh2.request(&ob2, 0, request("r2", op)));
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(!waiting.is_finished(), "waits for room");
+            assert!(
+                matches!(ob.pop(Duration::from_millis(10)), Pop::Idle),
+                "not busy"
+            );
+            assert!(urgent.try_recv().is_err(), "not ahead of the inbox");
+            assert_eq!(rid(rx.recv().unwrap()), "r1");
+            waiting.join().unwrap();
+            assert_eq!(rid(rx.recv().unwrap()), "r2");
+        }
+    }
 }

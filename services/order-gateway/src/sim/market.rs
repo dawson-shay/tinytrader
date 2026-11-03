@@ -13,7 +13,10 @@ use std::io::{BufReader, Read};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError, sync_channel};
+
+/// Records a venue's feed may hold ahead of its clock.
+pub(crate) const FEED: usize = 1_000_000;
 
 /// One applied input record.
 #[derive(Clone, Debug)]
@@ -54,7 +57,7 @@ pub(crate) struct QuoteSource {
 /// more has happened yet: the simulator never waits on it.
 #[derive(Clone)]
 pub struct Feed {
-    tx: Sender<(u64, RecordBuf)>,
+    tx: SyncSender<(u64, RecordBuf)>,
     /// The time of the last record pushed.
     last: Arc<AtomicU64>,
     /// The time the simulator has been advanced to, which the simulator keeps.
@@ -79,9 +82,15 @@ impl Feed {
             return Err(format!("a record at {ts}, but the simulator is at {floor}"));
         }
         let buf = RecordBuf::try_from(rec).map_err(|e| e.to_string())?;
-        self.tx
-            .send((ts, buf))
-            .map_err(|_| "the simulator has stopped".to_owned())?;
+        // Bounded: the session pushes a step's records before it advances the
+        // simulator, so a full feed is a step larger than any book could need, and
+        // the run stops saying so rather than waiting on itself.
+        self.tx.try_send((ts, buf)).map_err(|e| match e {
+            TrySendError::Full(_) => {
+                format!("the venue's feed is full: more than {FEED} records ahead of its clock")
+            }
+            TrySendError::Disconnected(_) => "the simulator has stopped".to_owned(),
+        })?;
         self.last.store(ts, Ordering::SeqCst);
         Ok(())
     }
@@ -197,7 +206,12 @@ impl QuoteSource {
     /// The source and its feed; the simulator stores its market time in `floor` after
     /// each advance.
     pub(crate) fn feed(pin: String, floor: Arc<AtomicU64>) -> (Self, Feed) {
-        let (tx, rx) = channel();
+        Self::feed_of(pin, floor, FEED)
+    }
+
+    /// A feed holding at most `cap` records ahead of the simulator.
+    fn feed_of(pin: String, floor: Arc<AtomicU64>, cap: usize) -> (Self, Feed) {
+        let (tx, rx) = sync_channel(cap);
         let src = Self {
             input: Input::Feed(rx),
             peeked: None,
@@ -238,5 +252,28 @@ impl QuoteSource {
 
     pub(crate) fn next(&mut self) -> Option<(u64, Rec)> {
         self.peeked.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::QuoteSource;
+    use dbn::{RecordRef, SystemMsg};
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicU64;
+
+    /// A full feed refuses a record, saying so, rather than waiting on a simulator
+    /// that only drains it when advanced.
+    #[test]
+    fn a_full_feed_refuses_and_says_so() {
+        let (_src, feed) = QuoteSource::feed_of(String::new(), Arc::new(AtomicU64::new(0)), 2);
+        let msg = |ts: u64| SystemMsg::heartbeat(ts);
+        for ts in 1..=2 {
+            let m = msg(ts);
+            feed.push(ts, RecordRef::from(&m)).unwrap();
+        }
+        let m = msg(3);
+        let e = feed.push(3, RecordRef::from(&m)).unwrap_err();
+        assert!(e.contains("feed is full"), "{e}");
     }
 }

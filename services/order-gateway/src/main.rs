@@ -12,7 +12,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::mpsc::{RecvTimeoutError, channel};
+use std::sync::mpsc::{RecvTimeoutError, sync_channel};
 use std::time::Duration;
 
 const HELP: &str = "order-gateway --account NAME --broker sim|alpaca-paper|alpaca-live --listen 127.0.0.1:PORT --state DIR
@@ -360,7 +360,7 @@ fn serve<B: Broker + Send + 'static>(cfg: &Config, broker: Result<B, String>) ->
     if cfg.profile.underlyings.is_empty() && cfg.profile.any_underlying_clients.is_empty() {
         eprintln!("order-gateway: no --underlyings: every option order is refused");
     }
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(1);
     match Signals::new([SIGINT, SIGTERM]) {
         Ok(mut signals) => {
             std::thread::spawn(move || {

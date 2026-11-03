@@ -643,6 +643,7 @@ fn a_store_name_that_climbs_out_is_refused() {
     let store = StoreApi::with_retry("http://127.0.0.1:9", quick(0));
     let e = store
         .open(&tinytrader_producer::FileRef {
+            route: Vec::new(),
             name: "vol/../catalog".into(),
             sha256: None,
         })
