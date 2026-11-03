@@ -279,6 +279,8 @@ struct StoreState {
     /// taken.
     incorporate_busy: u32,
     incorporate_delay_ms: u64,
+    /// Downloads (`/dl/...`) answered 500 before one is served.
+    dl_fail: u32,
 }
 
 /// A definition day (zstd DBN) listing these contracts, all expiring on `DAY`.
@@ -334,6 +336,7 @@ fn ready_store() -> StoreState {
         incorporate_error: None,
         incorporate_busy: 0,
         incorporate_delay_ms: 0,
+        dl_fail: 0,
     }
 }
 
@@ -428,7 +431,17 @@ async fn serve_store(state: StoreHandle) -> String {
                 },
             ),
         )
-        .route("/dl/{file}", get(|| async { "dbn bytes" }))
+        .route(
+            "/dl/{file}",
+            get(|AxState(s): AxState<StoreHandle>| async move {
+                let mut s = lock(&s);
+                if s.dl_fail > 0 {
+                    s.dl_fail -= 1;
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "down");
+                }
+                (StatusCode::OK, "dbn bytes")
+            }),
+        )
         .route(
             "/health",
             get(|AxState(s): AxState<StoreHandle>| async move { Json(json!({ "state": lock(&s).health })) }),
@@ -2573,6 +2586,130 @@ async fn a_cached_file_that_fails_its_checksum_is_not_kept() {
     assert!(err.unwrap().contains("SHA-256"));
     let left: Vec<_> = std::fs::read_dir(folder.join("OPRA-K2")).unwrap().collect();
     assert!(left.is_empty(), "{left:?}");
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+fn cache_rows(v: &Value) -> Vec<(String, String, Option<u64>)> {
+    v["cache"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| {
+            (
+                r["job"].as_str().unwrap().to_owned(),
+                r["state"].as_str().unwrap().to_owned(),
+                r["position"].as_u64(),
+            )
+        })
+        .collect()
+}
+
+/// A cache request made while capture is live is accepted, queued and shown,
+/// and runs once capture ends: one at a time, in the order asked.
+#[tokio::test]
+async fn a_cache_request_during_capture_runs_when_capture_ends() {
+    let folder =
+        std::env::temp_dir().join(format!("tinytrader-jobs-cache-live-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&folder);
+    let dir = folder.clone();
+    let r = rig_with("cache-live", move |j| {
+        j.cache_dir = Some(dir);
+        j.yield_to = vec![("relay".into(), j.store.clone())];
+    })
+    .await;
+    lock(&r.store).health = "ready";
+    cache_job(&r, "OPRA-L1", DBN_BYTES_SHA256);
+    cache_job(&r, "OPRA-L2", DBN_BYTES_SHA256);
+    for id in ["OPRA-L1", "OPRA-L2"] {
+        let (code, Json(v)) = cache(AxState(r.jobs.clone()), UrlPath(id.into())).await;
+        assert_eq!(
+            (code, v["state"].as_str()),
+            (StatusCode::ACCEPTED, Some("queued")),
+            "{v}"
+        );
+        assert!(folder.join(id).join("REQUESTED").exists());
+    }
+    // Asked again while queued: refused, not queued twice.
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-L2".into())).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    let mut rows = Vec::new();
+    for _ in 0..300 {
+        let (_, Json(v)) = cache_list(AxState(r.jobs.clone())).await;
+        rows = cache_rows(&v);
+        if rows.first().is_some_and(|r| r.1.starts_with("waiting")) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        rows,
+        [
+            (
+                "OPRA-L1".to_owned(),
+                "waiting: relay is live".to_owned(),
+                None
+            ),
+            ("OPRA-L2".to_owned(), "queued".to_owned(), Some(1)),
+        ]
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        !folder.join("OPRA-L1/COMPLETE").exists(),
+        "nothing while capture is live"
+    );
+    lock(&r.store).health = "idle";
+    assert_eq!(cache_done(&r, "OPRA-L1").await, ("cached".into(), None));
+    assert_eq!(cache_done(&r, "OPRA-L2").await, ("cached".into(), None));
+    assert!(
+        !folder.join("OPRA-L1/REQUESTED").exists(),
+        "the request has ended"
+    );
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// Databento failing for a while (5xx) doesn't fail the request: it's tried
+/// again until the file arrives.
+#[tokio::test]
+async fn a_cache_download_that_fails_for_a_while_is_retried() {
+    let folder = std::env::temp_dir().join(format!(
+        "tinytrader-jobs-cache-retry-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&folder);
+    let dir = folder.clone();
+    let r = rig_with("cache-retry", move |j| j.cache_dir = Some(dir)).await;
+    lock(&r.store).dl_fail = 7;
+    cache_job(&r, "OPRA-R1", DBN_BYTES_SHA256);
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-R1".into())).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    assert_eq!(cache_done(&r, "OPRA-R1").await, ("cached".into(), None));
+    assert_eq!(lock(&r.store).dl_fail, 0);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
+/// A request a restart interrupted (its marker, no `COMPLETE`) is taken up again
+/// at startup; one that had finished isn't.
+#[tokio::test]
+async fn a_restart_resumes_unfinished_cache_requests() {
+    let folder = std::env::temp_dir().join(format!(
+        "tinytrader-jobs-cache-resume-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&folder);
+    for (id, complete) in [("OPRA-S1", false), ("OPRA-S2", true)] {
+        std::fs::create_dir_all(folder.join(id)).unwrap();
+        std::fs::write(folder.join(id).join("REQUESTED"), r#"{"requested_at": 1}"#).unwrap();
+        if complete {
+            std::fs::write(folder.join(id).join("COMPLETE"), "{}").unwrap();
+        }
+    }
+    let dir = folder.clone();
+    let r = rig_with("cache-resume", move |j| j.cache_dir = Some(dir)).await;
+    cache_job(&r, "OPRA-S1", DBN_BYTES_SHA256);
+    resume_caching(&r.jobs);
+    assert_eq!(cache_done(&r, "OPRA-S1").await, ("cached".into(), None));
+    assert!(lock(&r.jobs.caching).get("OPRA-S2").is_none());
+    assert!(!folder.join("OPRA-S2/REQUESTED").exists());
     let _ = std::fs::remove_dir_all(&folder);
 }
 
