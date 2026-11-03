@@ -1,6 +1,8 @@
 //! Market data relay (`tinytrader.relay/1`): holds one provider connection and
 //! serves its records to any number of local clients. It only forwards; it
 //! keeps no recording. See decision 0006 for the protocol.
+//! (`POST /replay`, replay.rs, writes a Databento replay to a file when asked
+//! to; that is not a recording of the stream.)
 //!
 //! A client connects over TCP and sends one line of JSON,
 //! `{"protocol":"tinytrader.relay/1"}`, optionally with
@@ -26,6 +28,7 @@ mod hours;
 mod hub;
 mod protocol;
 mod quotes;
+mod replay;
 mod session;
 mod source;
 mod tape;
@@ -119,6 +122,21 @@ struct Args {
     /// at any time of day.
     #[arg(long, env = "RELAY_ALPACA_TEST")]
     alpaca_test: bool,
+
+    /// Databento only: where `POST /replay` writes replay files (one day's
+    /// replay of every symbol, to DBN). `/replay` is off when unset.
+    #[arg(long, env = "RELAY_REPLAY_DIR")]
+    replay_dir: Option<std::path::PathBuf>,
+
+    /// Seconds a replay to file may take before it is given up (and kept as
+    /// a partial file).
+    #[arg(long, env = "RELAY_REPLAY_TIMEOUT", default_value_t = 1800)]
+    replay_timeout: u64,
+
+    /// Megabits a second a replay to file may read, at most; unlimited when
+    /// unset. A replay during market hours shares the link with the live feed.
+    #[arg(long, env = "RELAY_REPLAY_MAX_MBPS")]
+    replay_max_mbps: Option<f64>,
 }
 
 #[tokio::main]
@@ -137,6 +155,8 @@ async fn run(args: Args) -> Result<(), String> {
         Schema::from_str(&args.schema).map_err(|e| format!("--schema {}: {e}", args.schema))?;
     let stype_in = SType::from_str(&args.stype_in)
         .map_err(|e| format!("--stype-in {}: {e}", args.stype_in))?;
+    // The source's feed below names its own symbology.
+    let replay_stype = stype_in;
     let reference = args
         .reference
         .iter()
@@ -203,7 +223,7 @@ async fn run(args: Args) -> Result<(), String> {
     observer.describe(json!({
         "role": format!("Relays {dataset} {schema_name} for {} to local clients ({}).", args.symbols.join(", "), protocol::PROTOCOL),
         "upstream": [{ "id": provider_id, "label": provider_id, "sub": dataset, "kind": "flow", "via": via }],
-        "streams": { "events": "/events", "series": "/recent", "bars": "/bars", "quotes": "/quotes", "stats": "/stats", "tape": "/tape", "session": "/session", "clients": "/clients" },
+        "streams": { "events": "/events", "series": "/recent", "bars": "/bars", "quotes": "/quotes", "stats": "/stats", "tape": "/tape", "session": "/session", "replay": "/replay", "clients": "/clients" },
         "panels": [{ "heading": format!("{dataset} {}", args.symbols.join(", ")), "note": "Trade prices of the most active instruments, sampled once per second", "decimals": 2 }],
         "relay": { "protocol": protocol::PROTOCOL, "listen": args.listen, "symbols": args.symbols },
         // Relays carrying the same feed on the same hours are one line on a schedule.
@@ -217,12 +237,34 @@ async fn run(args: Args) -> Result<(), String> {
     // Bars for charts: the relay's own symbols, with history where the
     // source keeps it.
     hub.bars.keep(&args.symbols);
-    // Today's session for one contract, replayed on request (option relays on Databento).
-    let session = match args.source {
+    // Today's session for one contract, replayed on request (option relays
+    // on Databento), and replays to file; one at a time between them.
+    let turn = Arc::new(tokio::sync::Semaphore::new(1));
+    let (session, replays) = match args.source {
         Provider::Databento => {
-            session::Session::new(&secret("DATABENTO_API_KEY")?, &args.dataset, &args.symbols)
+            let key = secret("DATABENTO_API_KEY")?;
+            let session = session::Session::new(&key, &args.dataset, &args.symbols, turn.clone());
+            let replays = match &args.replay_dir {
+                Some(dir) => Ok(replay::Replays::new(
+                    &key,
+                    &args.dataset,
+                    &args.symbols,
+                    replay_stype,
+                    replay::Settings {
+                        dir: dir.clone(),
+                        timeout: Duration::from_secs(args.replay_timeout.max(1)),
+                        max_mbps: args.replay_max_mbps,
+                    },
+                    turn,
+                )),
+                None => Err("replay files are off on this relay: set RELAY_REPLAY_DIR".to_owned()),
+            };
+            (session, replays)
         }
-        Provider::AlpacaIex => None,
+        Provider::AlpacaIex => (
+            None,
+            Err("replay files are for Databento relays".to_owned()),
+        ),
     };
     let observe_at = listen_address("RELAY_OBSERVE_LISTEN", "127.0.0.1:9110");
     let app = observer
@@ -237,6 +279,7 @@ async fn run(args: Args) -> Result<(), String> {
         .merge(quotes::router(hub.clone()))
         .merge(tape::router(hub.clone()))
         .merge(session.clone().map(session::router).unwrap_or_default())
+        .merge(replay::router(replays))
         .merge({
             let hub = hub.clone();
             axum::Router::new().route(

@@ -25,5 +25,8 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 tar = { version = "0.4", default-features = false }
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-time = { version = "0.3", features = ["parsing", "serde"] }
+time = { version = "0.3", features = ["formatting", "parsing", "serde"] }
 tokio = { workspace = true, features = ["io-util"] }
+# Replay files: Zstandard frames (the version dbn uses) and their SHA-256.
+zstd = { version = "0.13", default-features = false }
+sha2 = "0.10"

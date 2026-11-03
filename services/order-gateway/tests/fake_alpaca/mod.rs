@@ -53,6 +53,8 @@ pub struct FakeOrder {
     pub avg: Option<String>,
     pub limit: String,
     pub status: String,
+    /// `day` unless the order says otherwise.
+    pub tif: String,
 }
 
 #[derive(Default)]
@@ -170,6 +172,14 @@ impl FakeOrder {
             &q(self.single.as_ref().map(|l| l.intent.as_str())),
         )
         .replace("{{LIMIT}}", &self.limit)
+        .replace(
+            "{{TIF}}",
+            if self.tif.is_empty() {
+                "day"
+            } else {
+                &self.tif
+            },
+        )
         .replace("{{STATUS}}", &self.status)
         .replace("{{LEGS}}", &legs)
     }
@@ -199,6 +209,7 @@ fn order_from(id: String, body: &Value) -> FakeOrder {
         avg: None,
         limit: s(body, "limit_price"),
         status: "accepted".into(),
+        tif: s(body, "time_in_force"),
         id,
     }
 }
@@ -341,9 +352,42 @@ impl Fake {
         self.lock().ws_out.push(frame);
     }
 
+    /// A single-leg execution of `qty` at `price` whose order shows nothing more
+    /// filled: a cumulative that lags its fill.
+    pub fn fill_lagging(&self, cid: &str, qty: u64, price: &str) {
+        let (order, n) = self.with_order(cid, |o| (o.render(), o.filled));
+        let exec = self.exec();
+        let frame = fixture!("trade_update_fill.json")
+            .replace("{{EVENT}}", "partial_fill")
+            .replace("{{EXEC}}", &exec)
+            .replace("{{ORDER}}", &order)
+            .replace("{{POSITION}}", &n.to_string())
+            .replace("{{PRICE}}", price)
+            .replace("{{QTY}}", &qty.to_string())
+            .replace("{{TS}}", TS);
+        self.lock().ws_out.push(frame);
+    }
+
+    /// As [`Fake::mleg_fill`], every leg's execution under one id.
+    pub fn mleg_fill_one_exec(&self, cid: &str, units: u64, net: &str, prices: &[&str]) {
+        let shared = self.exec();
+        self.mleg_fill_with(cid, units, net, prices, &mut || shared.clone());
+    }
+
     /// An MLEG execution of `units` at net `net`, legs at `prices`.
     pub fn mleg_fill(&self, cid: &str, units: u64, net: &str, prices: &[&str]) {
-        let execs: Vec<String> = prices.iter().map(|_| self.exec()).collect();
+        self.mleg_fill_with(cid, units, net, prices, &mut || self.exec());
+    }
+
+    fn mleg_fill_with(
+        &self,
+        cid: &str,
+        units: u64,
+        net: &str,
+        prices: &[&str],
+        exec: &mut dyn FnMut() -> String,
+    ) {
+        let execs: Vec<String> = prices.iter().map(|_| exec()).collect();
         let (order, event, legs) = self.with_order(cid, |o| {
             o.filled += units;
             o.avg = Some(net.into());

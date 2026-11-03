@@ -71,6 +71,8 @@ pub struct Timing {
     pub poll: Duration,
     /// `cancel_on_disconnect` grace.
     pub disconnect_grace: Duration,
+    /// How long an ended foreign order's fill record is kept once unseen.
+    pub foreign_keep: Duration,
 }
 
 impl Default for Timing {
@@ -81,6 +83,7 @@ impl Default for Timing {
             idle: s(30),
             heartbeat: s(10),
             queue_bytes: 4 << 20,
+            foreign_keep: Duration::from_hours(24),
             resolve: vec![s(1), s(2), s(4)],
             stream_grace: s(5),
             poll: s(1),
