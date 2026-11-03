@@ -296,7 +296,7 @@ mod tests {
     fn scratch(name: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
-        loop {
+        for _ in 0..1000 {
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map_or(0, |d| d.as_nanos());
@@ -309,6 +309,7 @@ mod tests {
                 return d;
             }
         }
+        panic!("no new folder in {}", std::env::temp_dir().display());
     }
 
     #[test]
