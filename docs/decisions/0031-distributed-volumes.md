@@ -42,31 +42,44 @@ the drives are used:
 
 ## Decision
 
-### 1. A volume is its marker
+### 1. A volume has an identity of its own
 
-Every volume the store uses carries `.tinytrader-volume` at its root, as
+A volume's identity is a random UUID, its **`id`**, written once and never
+changed. It is the volume's identity everywhere: in the store's state, in
+coverage and manifests, and in the inventory. A path is only where a volume is
+mounted now, and a host is only where it is attached now.
+
+Most volumes carry it in `.tinytrader-volume` at their root, as
 `tinytrader.volume/1`:
 
 ```json
 { "format": "tinytrader.volume/1", "id": "6f1c…-…", "name": "data",
-  "created_at": 1792500000.0, "immutable": false, "mount": "rw",
+  "created_at": 1792500000.0, "mount": "rw", "epoch": 12,
   "filesystem_uuid": "A1B2…" }
 ```
 
-- **`id`** is a random UUID, written once and never changed. It is the
-  volume's identity everywhere: in the store's state, in coverage and
-  manifests, and in the inventory. A path is only where a volume is mounted
-  now, and a host is only where it is attached now.
-- **`name`** is the label people use, and it stays unique in a deployment.
-  It is set at creation and doesn't change: `/files/{volume}/…` names are
-  stable (0017).
+- **`name`** is the label people use. It is unique in a deployment and set at
+  creation. `/files/{volume}/…` keeps naming volumes by name, so those names
+  stay stable (0017). Every other endpoint that names a volume (retire, seal,
+  ignore, accept-empty) takes its `id` or its name, as either.
 - **`filesystem_uuid`** (the APFS/HFS volume UUID, from `diskutil info`, or
-  `blkid` on Linux) is recorded alongside. It identifies a volume that is
-  mounted read-only before its marker has an `id` (see [Migration](#migration)).
-- **Two volumes with the same `id`** (a block-level copy, or a clone
-  restored from backup) are both refused for writes and reported as a
-  conflict until an operator retires one. One mounted copy is never taken
-  for another.
+  `blkid` on Linux) is recorded alongside the `id`, here and in the
+  coordinator's registry.
+- **`epoch`** counts the times a node has mounted the volume writable. The node
+  increments it on the marker before its first write, and the coordinator
+  records the highest epoch it has seen. A volume that presents a **lower**
+  epoch than recorded is a stale clone, or a copy restored from backup. It is
+  quarantined: readable, never written, and reported, until an operator
+  retires one of the two. Two volumes with the same `id` online at once are
+  quarantined the same way. One copy is never taken for another.
+- **An immutable volume carries no new marker.** A volume that must never be
+  written (§4) isn't given one. Its identity lives in the coordinator's
+  registry: an `id` assigned there and bound to its `filesystem_uuid`, plus
+  the name and `approved_at` of its existing marker, if it has one. That is
+  weaker than a marker, because a block-level clone has the same filesystem
+  UUID. So for an immutable volume, the store treats "the same volume online
+  twice" as a conflict, and reads only from the first copy seen until an
+  operator decides.
 
 ### 2. A store node per host, one coordinator
 
@@ -74,48 +87,81 @@ The store splits into two roles. Both are the same binary, chosen by
 configuration:
 
 - **A node** runs on each host that has volumes attached:
-  - it discovers its volumes by marker, in the mount directory and from its
-    configured paths;
+  - it discovers its volumes by marker, or by filesystem UUID for an immutable
+    one;
   - it scans them and serves their files;
   - it files to its own writable volumes through its own filer (0030).
-  
+
   It knows nothing of other hosts.
 - **The coordinator** is the store's one address for clients:
   - it keeps the registry: every volume ever seen, by `id`, with the node it
-    was last on and a snapshot of what it held;
+    is on and its snapshot (§3);
   - it merges the nodes' catalogs and coverage into one `/catalog` and
     `/coverage`;
-  - it decides where new filings go, and answers the purchase questions.
+  - it places new filings (§4), and answers the purchase questions.
+- **Nodes authenticate.** Each node is approved once, as a drive is, and gets
+  its own credential: a token file the deployment provides, kept like the
+  store's write token. The coordinator accepts catalogs, filings and volume
+  claims only from approved nodes.
+  - A node may claim a volume the registry doesn't know only through an
+    operator's approval.
+  - A node may claim a known volume that has moved to it (§6); the move is
+    recorded.
+  - A claim for a volume another node still reports is a conflict (§1).
 - **Reads:** `GET /files/{volume}/{path}` on the coordinator answers `307` to
-  the node that has that volume now. Clients follow it, and the producer
-  already checks every file's hash. A `--proxy-reads` option serves through
-  the coordinator instead, for a client that can't reach the nodes.
-- **Writes:** these are the experimental endpoints (`/incoming`,
-  `/incorporate`, `/adopt`, the volume actions).
-  - The coordinator places a batch **whole** before its first file. It
-    answers each write with `307` to the node chosen for that batch, so all
-    of a batch's files land on one node and its filer orders them (0030).
-  - `adopt` goes to the node that already has the folder.
+  the node that has that volume now. Reads carry no token, and the producer
+  already checks every file's hash, so a redirect loses nothing. A
+  `--proxy-reads` option serves through the coordinator instead, for a client
+  that can't reach the nodes.
+- **Writes don't use redirects.** An HTTP client drops `Authorization` on a
+  redirect to another host, so a redirected write would arrive without its
+  token. Instead:
+  1. The client asks the coordinator to place a batch:
+     `POST /place/{provider}/{batch}`, with the write token.
+  2. The coordinator answers with the node's address and a **write ticket**:
+     short-lived, signed by the coordinator, and good only for that batch on
+     that node.
+  3. The client uploads to the node directly, with the ticket.
+
+  The whole batch goes to one node, whose filer orders it (0030). `adopt` is
+  placed the same way, on the node that already has the folder. The write
+  endpoints are experimental, and their clients are tinytrader's own
+  (databento-jobs, alpaca-history), so they change with this.
 - **One host is still one process.** With no `STORE_NODES` configured, the
-  store is coordinator and node at once, as today. A small deployment
-  changes nothing.
+  store is coordinator and node at once, as today, with no tickets and no
+  redirects. A small deployment changes nothing.
 - **A node that doesn't answer** has its volumes reported as offline, with
   their snapshots (§3). The coordinator never takes a silent node to mean
   "holds nothing".
 
-### 3. Offline but known: a snapshot, not a blank
+### 3. Offline but known: a snapshot kept current
 
-Today `held` is per-schema counts, too coarse to say whether a particular day
-is held. The coordinator instead keeps, per volume, the **manifests it last
-read in full**: each dataset's day list with each day's coverage, the same
-records `/coverage` serves. This is a few MB per volume, written with the
-state file.
+The coordinator keeps, per volume, a **snapshot**: every manifest entry the
+volume holds. That is each dataset's days, with each day's coverage, its
+files, and **each file's size and SHA-256**, the same records `/coverage`
+serves plus the hashes. This is a few MB per volume, written with the state
+file.
+
+**The snapshot is current, not just as of the last scan.** Each filing
+reaches the snapshot before it is acknowledged:
+
+- A node's filer reports each filing to the coordinator: the manifest entries
+  it wrote, with the volume's **snapshot version** (a counter the node keeps
+  in the volume's own manifests).
+- The node answers the client only once the coordinator has recorded it.
+- If the coordinator can't be reached, the node refuses new filings with
+  `503`, rather than filing something the snapshot would miss.
+- When a node reconnects, it sends what changed since the version the
+  coordinator has.
+
+So a day filed and then taken away on its volume is still in the snapshot,
+and it is never bought again.
 
 | Volume state | Its days in `/coverage` | Purchases |
 |---|---|---|
 | **online** (a node reads it now) | held, available | proceed |
-| **offline, known** (not attached, with a full snapshot) | held, `"available": false`, `"volume_state": "offline"` | proceed: its days count as held and aren't bought again |
-| **unknown** (never read in full, its snapshot incomplete, or a node that won't say which volumes it has) | not listed | **refused**, as today |
+| **offline, known** (away, with a current snapshot) | held, `"available": false`, `"volume_state": "offline"` | proceed: its days count as held and aren't bought again |
+| **unknown** (never read in full, no current snapshot, quarantined, or a node that won't say which volumes it has) | not listed | **refused**, as today |
 | **retired** | not held | proceed: its days may be bought again |
 
 - `missing_volumes` keeps its name and its rule for the jobs service: refuse
@@ -124,40 +170,76 @@ state file.
   simply stops being blocked by a drive that is known to be away.
 - An offline day isn't readable. A session or research job that asks for it
   is told which volume holds it, and that the volume is offline.
-- A snapshot that turns out wrong is caught when the volume comes back: its
-  full scan is compared with the snapshot. If it holds less than its snapshot
-  said, the volume is degraded, and the lost days are listed in `/events`. If
-  the drive is gone for good, retiring it (as today) makes its days
-  purchasable again.
+- **A volume away too long** is reported:
+  - degraded in `/health` past `STORE_OFFLINE_WARN` (7 days by default);
+  - the snapshot can't vouch for a drive nobody has seen, so its days stay
+    held but are flagged.
+- **Data lost while away** is found when the volume returns: its full scan is
+  compared with the snapshot. Days it no longer holds, or whose hashes
+  differ, are listed in `/events` and on the volume as `lost`.
+  - A lost day is **not** made purchasable by the scan. A drive that mounted
+    badly would otherwise set off purchases.
+  - An operator confirms the loss with `POST /volumes/{id}/accept-loss`, and
+    only then are those days not held, and purchasable.
+  - Retiring a drive that is gone for good does the same for all its days.
+- **A lost state file** is rebuilt from the nodes. Each volume's own
+  manifests are the record, and the snapshot is only a copy of them. Online
+  volumes are read again. Offline volumes whose snapshots were lost become
+  **unknown**, and block purchases until they come back. Losing the state
+  file is therefore never a reason to buy anything. The state file is kept
+  by the deployment's backups, as other state is.
 
 ### 4. Placement, and volumes that are never written
 
 - A new filing goes to a volume that is **online, writable, not immutable**,
   and below its critical threshold. The choice is made in this order:
-  1. the dataset's placement rule, if the configuration gives one
+  1. **a day already held goes where it is.** A filing that changes a day
+     already held (0018's partial merges, a supersede) goes to the volume
+     holding that day, so that volume's filer orders it with every other
+     write to the day. Two nodes never write the same day. If that volume is
+     offline, the filing waits (`503`, retried) rather than splitting the day
+     across volumes;
+  2. the dataset's placement rule, if the configuration gives one
      (`STORE_PLACEMENT`, such as `databento/*=archive-*`, or by protection
      class: purchased to the NAS);
-  2. otherwise 0007's rule: the most room.
-- 0007's second copies go to a different volume, and to a different host
-  when one is online.
-- **`immutable: true`** in the marker means no node writes to that volume
-  again: no filing, no `.incoming`, no provenance, no repair, no marker
-  rewrite. It is a property of the volume, so it travels with it to any host.
-  - Setting it is a store action, `POST /volumes/{id}/seal`.
-  - Clearing it is deliberate: the marker is edited by hand, and the volume
-    is approved again.
+  3. otherwise 0007's rule: the most room.
+- 0007's second copies go to a different volume, and to a different host when
+  one is online.
+- **One write gate.** Every write the store makes to a volume goes through
+  one function, which refuses a volume that is immutable, configured
+  read-only, mounted read-only, or quarantined. That covers filing,
+  `.incoming`, provenance, migrations, repairs, markers and the indexing
+  files. A test drives every write endpoint against such a volume and checks
+  that nothing on it changed. fstab and mount flags (below) are a second
+  line, not the only one.
+- **`immutable`** is a property of the volume, recorded in the coordinator's
+  registry and, for a volume sealed while writable, in its marker, so it
+  travels with the volume to any host.
+  - **Sealing** (`POST /volumes/{id}/seal`) is the last write a volume
+    takes. It needs a writable mount, so the node:
+    1. stops placing new filings on the volume, and waits for its filer to
+       be idle;
+    2. checks every file against the manifests;
+    3. writes the marker with `"immutable": true` and syncs it.
+
+    The operator then remounts the volume read-only, which the host module's
+    mount policy makes permanent. A volume already mounted read-only (an
+    existing archive) is sealed in the registry only, with no write (§1).
+  - Clearing `immutable` is deliberate: an operator edits the registry, or
+    the marker by hand, and approves the volume again.
 - **`mount`** (`rw` or `ro`) is the volume's mount policy, and `immutable`
   implies `ro`.
   - The node reports a volume mounted against its policy (writable when it
-    should be `ro`) as a warning in `/catalog` and `/health`, and treats it as
-    read-only regardless.
+    should be `ro`) as a warning in `/catalog` and `/health`, and the write
+    gate treats it as read-only regardless.
   - The deployment's host module enforces the policy at mount time: on macOS
     an `/etc/fstab` entry by filesystem UUID with `ro`; on NixOS a
     `fileSystems` entry.
 
 ### 5. Indexing and change logs off
 
-At approval, while the volume is still writable, the store writes:
+At approval, while the volume is still writable, the store writes (through
+the write gate):
 
 - `.metadata_never_index`, so Spotlight skips the volume, and runs
   `mdutil -i off` on it;
@@ -165,23 +247,27 @@ At approval, while the volume is still writable, the store writes:
 
 Each node checks these on every scan and reports `indexing: off | on |
 unknown` per volume. `on` is a warning, with the command that fixes it. A
-volume already mounted read-only can't be given them, so it stays `unknown`
-until it is next mounted writable. The deployment's host module may also
-exclude store volumes from Time Machine.
+read-only volume can't be given them, so it stays `unknown`. The host module
+turns indexing off for it by mount point instead (`mdutil -i off`, which
+needs no write to the volume). The deployment's host module may also exclude
+store volumes from Time Machine.
 
 ### 6. Moving a volume between hosts
 
 1. **Unplug it from host A.** A's node stops reporting it, and it becomes
    **offline, known**. Its days still count as held, so purchases go on.
-2. **Plug it into host B.** B's node finds the marker and reports the `id`.
-   The coordinator moves the registry entry to B, records `moved {id} A → B`
-   in `/events`, and B scans it fully against the snapshot.
+2. **Plug it into host B.** B's node finds the volume, by marker or
+   filesystem UUID, and claims its `id` (§2).
+   - The coordinator checks the epoch (§1) and moves the registry entry to B.
+   - It records `moved {id} A → B` in `/events`.
+   - B scans the volume fully against the snapshot (§3).
 3. **Reads redirect to B.** Nothing in a client changes, because
    `/files/{volume}/…` names the volume, not the host.
 
 A volume found on a host other than its **expected host** (§7) is used, and
 reported as `unexpected_host` (degraded, not refused). That way an emergency
-move works at once, and the inventory is corrected afterwards.
+move works at once, and the inventory is corrected afterwards. If A's node
+still reports the volume when B claims it, both are quarantined (§1).
 
 ### 7. The deployment names volumes, not paths
 
@@ -191,10 +277,15 @@ In a deployment's inventory, a store data root becomes:
 { volume = "<id>"; name = "data"; expectedHost = "<host>"; mount = "ro"; }
 ```
 
-- `path` goes: the node finds the volume by its marker.
+- `path` goes: the node finds the volume itself.
 - The data-roots check (that a container may only mount the roots it is
   granted) uses `expectedHost` and the mount point the node reports.
 - The host module writes the fstab entries from `mount`.
+
+**Every node must be reachable from the clients that read from it**, once
+reads redirect: 0005's "one address" becomes one address to ask, plus the
+nodes it points to. A client that can reach only the coordinator uses
+`--proxy-reads`.
 
 ### 8. The store checks what a batch says it belongs to
 
@@ -205,8 +296,9 @@ rebuilds a day's conditions after its main was filed can attach them to a
 main they don't describe, if the provider's data changed in between.
 
 - **On `incorporate`, a batch that carries a binding is checked** against the
-  main it names, on whichever volume holds it, online or offline (by the
-  snapshot's hashes).
+  main it names, on whichever volume holds it:
+  - online: from the volume's manifest;
+  - offline: from the snapshot's per-file hashes (§3).
 - **A mismatch is refused with `409`**, naming both hashes, and nothing is
   filed. A binding whose main isn't held is refused the same way. The rule
   lives with the data, not in each client.
@@ -218,78 +310,103 @@ main they don't describe, if the provider's data changed in between.
 
 From today's state (a state file keyed by name, markers without `id`, and
 volumes named only in `STORE_VOLUMES` without a marker), with no rescan of
-the data:
+the data.
 
-1. **Writable volumes.** On its first start, the new store gives each
-   remembered or configured volume an `id`. It writes the full v1 marker,
-   keeping the name, or creates one for a `STORE_VOLUMES` volume that has
-   none. It records the `filesystem_uuid`, and rekeys the state file by `id`.
-   The old marker is kept as `.tinytrader-volume.v0`.
-2. **Volumes mounted read-only**, like a data drive moved to another host in
-   an emergency, can't be written. They are matched to their remembered entry
-   by `filesystem_uuid` if one was recorded, otherwise by name plus the
-   v0 marker's `approved_at`. They get their `id` the next time they are
-   mounted writable. Until then they are fully usable for reads, and they are
-   never chosen for writes.
-3. **Snapshots** are taken by the first full scan after the upgrade. Until a
-   volume has one, an offline volume is **unknown** and blocks purchases as it
-   does today.
-4. **Moving the store**: the coordinator moves to its new host with its state
+1. **A dry run first.** `store migrate --dry-run` lists, for each remembered
+   or configured volume, what the migration would do: write a marker, track
+   it in the registry only, or skip it, and why. Nothing is written.
+   `store migrate --apply VOLUME…` then acts on the volumes named, and only
+   those.
+2. **No marker is written to a volume that must not be written:**
+   - one configured `:ro` or mounted read-only;
+   - one an operator names as immutable or as an archive (`--immutable
+     VOLUME`);
+   - one whose datasets are of the purchased class (0007) or Databento, by
+     default, unless an operator names it in `--apply` explicitly.
+
+   Each of these gets its `id` in the registry only, bound to its
+   `filesystem_uuid` and to its existing v0 marker's name and `approved_at`
+   (§1). The purchased archive is never written by the migration.
+3. **Other writable volumes**, once named in `--apply`, get the v1 marker,
+   keeping their name. One is created for a `STORE_VOLUMES` volume that has
+   none. The old marker is kept as `.tinytrader-volume.v0`. Each write goes
+   through the write gate.
+4. **The state file** is rekeyed by `id`, the old one kept beside it.
+5. **Snapshots** are taken by the first full scan after the upgrade. Until a
+   volume has one, an offline volume is **unknown**, and blocks purchases as
+   it does today.
+6. **Moving the store**: the coordinator moves to its new host with its state
    file. Each old host keeps a node until its drives move, and then its node
    is removed. The NAS joins as a node, or as a mounted share under an
    existing node. The inventory changes from host and path to volume IDs in
    the same step.
 
+The deployment's own runbook (which volumes, which hosts, in what order) is
+kept in the deployment repository, and starts from the dry run's output.
+
 ## Steps
 
 Each step is its own PR, and each one is useful on its own:
 
-1. **Identity.**
-   - The v1 marker, `id` and `filesystem_uuid`.
-   - The state file keyed by `id`, the migration above, and duplicate-`id`
-     refusal.
-   - Still one process. Tests: migration from v0 state and markers, a
-     read-only volume matched by filesystem UUID, a clone refused.
+1. **Identity and the write gate.**
+   - The v1 marker, `id`, `filesystem_uuid` and `epoch`, and the registry
+     for volumes without a marker.
+   - The state file keyed by `id`.
+   - The one write gate, with its test over every write endpoint.
+   - `migrate --dry-run` and `--apply`, and quarantine for clones and stale
+     epochs.
+   - Still one process. Tests: migration from v0 state and markers; a
+     read-only or purchased volume left unwritten; a clone and a stale epoch
+     quarantined.
 2. **Offline but known.**
-   - Per-volume snapshots, `offline_volumes`, and `missing_volumes` narrowed
-     to unknown volumes.
-   - The comparison when a volume returns.
-   - This alone ends "a moved drive stops every purchase". Tests: a purchase
-     proceeds with a known volume away and is refused with an unknown one; a
-     returning volume holding less than its snapshot.
+   - Per-volume snapshots with file hashes, updated by each filing before it
+     is acknowledged.
+   - `offline_volumes`, and `missing_volumes` narrowed to unknown volumes.
+   - The offline-age warning, `lost` days on return, and `accept-loss`.
+   - Rebuilding the state file from the volumes.
+   - This alone ends "a moved drive stops every purchase". Tests:
+     - a purchase proceeds with a known volume away, and is refused with an
+       unknown one;
+     - a day filed just before its volume goes away is still held;
+     - a volume that returns missing days doesn't make them purchasable
+       until the loss is accepted.
 3. **Volume hygiene.**
-   - Indexing and change logs off at approval, and reported on each scan.
-   - `immutable` and `seal`, and `mount` policy warnings.
+   - Indexing and change logs off, reported on each scan.
+   - `seal`, and `mount` policy warnings.
    - The deployment module's fstab and `fileSystems` entries.
-4. **Node and coordinator.**
-   - `STORE_NODES`, merged catalogs, `307` reads and placed writes, and
-     moves recorded in `/events`.
+4. **The binding check on `incorporate`** (§8).
+5. **Node and coordinator.**
+   - Node approval and credentials, and `STORE_NODES`.
+   - Merged catalogs, `307` reads, and placement with write tickets.
+   - A day's writes kept on the volume that holds it.
+   - Moves and conflicts recorded in `/events`.
    - Tests on two nodes on one machine (two mount directories): a move, a
-     silent node, a redirect, and a batch kept whole on one node.
-5. **Placement rules and cross-host copies** (finishing 0007's copies).
-
-§8, the binding check on `incorporate`, needs none of the above and can land
-at any point.
-
-The deployment's migration (its inventory and the order its hosts move in) is
-a runbook in the deployment repository, carried out after steps 1–3.
+     silent node, a stale clone claimed by a second node, a redirect, a
+     ticket refused for another batch or node, and a day's merge sent to its
+     volume.
+6. **Placement rules and cross-host copies** (finishing 0007's copies).
 
 ## Consequences
 
 - **A drive away is no longer an outage for purchases**, only for reading
   that drive's days, and every caller is told which volume and why.
 - **Moving a drive is plugging it in.** Configuration catches up later.
+- **Nothing is bought twice:**
+  - a filing reaches the snapshot before it is acknowledged;
+  - a returning volume's losses need an operator to accept them;
+  - a lost state file makes volumes unknown, not empty.
+
+  The cost is purchases blocked or skipped until someone acts, never a
+  purchase made twice.
+- **Immutability is enforced in code** by one gate, with mount flags behind
+  it. The archive is never written by the migration.
 - **The coordinator is a single point**, as the one store is today. If it is
-  down, reads stop even though the nodes are up. A client may be given a
-  node's address directly for reading that node's volumes, but no failover
-  is designed here.
-- **The registry's snapshots can be wrong** (a drive that died while away).
-  The cost is a purchase skipped until someone retires the drive, never a
-  purchase made twice: the guards stay on the side of not buying.
+  down, reads stop, and so do new filings (§3), even though the nodes are up.
+  A client may be given a node's address for reading that node's volumes,
+  but no failover is designed here.
 - **The `/files` contract is unchanged**, with a `307` in front of it. The
-  write endpoints change, but they are experimental and their clients are
-  tinytrader's own (databento-jobs, alpaca-history), which already follow
-  redirects.
+  write endpoints change (placement and tickets), but they are experimental
+  and their clients are tinytrader's own.
 
 ## Open questions
 
@@ -303,3 +420,4 @@ a runbook in the deployment repository, carried out after steps 1–3.
   made by a flag.
 - **The coordinator's host.** Wherever the most-read data is, to keep
   redirects local. That is a deployment choice.
+- **How long `STORE_OFFLINE_WARN` should be by default.** 7 days is a guess.
