@@ -788,6 +788,70 @@ fn buying_power_refuses_what_cash_cant_cover() {
     gw.stop().unwrap();
 }
 
+/// Defined-risk buying power holds a calendar to its debit: the long of each type and
+/// strike that expires later covers the front short. A double calendar of two units at
+/// $2.40 ($480) fits in $500 of cash; three ($720) do not. By expiry alone the front 580
+/// call would be naked, with no bound.
+#[test]
+fn buying_power_holds_a_double_calendar_to_its_debit() {
+    const LEGS: [&str; 4] = [
+        "SPY261005P00570000",
+        "SPY261012P00570000",
+        "SPY261005C00580000",
+        "SPY261012C00580000",
+    ];
+    let (sim, feed) = SimBroker::fed(
+        r#"{"account":{"cash":"500.00"},"venue_rules":{"buying_power":"defined_risk"},"expiry":{"settle":false}}"#,
+        r#"{"source":"session","run":"test"}"#,
+    )
+    .unwrap();
+    let mut cfg = config(root("fed-bp-double-calendar"));
+    cfg.profile.allow_calendars = true;
+    let gw = start(cfg, sim).unwrap();
+    let clock = gw.clock();
+    let mut c = Conn::open(&gw, "reactor", None);
+    for (iid, sym) in (1..).zip(LEGS) {
+        let raw = format!("{:<6}{}", &sym[..3], &sym[3..]);
+        let m = SymbolMappingMsg::new(
+            iid,
+            T0 - S,
+            SType::Parent,
+            "SPY.OPT",
+            SType::RawSymbol,
+            &raw,
+            0,
+            0,
+        )
+        .unwrap();
+        feed.push(T0 - S, RecordRef::from(&m)).unwrap();
+    }
+    for iid in 1..=4 {
+        cbbo(&feed, iid, T0, 300, 310);
+    }
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    let double = |cid: &str, qty: u32| {
+        combo(
+            cid,
+            &[
+                (LEGS[0], 1, "sell", "open"),
+                (LEGS[1], 1, "buy", "open"),
+                (LEGS[2], 1, "sell", "open"),
+                (LEGS[3], 1, "buy", "open"),
+            ],
+            qty,
+            "2.40",
+        )
+    };
+    let r = c.submit("r1", &double("wse-three", 3));
+    assert_eq!(r["code"], "sim_insufficient_buying_power", "{r}");
+    let r = c.submit("r2", &double("wse-two", 2));
+    assert_eq!(r["outcome"], "accepted", "{r}");
+    // Working, its debit is held as paid and nothing more: $500 - $480.
+    let (a, _) = c.req("account", "r3", "");
+    assert_eq!(a["account"]["buying_power"], "20.00", "{a}");
+    gw.stop().unwrap();
+}
+
 /// fill_on = "next_quote" for a combo: one leg's new quote isn't enough; every leg
 /// must have quoted since the order activated.
 #[test]
