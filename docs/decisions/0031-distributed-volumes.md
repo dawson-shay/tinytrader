@@ -1,6 +1,6 @@
 # 0031: Volumes with their own identity, a store node per host
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-03
 - **Amends:** [0007](0007-storage-pool-and-automations.md) (the pool, the
   marker), [0019](0019-purchase-guards.md) (missing volumes stop purchases),
