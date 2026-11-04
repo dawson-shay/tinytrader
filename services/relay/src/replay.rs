@@ -19,7 +19,9 @@
 //!   (the session closes, an error, the timeout) is kept as
 //!   `….partial.dbn.zst`. A sidecar `<file>.json` says what the file holds
 //!   (`tinytrader.replay-file/1`).
-//! - **The file:** standard DBN v3 (the session's metadata, then every record
+//! - **The file:** standard DBN v3, its header's schema unset (mixed: the
+//!   stream holds symbol mappings and system records beside the schema's; the
+//!   name and the sidecar say the schema). The session's metadata, then every record
 //!   Databento sent but heartbeats, unchanged, symbol mappings included,
 //!   through its `ReplayCompleted` system record,
 //!   the file's explicit end), as independent checksummed Zstandard frames of
@@ -351,13 +353,17 @@ pub struct About<'a> {
     pub start: i64,
 }
 
-/// The file's metadata: the session's, saying what was asked for. A live
-/// gateway's header may leave the schema, symbology and symbols out, and
-/// readers (Python's `DBNStore.to_df()`) refuse a file without them.
+/// The file's metadata: the session's, saying what was asked for (a live
+/// gateway's header may leave the symbology and symbols out). Its schema is
+/// unset, mixed, as decision 0022 section 4 has it: the stream carries symbol
+/// mappings and system records beside the schema's, and a reader that trusted
+/// a single schema would read them as that schema's records (Python's
+/// `DBNStore.to_df()` did). The schema asked for is in the file's name and its
+/// sidecar; Python reads it with `to_df(schema="cbbo-1m")`.
 fn file_metadata(session: &Metadata, about: &About<'_>) -> Metadata {
     let mut m = session.clone();
     m.dataset = about.dataset.to_owned();
-    m.schema = Some(about.schema);
+    m.schema = None;
     m.stype_in = Some(about.stype_in);
     m.symbols = about.symbols.to_vec();
     m.start = u64::try_from(about.start).unwrap_or(0) * 1_000_000_000;
@@ -944,7 +950,9 @@ mod tests {
         let (meta, ts) = read_back(&p.file);
         // The session's header said none of these; the file does.
         assert_eq!(meta.symbols, spy());
-        assert_eq!(meta.schema, Some(Schema::Trades));
+        // Mixed: the stream holds a system record beside the trades, so the
+        // header names no one schema (the sidecar does).
+        assert_eq!(meta.schema, None);
         assert_eq!(meta.stype_in, Some(SType::Parent));
         assert_eq!(meta.start, 1_791_811_800 * 1_000_000_000);
         assert_eq!(ts.len() as u64, n + 1);
@@ -957,6 +965,106 @@ mod tests {
         assert_eq!(side["parents"], json!(["SPY.OPT"]));
         let sha = format!("{:x}", Sha256::digest(fs::read(&p.file).unwrap()));
         assert_eq!(side["sha256"], sha);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Records from memory of several kinds, as a replay holds: a symbol
+    /// mapping, trades, and the system records around them.
+    fn mixed() -> Fake {
+        let mut f = Fake::new(5, true);
+        let m = databento::dbn::SymbolMappingMsg::new(
+            7,
+            900,
+            SType::Parent,
+            "SPY.OPT",
+            SType::RawSymbol,
+            "SPY   261027C00580000",
+            0,
+            0,
+        )
+        .unwrap();
+        f.records.push_front(RecordBuf::from(m));
+        for (i, r) in f.records.iter_mut().enumerate() {
+            if let Some(t) = r.get_mut::<TradeMsg>() {
+                t.hd.instrument_id = 7;
+                t.size = u32::try_from(i).unwrap();
+            }
+        }
+        f
+    }
+
+    /// The replay file for Python's round trip through databento's own reader
+    /// (clients/python/tests/test_replay_file.py): written by the relay's
+    /// writer, compared byte for byte, `RELAY_FIXTURE_WRITE=1` writes it again.
+    #[tokio::test]
+    async fn the_python_round_trip_fixture_is_what_the_writer_writes() {
+        let dir = temp_dir("fixture");
+        let (p, _) = write(&dir, &mut mixed()).await;
+        let (meta, ts) = read_back(&p.file);
+        assert_eq!(meta.schema, None);
+        // The mapping, the trades and ReplayCompleted (heartbeats aren't kept).
+        assert_eq!(ts.len(), 1 + 5 + 1);
+        let got = fs::read(&p.file).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../clients/python/tests/fixtures/replay-mixed.dbn.zst");
+        if std::env::var("RELAY_FIXTURE_WRITE").is_ok_and(|v| v == "1") {
+            fs::create_dir_all(fixture.parent().unwrap()).unwrap();
+            fs::write(&fixture, &got).unwrap();
+            panic!("fixture written; unset RELAY_FIXTURE_WRITE and run again");
+        }
+        assert_eq!(
+            got,
+            fs::read(&fixture).unwrap(),
+            "the writer's output changed"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file written with a one-schema header is copied with its schema unset
+    /// and every record unchanged; the original is never written, and an
+    /// existing copy is refused.
+    #[test]
+    fn an_old_replay_file_is_copied_with_a_mixed_header() {
+        use relay::replay_fix::{copy_path, schema_none_copy};
+        let dir = temp_dir("fix");
+        fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("OPRA.PILLAR-SPY-trades-1.dbn.zst");
+        let mut meta = mixed().metadata;
+        meta.schema = Some(Schema::Trades);
+        let mut f = DbnFile::create(&old.with_extension("tmp"), &meta, Arc::default()).unwrap();
+        let n = 2 * (FRAME_BYTES / std::mem::size_of::<TradeMsg>());
+        let mut fake = mixed();
+        for _ in 0..n {
+            let mut t = TradeMsg::default();
+            t.hd.ts_event = 3_000;
+            fake.records.push_back(RecordBuf::from(t));
+        }
+        for r in &fake.records {
+            f.push(RecordRef::from(r).as_ref()).unwrap();
+        }
+        f.finish(&old).unwrap();
+        let before = fs::read(&old).unwrap();
+        let copy = copy_path(&old);
+        assert_eq!(
+            copy,
+            dir.join("OPRA.PILLAR-SPY-trades-1.schema-none.dbn.zst")
+        );
+        assert!(schema_none_copy(&old, &copy).unwrap());
+        assert_eq!(fs::read(&old).unwrap(), before, "the original is untouched");
+        let (m_old, ts_old) = read_back(&old);
+        let (m_new, ts_new) = read_back(&copy);
+        assert_eq!(m_old.schema, Some(Schema::Trades));
+        assert_eq!(m_new.schema, None);
+        assert_eq!(ts_new, ts_old);
+        assert!(ts_new.len() > n, "every frame copied");
+        assert!(
+            schema_none_copy(&old, &copy).is_err(),
+            "an existing copy is refused"
+        );
+        // A copy of a mixed file is the same records, its header unchanged.
+        let again = dir.join("again.dbn.zst");
+        assert!(!schema_none_copy(&copy, &again).unwrap());
+        assert_eq!(read_back(&again), read_back(&copy));
         let _ = fs::remove_dir_all(&dir);
     }
 
