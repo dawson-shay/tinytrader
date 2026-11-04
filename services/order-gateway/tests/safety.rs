@@ -647,6 +647,69 @@ fn a_vix_call_calendar_is_refused_as_unknown() {
     gw.stop().unwrap();
 }
 
+/// A double calendar: sell the 5 Oct 570 put and 580 call, buy the 12 Oct 570 put and 580
+/// call.
+fn double_calendar(cid: &str, qty: u32, price: &str) -> String {
+    combo(
+        cid,
+        &[
+            ("SPY261005P00570000", 1, "sell", "open"),
+            ("SPY261012P00570000", 1, "buy", "open"),
+            (CALL, 1, "sell", "open"),
+            (CALL_580_NEXT, 1, "buy", "open"),
+        ],
+        qty,
+        price,
+    )
+}
+
+#[test]
+fn a_double_calendar_is_refused_without_allow_calendars() {
+    let gw = scripted(config(root("max-loss-double-cal-off")), &clocked_holding());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let welcome: serde_json::Value = serde_json::from_str(&c.lines[0]).unwrap();
+    assert!(
+        welcome["limits"].get("allow_calendars").is_none(),
+        "{welcome}"
+    );
+    let r = c.submit("d1", &double_calendar("wse-d1", 1, "2.40"));
+    assert_eq!(r["reason"], "max_loss_unknown", "{r}");
+    gw.stop().unwrap();
+}
+
+#[test]
+fn a_double_calendar_is_admitted_at_its_debit_with_allow_calendars() {
+    // A $2.40 debit is $240 a unit: a $500 cap admits two units and refuses three. A diagonal
+    // of four legs is still unknown.
+    let mut cfg = config(root("max-loss-double-cal"));
+    cfg.profile.allow_calendars = true;
+    cfg.profile.max_notional_cents = 50_000;
+    let gw = scripted(cfg, &clocked_holding());
+    let mut c = Conn::open(&gw, "reactor", None);
+    let welcome: serde_json::Value = serde_json::from_str(&c.lines[0]).unwrap();
+    assert_eq!(welcome["limits"]["allow_calendars"], "yes", "{welcome}");
+    assert_eq!(
+        cap_name(&c.submit("d3", &double_calendar("wse-d3", 3, "2.40"))),
+        Some("notional".into())
+    );
+    let r = c.submit("d2", &double_calendar("wse-d2", 2, "2.40"));
+    assert_eq!(r["outcome"], "accepted", "{r}");
+    let diag = combo(
+        "wse-dd",
+        &[
+            ("SPY261005P00570000", 1, "sell", "open"),
+            ("SPY261012P00565000", 1, "buy", "open"),
+            (CALL, 1, "sell", "open"),
+            ("SPY261012C00585000", 1, "buy", "open"),
+        ],
+        1,
+        "1.00",
+    );
+    let r = c.submit("dd", &diag);
+    assert_eq!(r["reason"], "max_loss_unknown", "{r}");
+    gw.stop().unwrap();
+}
+
 #[test]
 fn a_close_is_not_held_to_the_maximum_loss() {
     // Selling a held call to close is a naked short's shape; a close is never bounded.

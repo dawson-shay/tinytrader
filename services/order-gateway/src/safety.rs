@@ -18,6 +18,10 @@ pub struct Profile {
     pub equities: Vec<String>,
     /// Whether a stock may be sold to open (a short sale).
     pub allow_short: bool,
+    /// Whether an opening combo across expiries that is a covered calendar (each short
+    /// covered by a later long of its type and strike) is sized at its debit
+    /// (`--allow-calendars`); off, only a two-leg calendar or diagonal is.
+    pub allow_calendars: bool,
     /// Allowed futures roots (outrights, single orders); none by default.
     pub futures: Vec<String>,
     /// The most futures contracts one opening order may trade. A future's loss
@@ -51,6 +55,7 @@ impl Default for Profile {
             any_underlying_clients: Vec::new(),
             equities: Vec::new(),
             allow_short: false,
+            allow_calendars: false,
             futures: Vec::new(),
             max_future_qty: 1,
             max_legs: 4,
@@ -87,8 +92,12 @@ impl Profile {
                 .raw("futures", &f)
                 .n("max_future_qty", self.max_future_qty);
         }
-        o.s("allow_short", if self.allow_short { "yes" } else { "no" })
-            .n("max_legs", self.max_legs)
+        o = o.s("allow_short", if self.allow_short { "yes" } else { "no" });
+        // Only when set, so a profile without it pins as before.
+        if self.allow_calendars {
+            o = o.s("allow_calendars", "yes");
+        }
+        o.n("max_legs", self.max_legs)
             .n("max_open", self.max_open)
             .s("max_notional", &fmt_cents(self.max_notional_cents))
             .n("submits_per_min", self.submits_per_min)

@@ -460,13 +460,22 @@ pub struct MaxLoss {
 /// share loses its premium; a naked short call or share is `max_loss_unbounded`; a naked
 /// short put loses its strike less the credit. A combo of options with one underlying and
 /// one expiry loses its net debit less the least payoff at expiry (see [`combo_loss`]).
-/// A combo with a closing leg, and a calendar, are `max_loss_unknown`. A partial close is
-/// not an intent property; the caller passes the open quantity that remains, since the loss
-/// is linear in quantity and zero once nothing remains open.
+/// A combo with a closing leg is `max_loss_unknown`, and so is a combo across expiries other
+/// than a two-leg calendar or diagonal (see [`calendar_loss`]). A partial close is not an
+/// intent property; the caller passes the open quantity that remains, since the loss is
+/// linear in quantity and zero once nothing remains open. This is [`max_loss_with`] with the
+/// profile's `--allow-calendars` off.
 pub fn max_loss(intent: &Intent) -> Result<MaxLoss, &'static str> {
+    max_loss_with(intent, false)
+}
+
+/// [`max_loss`] under a profile: with `allow_calendars` (`--allow-calendars`), a combo across
+/// expiries that [`calendar_loss`] does not bound is also sized as a covered calendar (see
+/// [`covered_calendar_loss`]): a double calendar, or calendars in ratio.
+pub fn max_loss_with(intent: &Intent, allow_calendars: bool) -> Result<MaxLoss, &'static str> {
     let limit = i128::from(intent.limit_cents);
     let (per_unit, debit) = if intent.combo {
-        (combo_loss(intent)?, intent.limit_cents > 0)
+        (combo_loss(intent, allow_calendars)?, intent.limit_cents > 0)
     } else {
         (single_loss(&intent.legs[0], limit)?, intent.legs[0].buy)
     };
@@ -517,7 +526,7 @@ fn single_loss(leg: &Leg, limit: i128) -> Result<i128, &'static str> {
 /// VIXW the weekly VIX root, NDXP the PM-settled NDX root and RUTW the weekly RUT root. The list
 /// must match the contract specs: an unlisted root is treated as American. The payoff-floor
 /// bound of [`combo_loss`] and the calendar bound of [`calendar_loss`] depend on this.
-const EUROPEAN_ROOTS: [&str; 14] = [
+pub(crate) const EUROPEAN_ROOTS: [&str; 14] = [
     "SPX", "SPXW", "XSP", "NDX", "NDXP", "XND", "RUT", "RUTW", "MRUT", "DJX", "XEO", "VIX", "VIXW",
     "SPIKE",
 ];
@@ -543,7 +552,7 @@ const EUROPEAN_ROOTS: [&str; 14] = [
 /// than the floor before expiry. For a European root such a floor is not used, and the combo is
 /// `max_loss_unknown`. A floor at zero is the debit, which holds for any option, and a negative
 /// least payoff (a short-side bound) is no less than its discounted value, so both stay.
-fn combo_loss(intent: &Intent) -> Result<i128, &'static str> {
+fn combo_loss(intent: &Intent, allow_calendars: bool) -> Result<i128, &'static str> {
     if intent.legs.iter().any(|l| !l.open) {
         return Err("max_loss_unknown");
     }
@@ -556,7 +565,12 @@ fn combo_loss(intent: &Intent) -> Result<i128, &'static str> {
         return Err("max_loss_unknown");
     }
     if cs.iter().any(|c| c.expiry != cs[0].expiry) {
-        return calendar_loss(intent, &cs);
+        let pair = calendar_loss(intent, &cs);
+        return if pair.is_err() && allow_calendars {
+            covered_calendar_loss(intent, &cs)
+        } else {
+            pair
+        };
     }
     // Per leg: its strike in cents, whether it is a put, and its signed ratio.
     let parts = intent
@@ -597,7 +611,8 @@ fn combo_loss(intent: &Intent) -> Result<i128, &'static str> {
 /// call at or below its strike, a put at or above) covers it, and the loss is the debit.
 /// A less favourable long (a call above the short strike, a put below it) leaves the gap
 /// between the strikes open, so the loss is the debit plus that gap. A short expiring after
-/// its long is unknown, as is anything with more legs or ratios other than one.
+/// its long is unknown, as is anything with more legs or ratios other than one (but see
+/// [`covered_calendar_loss`], under `--allow-calendars`).
 ///
 /// Every calendar or diagonal on a European root, call or put, is unknown whatever its strikes.
 /// The bound assumes that when the short expires the long is worth at least the short's payoff,
@@ -629,6 +644,70 @@ fn calendar_loss(intent: &Intent, cs: &[Contract]) -> Result<i128, &'static str>
     Ok(i128::from(intent.limit_cents) + gap.max(0))
 }
 
+/// The loss per unit of a covered calendar, under `--allow-calendars`: every short leg is
+/// covered by long legs of the same root, type and strike that expire strictly later, with at
+/// least its ratio between them, and no long's ratio is counted twice. Every long covers some
+/// earlier short, so no leg is left outside a calendar; a long may have more ratio than the
+/// shorts it covers. A double calendar (a put and a call calendar at two strikes) and a
+/// calendar sold 2 by 1 against two later longs are such combos; a diagonal (strikes that
+/// differ) of more than two legs is not.
+///
+/// When a short expires, an American long of the same strike expiring later is worth at least
+/// the short's payoff (it can be exercised), so each pair is worth at least zero and the combo
+/// can lose no more than its debit. Only a debit is bounded this way: a credit or a zero debit
+/// of this shape is `max_loss_unknown` (it would claim no loss at all). A European root (see
+/// [`calendar_loss`] for why) is `max_loss_unknown`.
+///
+/// Coverage is checked as a matching. A short can be covered by any long expiring after it, so
+/// the shorts expiring on or after any short's expiry need at least as much long ratio expiring
+/// strictly after that date; checked at every short's expiry, that is enough for a matching that
+/// counts each long once.
+fn covered_calendar_loss(intent: &Intent, cs: &[Contract]) -> Result<i128, &'static str> {
+    if intent.limit_cents <= 0 || EUROPEAN_ROOTS.contains(&cs[0].root) {
+        return Err("max_loss_unknown");
+    }
+    // Per type and strike: each leg's expiry and signed ratio (+ bought, - sold).
+    let mut groups: std::collections::BTreeMap<(bool, i128), Vec<(i64, i64)>> =
+        std::collections::BTreeMap::new();
+    for (l, c) in intent.legs.iter().zip(cs) {
+        let w = i64::from(l.ratio);
+        groups
+            .entry((c.put, strike_of(c)?))
+            .or_default()
+            .push((c.expiry, if l.buy { w } else { -w }));
+    }
+    for legs in groups.values() {
+        for &(e, q) in legs {
+            let paired = legs.iter().any(|&(e2, q2)| {
+                if q < 0 {
+                    q2 > 0 && e2 > e
+                } else {
+                    q2 < 0 && e2 < e
+                }
+            });
+            if !paired {
+                return Err("max_loss_unknown");
+            }
+        }
+        for &(e, _) in legs.iter().filter(|l| l.1 < 0) {
+            let short: i64 = legs
+                .iter()
+                .filter(|l| l.1 < 0 && l.0 >= e)
+                .map(|l| -l.1)
+                .sum();
+            let long: i64 = legs
+                .iter()
+                .filter(|l| l.1 > 0 && l.0 > e)
+                .map(|l| l.1)
+                .sum();
+            if short > long {
+                return Err("max_loss_unknown");
+            }
+        }
+    }
+    Ok(i128::from(intent.limit_cents))
+}
+
 fn strike_of(c: &Contract) -> Result<i128, &'static str> {
     c.strike_cents.map(i128::from).ok_or("max_loss_unknown")
 }
@@ -643,7 +722,7 @@ pub(crate) fn hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Class, Intent, Leg, MaxLoss, max_loss};
+    use super::{Class, Intent, Leg, MaxLoss, max_loss, max_loss_with};
 
     fn max_loss_cents(o: &Intent) -> Result<u64, &'static str> {
         max_loss(o).map(|m| m.cents)
@@ -1023,6 +1102,227 @@ mod tests {
             1,
         );
         assert_eq!(max_loss_cents(&cal), Ok(100 * 100));
+    }
+
+    /// The loss with `--allow-calendars` on.
+    fn with_calendars(o: &Intent) -> Result<u64, &'static str> {
+        max_loss_with(o, true).map(|m| m.cents)
+    }
+
+    const P570_NEXT: &str = "SPY261012P00570000";
+    const P565_NEXT: &str = "SPY261012P00565000";
+    const C580_LATER: &str = "SPY261019C00580000";
+
+    /// Sell the 5 Oct 570 put and 580 call, buy the 12 Oct 570 put and 580 call.
+    fn double_calendar(limit: i64, qty: u32) -> Intent {
+        order(
+            vec![
+                leg(P570, false, true),
+                leg(P570_NEXT, true, true),
+                leg(C580, false, true),
+                leg(C580_NEXT, true, true),
+            ],
+            limit,
+            qty,
+        )
+    }
+
+    #[test]
+    fn a_double_calendar_loses_its_debit_with_calendars_allowed() {
+        // A $2.40 debit, two units: each short is covered by the later long of its type and
+        // strike, so the loss is the debit, $2.40 x 100 x 2 = $480.
+        let o = double_calendar(240, 2);
+        assert_eq!(with_calendars(&o), Ok(240 * 100 * 2));
+        assert_eq!(
+            max_loss_with(&o, true).unwrap().premium_cents,
+            Some(240 * 100 * 2)
+        );
+        // The legs in another order are the same combo.
+        let mut shuffled = o.clone();
+        shuffled.legs.reverse();
+        assert_eq!(with_calendars(&shuffled), Ok(240 * 100 * 2));
+    }
+
+    #[test]
+    fn a_double_calendar_is_unknown_with_calendars_off() {
+        let o = double_calendar(240, 2);
+        assert_eq!(max_loss_cents(&o), Err("max_loss_unknown"));
+        assert_eq!(max_loss_with(&o, false), max_loss(&o));
+    }
+
+    #[test]
+    fn a_single_calendar_keeps_its_debit_with_calendars_allowed() {
+        let cal = order(
+            vec![leg(C580, false, true), leg(C580_NEXT, true, true)],
+            150,
+            2,
+        );
+        assert_eq!(with_calendars(&cal), Ok(150 * 2 * 100));
+        assert_eq!(with_calendars(&cal), max_loss_cents(&cal));
+    }
+
+    #[test]
+    fn a_diagonal_is_not_a_covered_calendar() {
+        // A double diagonal: the backs are at other strikes, so neither short is covered.
+        let o = order(
+            vec![
+                leg(P570, false, true),
+                leg(P565_NEXT, true, true),
+                leg(C580, false, true),
+                leg(C585_NEXT, true, true),
+            ],
+            240,
+            1,
+        );
+        assert_eq!(with_calendars(&o), Err("max_loss_unknown"));
+        // A two-leg diagonal keeps the bound it has without the flag: debit plus the gap.
+        let diag = order(
+            vec![leg(C580, false, true), leg(C585_NEXT, true, true)],
+            150,
+            1,
+        );
+        assert_eq!(with_calendars(&diag), Ok((150 + 500) * 100));
+    }
+
+    #[test]
+    fn a_short_covered_only_in_its_own_expiry_is_unknown() {
+        // The 580 calls are a calendar, but the 570 put sold on 12 Oct has only a 565 put of the
+        // same expiry beside it: a vertical, not a later long of its strike.
+        let o = order(
+            vec![
+                leg(C580, false, true),
+                leg(C580_NEXT, true, true),
+                leg(P570_NEXT, false, true),
+                leg(P565_NEXT, true, true),
+            ],
+            100,
+            1,
+        );
+        assert_eq!(with_calendars(&o), Err("max_loss_unknown"));
+        // A long of the same expiry never covers: the cover must expire strictly later.
+        // (Validation refuses the repeated symbol; the rule refuses the shape anyway.)
+        let same = order(
+            vec![
+                leg(C580, false, true),
+                leg(C580_NEXT, true, true),
+                leg(P570_NEXT, false, true),
+                leg(P570_NEXT, true, true),
+            ],
+            100,
+            1,
+        );
+        assert_eq!(with_calendars(&same), Err("max_loss_unknown"));
+    }
+
+    #[test]
+    fn a_back_with_less_quantity_is_unknown() {
+        // Sell two front 580 calls against one back: one is uncovered.
+        let o = order(
+            vec![ratio_leg(C580, false, 2), ratio_leg(C580_NEXT, true, 1)],
+            50,
+            1,
+        );
+        assert_eq!(with_calendars(&o), Err("max_loss_unknown"));
+        // The same on the put side of a double calendar.
+        let d = order(
+            vec![
+                ratio_leg(P570, false, 2),
+                ratio_leg(P570_NEXT, true, 1),
+                ratio_leg(C580, false, 2),
+                ratio_leg(C580_NEXT, true, 3),
+            ],
+            100,
+            1,
+        );
+        assert_eq!(with_calendars(&d), Err("max_loss_unknown"));
+    }
+
+    #[test]
+    fn calendars_in_ratio_are_covered_without_double_counting() {
+        // Sell one front 580 call and buy two backs: covered, with a long to spare.
+        let more = order(
+            vec![ratio_leg(C580, false, 1), ratio_leg(C580_NEXT, true, 2)],
+            300,
+            3,
+        );
+        assert_eq!(with_calendars(&more), Ok(300 * 100 * 3));
+        // Sell two front 580 calls, buy one on 12 Oct and one on 19 Oct: each covers one.
+        let spread = order(
+            vec![
+                ratio_leg(C580, false, 2),
+                ratio_leg(C580_NEXT, true, 1),
+                ratio_leg(C580_LATER, true, 1),
+            ],
+            200,
+            1,
+        );
+        assert_eq!(with_calendars(&spread), Ok(200 * 100));
+        // Sell the 5 Oct and the 12 Oct 580 calls against one 19 Oct: the long can cover only
+        // one of them.
+        let twice = order(
+            vec![
+                leg(C580, false, true),
+                leg(C580_NEXT, false, true),
+                leg(C580_LATER, true, true),
+            ],
+            100,
+            1,
+        );
+        assert_eq!(with_calendars(&twice), Err("max_loss_unknown"));
+        // With two of the 19 Oct, both are covered.
+        let both = order(
+            vec![
+                ratio_leg(C580, false, 1),
+                ratio_leg(C580_NEXT, false, 1),
+                ratio_leg(C580_LATER, true, 2),
+            ],
+            100,
+            1,
+        );
+        assert_eq!(with_calendars(&both), Ok(100 * 100));
+    }
+
+    #[test]
+    fn a_covered_calendar_needs_a_debit_and_every_leg_in_it() {
+        // A credit or no debit claims no loss, so it is not bounded this way.
+        assert_eq!(
+            with_calendars(&double_calendar(-50, 1)),
+            Err("max_loss_unknown")
+        );
+        assert_eq!(
+            with_calendars(&double_calendar(0, 1)),
+            Err("max_loss_unknown")
+        );
+        // A long that covers no short is not part of a calendar.
+        let stray = order(
+            vec![
+                ratio_leg(C580, false, 1),
+                ratio_leg(C580_NEXT, true, 1),
+                ratio_leg(P570_NEXT, true, 1),
+            ],
+            200,
+            1,
+        );
+        assert_eq!(with_calendars(&stray), Err("max_loss_unknown"));
+        // A closing leg is never sized.
+        let mut closing = double_calendar(240, 1);
+        closing.legs[1].open = false;
+        assert_eq!(with_calendars(&closing), Err("max_loss_unknown"));
+    }
+
+    #[test]
+    fn a_european_double_calendar_is_unknown() {
+        let o = order(
+            vec![
+                leg("SPXW261016P05700000", false, true),
+                leg("SPXW261023P05700000", true, true),
+                leg("SPXW261016C05800000", false, true),
+                leg("SPXW261023C05800000", true, true),
+            ],
+            900,
+            1,
+        );
+        assert_eq!(with_calendars(&o), Err("max_loss_unknown"));
     }
 
     #[test]

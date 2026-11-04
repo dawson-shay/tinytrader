@@ -290,7 +290,7 @@ impl SimBroker {
             dropped: false,
         };
         sim.rng = sim.s.seed;
-        let preload: Vec<_> = sim.s.orders.drain(..).collect();
+        let preload = std::mem::take(&mut sim.s.orders);
         for p in preload {
             let leg = SimLeg {
                 symbol: p.symbol,
@@ -514,7 +514,7 @@ impl SimBroker {
             .map(|l| {
                 let q = self.s.quotes.get(&l.symbol).copied().unwrap_or_default();
                 let side = if l.buy { q.1 } else { q.0 };
-                side.map_or(if o.combo { 0 } else { o.limit_cents }, |c| c) * CENT
+                side.unwrap_or(if o.combo { 0 } else { o.limit_cents }) * CENT
             })
             .collect()
     }
