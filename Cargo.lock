@@ -727,6 +727,7 @@ dependencies = [
  "clap",
  "databento",
  "dbn",
+ "fs4",
  "futures-util",
  "reqwest 0.13.5",
  "rustls",

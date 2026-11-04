@@ -249,8 +249,7 @@ mod tests {
 
     #[test]
     fn an_unresolved_submission_blocks_the_same_request_until_reconciled() {
-        let d = std::env::temp_dir().join(format!("tinytrader-ledger-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
+        let d = scratch("unresolved");
         let path = d.join("submissions.jsonl");
         let r = fingerprint(
             "OPRA.PILLAR",
@@ -291,11 +290,26 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
     }
 
+    /// A new, empty folder of this test's own: made exclusively (`create_dir`
+    /// fails on one that exists), under a name no other test or process shares,
+    /// so tests running at once in a shared temp dir never meet.
     fn scratch(name: &str) -> PathBuf {
-        let d =
-            std::env::temp_dir().join(format!("tinytrader-ledger-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&d);
-        d
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..1000 {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos());
+            let d = std::env::temp_dir().join(format!(
+                "tinytrader-ledger-{name}-{}-{nanos}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::SeqCst)
+            ));
+            if fs::create_dir(&d).is_ok() {
+                return d;
+            }
+        }
+        panic!("no new folder in {}", std::env::temp_dir().display());
     }
 
     #[test]

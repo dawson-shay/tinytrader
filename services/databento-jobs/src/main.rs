@@ -117,6 +117,10 @@ struct Args {
     /// data is what research reads anyway; the key never goes there.
     #[arg(long, env = "JOBS_CACHE_DIR")]
     cache_dir: Option<std::path::PathBuf>,
+    /// Free space the cache never takes its volume below, in GB: a download
+    /// waits rather than go past it (or past 95% used, whichever keeps more).
+    #[arg(long, env = "JOBS_CACHE_MIN_FREE_GB", default_value_t = 20)]
+    cache_min_free_gb: u64,
 }
 
 /// How long a price stays good for submitting: an hour when it costs
@@ -419,6 +423,8 @@ struct Transfer {
     done_bytes: u64,
     total_bytes: u64,
     error: Option<String>,
+    /// For a cache request: when it was asked for.
+    requested_at: Option<f64>,
 }
 
 struct Jobs {
@@ -448,8 +454,20 @@ struct Jobs {
     transfers: Mutex<HashMap<String, Transfer>>,
     /// Where `POST /cache/{job}` downloads to; none, refused.
     cache_dir: Option<std::path::PathBuf>,
-    /// Downloads into the cache, by job: their progress.
+    /// Downloads into the cache, by job: their progress. Written only by the
+    /// cache worker (and `DELETE /cache` for one that has ended); read by
+    /// `GET /cache` and `GET /jobs`.
     caching: Mutex<HashMap<String, Transfer>>,
+    /// The cache worker's queue, the one bounded structure of cache requests.
+    /// Started on first use.
+    cache_queue: std::sync::OnceLock<tokio::sync::mpsc::Sender<CacheAsk>>,
+    /// Free space the cache keeps on its volume: at least this many bytes, and
+    /// at least this percentage of the volume.
+    cache_min_free: u64,
+    cache_min_free_pct: u64,
+    /// In tests, a floor that can be raised under a running worker.
+    #[cfg(test)]
+    cache_floor_for_tests: AtomicU64,
     /// Jobs submitted here, downloaded once done.
     follow: Mutex<HashSet<String>>,
     /// Jobs whose download is queued or running: never a second.
@@ -519,6 +537,11 @@ impl Jobs {
             transfers: Mutex::default(),
             cache_dir: None,
             caching: Mutex::default(),
+            cache_queue: std::sync::OnceLock::new(),
+            cache_min_free: 20_000_000_000,
+            cache_min_free_pct: 5,
+            #[cfg(test)]
+            cache_floor_for_tests: AtomicU64::new(0),
             follow: Mutex::default(),
             in_flight: Mutex::default(),
             tries: Mutex::default(),
@@ -635,6 +658,7 @@ async fn main() {
             .build()
             .expect("http client"),
     );
+    jobs.cache_min_free = args.cache_min_free_gb.saturating_mul(1_000_000_000);
     jobs.cache_dir = args.cache_dir.clone().or_else(|| {
         args.ledger
             .as_ref()
@@ -709,6 +733,7 @@ async fn main() {
         .route("/ledger/unresolved", get(ledger_unresolved))
         .route("/ledger/resolve", post(resolve))
         .route("/download/{job}", post(download))
+        .route("/cache", get(cache_list))
         .route("/cache/{job}", post(cache).delete(uncache))
         // A web page of another origin can't submit (or pay for) anything.
         .layer(axum::middleware::from_fn(
@@ -736,6 +761,7 @@ async fn main() {
 
     // Databento's day conditions for what the store holds, daily.
     tokio::spawn(conditions::every_day(jobs.clone()));
+    resume_caching(&jobs);
     let every = Duration::from_secs(args.refresh.max(10));
     let mut calendar = (tinytrader_schedule::Calendar::default(), None::<Instant>);
     loop {
@@ -2529,10 +2555,22 @@ async fn download(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>)
     (StatusCode::ACCEPTED, Json(json!({ "job": job })))
 }
 
-/// Download a done job's files into the cache folder (`JOBS_CACHE_DIR`),
-/// not the store: a copy for reading while the store can't file it. The key
-/// stays here; each file is checked against Databento's size and SHA-256
-/// before it takes its name. Files already there and whole are kept.
+/// How many cache requests may wait at once; past that, `503`.
+const CACHE_QUEUE: usize = 256;
+
+/// The marker a cache request leaves in its folder until it has ended, so a
+/// restart picks the request up again.
+const REQUESTED: &str = "REQUESTED";
+
+/// Queue a done job's files for the cache folder (`JOBS_CACHE_DIR`), not the
+/// store: a copy for reading while the store can't file it. The key stays
+/// here; each file is checked against Databento's size and SHA-256 before it
+/// takes its name. Files already there and whole are kept.
+///
+/// One worker downloads them, a job at a time, in the order asked. While
+/// capture is live it waits, and a request made then is queued and runs when
+/// capture ends. A request survives a restart (its `REQUESTED` marker), and a
+/// network error or Databento's 429 or 5xx is tried again later, not failed.
 async fn cache(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) -> Reply {
     let Some(root) = jobs.cache_dir.clone() else {
         return refused(
@@ -2550,47 +2588,323 @@ async fn cache(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) ->
         Ok(_) => {}
         Err(e) => return refused(StatusCode::BAD_GATEWAY, format!("job {job}: {e}")),
     }
-    {
-        let mut c = lock(&jobs.caching);
-        if c.get(&job)
-            .is_some_and(|t| t.error.is_none() && t.state != "cached")
-        {
-            return refused(StatusCode::CONFLICT, "already caching");
-        }
-        c.insert(
-            job.clone(),
-            Transfer {
-                state: "waiting".into(),
-                ..Transfer::default()
-            },
+    let dir = root.join(&job);
+    let marker = dir.join(REQUESTED);
+    // Its marker is there from the moment it's asked for until it has ended,
+    // before the worker has even taken it.
+    if marker.exists() || lock(&jobs.caching).get(&job).is_some_and(cache_active) {
+        return refused(StatusCode::CONFLICT, "already queued or caching");
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
+        std::fs::write(
+            &marker,
+            json!({ "job": job, "requested_at": tinytrader_observe::unix_seconds() }).to_string(),
+        )
+    }) {
+        return refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("{}: {e}", marker.display()),
         );
     }
-    let dir = root.join(&job);
-    let task = jobs.clone();
-    let id = job.clone();
+    if cache_sender(&jobs)
+        .try_send(CacheAsk {
+            job: job.clone(),
+            due: None,
+        })
+        .is_err()
+    {
+        let _ = std::fs::remove_file(&marker);
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("busy: {CACHE_QUEUE} cache requests are already waiting; try again later"),
+        );
+    }
+    lock(&jobs.caching).insert(
+        job.clone(),
+        Transfer {
+            state: "queued".into(),
+            requested_at: Some(tinytrader_observe::unix_seconds()),
+            ..Transfer::default()
+        },
+    );
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": job, "folder": dir, "state": "queued" })),
+    )
+}
+
+/// Whether a cache request is still to run or running.
+fn cache_active(t: &Transfer) -> bool {
+    t.error.is_none() && t.state != "cached"
+}
+
+/// Every cache request this run has seen: queued (with how many are ahead),
+/// waiting for capture to end, downloading, retrying, cached or failed.
+async fn cache_list(AxState(jobs): AxState<Shared>) -> Reply {
+    let mut rows: Vec<Value> = lock(&jobs.caching)
+        .iter()
+        .map(|(id, t)| {
+            json!({ "job": id, "state": t.state, "position": Value::Null, "file": t.file,
+                    "done_bytes": t.done_bytes, "total_bytes": t.total_bytes, "error": t.error,
+                    "requested_at": t.requested_at })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        a["requested_at"]
+            .as_f64()
+            .partial_cmp(&b["requested_at"].as_f64())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    // A queued request's position: how many still to run were asked for first.
+    let mut ahead = 0;
+    for r in &mut rows {
+        let state = r["state"].as_str().unwrap_or_default().to_owned();
+        if state == "queued" {
+            r["position"] = json!(ahead);
+        }
+        if state != "cached" && state != "failed" {
+            ahead += 1;
+        }
+    }
+    let waiting = rows.iter().filter(|r| r["state"] == "queued").count();
+    (
+        StatusCode::OK,
+        Json(json!({ "cache": rows, "queued": waiting, "capacity": CACHE_QUEUE })),
+    )
+}
+
+/// A cache request in the worker's queue: its job, and when it may next run
+/// (none: now). A request that must wait (a transient error, too little disk)
+/// goes to the back with a time, so the rest proceed.
+struct CacheAsk {
+    job: String,
+    due: Option<Instant>,
+}
+
+/// The cache worker's queue, starting the worker on first use.
+fn cache_sender(jobs: &Shared) -> &tokio::sync::mpsc::Sender<CacheAsk> {
+    jobs.cache_queue.get_or_init(|| {
+        let (tx, rx) = tokio::sync::mpsc::channel(CACHE_QUEUE);
+        tokio::spawn(cache_worker(Arc::clone(jobs), tx.clone(), rx));
+        tx
+    })
+}
+
+/// At startup, the cache requests a restart interrupted: every folder with a
+/// `REQUESTED` marker and no `COMPLETE`, queued again in the order asked. All
+/// of them are queued, waiting for room when there are more than the queue
+/// holds; until then new requests are refused as busy.
+fn resume_caching(jobs: &Shared) {
+    let Some(root) = jobs.cache_dir.clone() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut asked: Vec<(f64, String)> = Vec::new();
+    for e in entries.flatten() {
+        let dir = e.path();
+        let Some(job) = dir.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
+            continue;
+        };
+        let Ok(text) = std::fs::read_to_string(dir.join(REQUESTED)) else {
+            continue;
+        };
+        if dir.join("COMPLETE").exists() {
+            let _ = std::fs::remove_file(dir.join(REQUESTED));
+            continue;
+        }
+        let at = serde_json::from_str::<Value>(&text)
+            .ok()
+            .and_then(|v| v["requested_at"].as_f64())
+            .unwrap_or(0.0);
+        asked.push((at, job));
+    }
+    asked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    {
+        let mut c = lock(&jobs.caching);
+        for (at, job) in &asked {
+            c.insert(
+                job.clone(),
+                Transfer {
+                    state: "queued".into(),
+                    requested_at: Some(*at),
+                    ..Transfer::default()
+                },
+            );
+        }
+    }
+    let tx = cache_sender(jobs).clone();
     tokio::spawn(async move {
-        let result = fetch_to_cache(&task, &id, &dir).await;
-        let mut c = lock(&task.caching);
-        let t = c.entry(id.clone()).or_default();
-        match result {
-            Ok(n) => {
-                t.state = "cached".into();
-                task.events.push(
-                    format!("cached {id} in {} ({n} files)", dir.display()),
-                    id.clone(),
-                );
-            }
-            Err(e) => {
-                t.state = "failed".into();
-                t.error = Some(e.clone());
-                task.events.push(format!("caching {id} failed: {e}"), e);
+        for (_, job) in asked {
+            if tx.send(CacheAsk { job, due: None }).await.is_err() {
+                return;
             }
         }
     });
-    (
-        StatusCode::ACCEPTED,
-        Json(json!({ "job": job, "folder": root.join(&job) })),
-    )
+}
+
+/// The one worker that fills the cache, from the one bounded queue: a job at a
+/// time, in order. A job that has to wait goes to the back of the queue with
+/// the time it may run again, so a dead or stalled job never holds up the
+/// rest.
+async fn cache_worker(
+    jobs: Shared,
+    tx: tokio::sync::mpsc::Sender<CacheAsk>,
+    mut rx: tokio::sync::mpsc::Receiver<CacheAsk>,
+) {
+    // Each waiting job's next backoff: only jobs in the queue, so bounded by it.
+    let mut backoff: HashMap<String, Duration> = HashMap::new();
+    // Requests passed over in a row because they weren't due yet.
+    let mut passed = 0usize;
+    while let Some(ask) = rx.recv().await {
+        if let Some(due) = ask.due
+            && due > Instant::now()
+        {
+            passed += 1;
+            // Everything in the queue is waiting: rest a moment before looking
+            // again, rather than spin.
+            if passed > rx.len() {
+                let rest = due.saturating_duration_since(Instant::now());
+                tokio::time::sleep(rest.min(Duration::from_secs(1))).await;
+                passed = 0;
+            }
+            match tx.try_send(ask) {
+                Ok(()) => continue,
+                // The queue filled meanwhile: this one waits its time and runs.
+                Err(e) => {
+                    let ask = e.into_inner();
+                    if let Some(due) = ask.due {
+                        tokio::time::sleep_until(due.into()).await;
+                    }
+                    run_cache_turn(&jobs, &tx, &mut backoff, ask.job).await;
+                }
+            }
+            continue;
+        }
+        passed = 0;
+        run_cache_turn(&jobs, &tx, &mut backoff, ask.job).await;
+    }
+}
+
+/// One turn of a cache request: done, failed, or back in the queue for later.
+async fn run_cache_turn(
+    jobs: &Jobs,
+    tx: &tokio::sync::mpsc::Sender<CacheAsk>,
+    backoff: &mut HashMap<String, Duration>,
+    mut job: String,
+) {
+    let Some(dir) = jobs.cache_dir.as_ref().map(|r| r.join(&job)) else {
+        return;
+    };
+    loop {
+        set_cache(jobs, &job, |t| t.state = "starting".into());
+        let (state, wait) = match fetch_to_cache(jobs, &job, &dir).await {
+            Ok(n) => {
+                backoff.remove(&job);
+                let _ = std::fs::remove_file(dir.join(REQUESTED));
+                set_cache(jobs, &job, |t| t.state = "cached".into());
+                jobs.events.push(
+                    format!("cached {job} in {} ({n} files)", dir.display()),
+                    job.clone(),
+                );
+                return;
+            }
+            Err(CacheError::Permanent(e)) => {
+                backoff.remove(&job);
+                let _ = std::fs::remove_file(dir.join(REQUESTED));
+                set_cache(jobs, &job, |t| {
+                    t.state = "failed".into();
+                    t.error = Some(e.clone());
+                });
+                jobs.events.push(format!("caching {job} failed: {e}"), e);
+                return;
+            }
+            Err(CacheError::Transient(e)) => {
+                let first = Duration::from_millis(if cfg!(test) { 20 } else { 15_000 });
+                let wait = backoff.get(&job).copied().unwrap_or(first);
+                backoff.insert(job.clone(), (wait * 2).min(Duration::from_secs(600)));
+                eprintln!("databento-jobs: cache {job}: {e}; trying again in {wait:?}");
+                (format!("retrying: {e}"), wait)
+            }
+            Err(CacheError::Disk(e)) => (
+                format!("waiting for disk: {e}"),
+                Duration::from_millis(if cfg!(test) { 20 } else { 60_000 }),
+            ),
+        };
+        set_cache(jobs, &job, |t| t.state = state);
+        let ask = CacheAsk {
+            job,
+            due: Some(Instant::now() + wait),
+        };
+        match tx.try_send(ask) {
+            Ok(()) => return,
+            // No room behind the others (the worker is its own queue's only
+            // reader, so it can't wait for room): it waits here instead, and
+            // has its next turn now.
+            Err(e) => {
+                job = e.into_inner().job;
+                tokio::time::sleep(wait).await;
+            }
+        }
+    }
+}
+
+/// A cache download's error: one worth trying again later (the network,
+/// Databento's 429 or 5xx, a file cut short), too little disk for it yet, or
+/// one that won't change.
+enum CacheError {
+    Transient(String),
+    Disk(String),
+    Permanent(String),
+}
+
+/// Why a job's files couldn't be listed: permanent if the job has expired, is
+/// no longer done, or Databento answered a status that asking again won't
+/// change (a 4xx but 408 and 429); otherwise transient. Decided on the job's
+/// state and the HTTP status, never on the error's text.
+async fn listing_error(jobs: &Jobs, job: &str, e: api::CallError) -> CacheError {
+    match jobs.db.job_checked(job).await {
+        Ok(j) if j.state == JobState::Expired => {
+            CacheError::Permanent(format!("the job has expired: {e}"))
+        }
+        Ok(j) if j.state != JobState::Done => {
+            CacheError::Permanent(format!("the job is no longer done: {e}"))
+        }
+        Err(e2) if e2.permanent() => CacheError::Permanent(format!(
+            "the job: Databento answered {}: {e2}",
+            e2.status.unwrap_or_default()
+        )),
+        _ if e.permanent() => CacheError::Permanent(format!(
+            "list files: Databento answered {}: {e}",
+            e.status.unwrap_or_default()
+        )),
+        _ => CacheError::Transient(format!("list files: {e}")),
+    }
+}
+
+/// Whether `need` more bytes fit on the cache's volume, keeping its floor free:
+/// at least `cache_min_free` bytes, and `cache_min_free_pct` of the volume.
+fn disk_room(jobs: &Jobs, dir: &std::path::Path, need: u64) -> Result<(), CacheError> {
+    let (free, total) = (fs4::available_space(dir), fs4::total_space(dir));
+    let (Ok(free), Ok(total)) = (free, total) else {
+        return Err(CacheError::Disk(format!(
+            "{}: can't read its free space",
+            dir.display()
+        )));
+    };
+    let floor = jobs
+        .cache_min_free
+        .max(total / 100 * jobs.cache_min_free_pct);
+    #[cfg(test)]
+    let floor = floor.max(jobs.cache_floor_for_tests.load(Ordering::SeqCst));
+    if free.saturating_sub(need) < floor {
+        return Err(CacheError::Disk(format!(
+            "{need} bytes to download, {free} free on {}, keeping {floor} free",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// Delete a job's cache folder (refused while it is being filled).
@@ -2604,11 +2918,8 @@ async fn uncache(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) 
     if !job.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') || job.is_empty() {
         return refused(StatusCode::BAD_REQUEST, "not a job ID");
     }
-    if lock(&jobs.caching)
-        .get(&job)
-        .is_some_and(|t| t.error.is_none() && t.state != "cached")
-    {
-        return refused(StatusCode::CONFLICT, "still caching");
+    if lock(&jobs.caching).get(&job).is_some_and(cache_active) {
+        return refused(StatusCode::CONFLICT, "still queued or caching");
     }
     let dir = root.join(&job);
     match std::fs::remove_dir_all(&dir) {
@@ -2633,14 +2944,26 @@ fn set_cache(jobs: &Jobs, job: &str, f: impl FnOnce(&mut Transfer)) {
 /// Every file of a done job into `dir`, then its manifest. Like the store's
 /// downloads it waits while capture is live. Returns how many files it
 /// downloaded (whole ones already there are kept).
-async fn fetch_to_cache(jobs: &Jobs, job: &str, dir: &std::path::Path) -> Result<usize, String> {
+async fn fetch_to_cache(
+    jobs: &Jobs,
+    job: &str,
+    dir: &std::path::Path,
+) -> Result<usize, CacheError> {
+    use CacheError::{Permanent, Transient};
     use std::os::unix::fs::PermissionsExt as _;
-    let files = jobs
-        .db
-        .files(job)
-        .await
-        .map_err(|e| format!("list files: {e}"))?;
-    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let files = match jobs.db.files_checked(job).await {
+        Ok(f) => f,
+        Err(e) => return Err(listing_error(jobs, job, e).await),
+    };
+    std::fs::create_dir_all(dir).map_err(|e| Permanent(format!("{}: {e}", dir.display())))?;
+    // The whole job must fit before any of it is fetched (files already there
+    // at their size count as had); each file is checked again before it is.
+    let missing: u64 = files
+        .iter()
+        .filter(|f| std::fs::metadata(dir.join(&f.filename)).map_or(true, |m| m.len() != f.size))
+        .map(|f| f.size)
+        .sum();
+    disk_room(jobs, dir, missing)?;
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
     // COMPLETE is written last: until then the folder isn't whole (Databento's
     // own file list has a manifest.json, which arrives like any other file).
@@ -2654,7 +2977,7 @@ async fn fetch_to_cache(jobs: &Jobs, job: &str, dir: &std::path::Path) -> Result
     let (mut done, mut fetched) = (0u64, 0usize);
     for f in &files {
         if f.filename.contains('/') || f.filename.starts_with('.') {
-            return Err(format!("{}: not a plain file name", f.filename));
+            return Err(Permanent(format!("{}: not a plain file name", f.filename)));
         }
         set_cache(jobs, job, |t| t.file = f.filename.clone());
         let path = dir.join(&f.filename);
@@ -2671,24 +2994,28 @@ async fn fetch_to_cache(jobs: &Jobs, job: &str, dir: &std::path::Path) -> Result
                 };
                 let Some(why) = why else { break };
                 set_cache(jobs, job, |t| t.state = why.clone());
-                tokio::time::sleep(Duration::from_secs(15)).await;
+                tokio::time::sleep(Duration::from_millis(if cfg!(test) { 20 } else { 15_000 }))
+                    .await;
             }
+            disk_room(jobs, dir, f.size)?;
             set_cache(jobs, job, |t| t.state = "downloading".into());
             let url = f
                 .urls
                 .get("https")
-                .ok_or_else(|| format!("{}: no https URL", f.filename))?;
+                .ok_or_else(|| Permanent(format!("{}: no https URL", f.filename)))?;
             let mut attempt = 0;
             loop {
                 attempt += 1;
                 match copy_to_file(jobs, job, url, &path, f.size, &want, done).await {
                     Ok(()) => break,
-                    Err(e) if attempt < 3 => {
+                    Err(Transient(e)) if attempt < 3 => {
                         eprintln!("databento-jobs: cache {job}/{}: {e}; retrying", f.filename);
                         let wait = if cfg!(test) { 0 } else { 5 * attempt };
                         tokio::time::sleep(Duration::from_secs(wait)).await;
                     }
-                    Err(e) => return Err(format!("{}: {e}", f.filename)),
+                    Err(Transient(e)) => return Err(Transient(format!("{}: {e}", f.filename))),
+                    Err(Permanent(e)) => return Err(Permanent(format!("{}: {e}", f.filename))),
+                    Err(CacheError::Disk(e)) => return Err(CacheError::Disk(e)),
                 }
             }
             fetched += 1;
@@ -2706,7 +3033,7 @@ async fn fetch_to_cache(jobs: &Jobs, job: &str, dir: &std::path::Path) -> Result
             &path,
             serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
         )
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+        .map_err(|e| Permanent(format!("{}: {e}", path.display())))?;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     }
     let done = json!({
@@ -2719,7 +3046,7 @@ async fn fetch_to_cache(jobs: &Jobs, job: &str, dir: &std::path::Path) -> Result
         &complete,
         serde_json::to_vec_pretty(&done).unwrap_or_default(),
     )
-    .map_err(|e| format!("{}: {e}", complete.display()))?;
+    .map_err(|e| Permanent(format!("{}: {e}", complete.display())))?;
     let _ = std::fs::set_permissions(&complete, std::fs::Permissions::from_mode(0o644));
     Ok(fetched)
 }
@@ -2734,7 +3061,8 @@ async fn copy_to_file(
     size: u64,
     sha256: &str,
     before: u64,
-) -> Result<(), String> {
+) -> Result<(), CacheError> {
+    use CacheError::{Permanent, Transient};
     use sha2::Digest as _;
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;
@@ -2750,19 +3078,28 @@ async fn copy_to_file(
         .basic_auth(&jobs.key, None::<&str>)
         .send()
         .await
-        .map_err(|e| e.to_string())?;
-    if !resp.status().is_success() {
-        return Err(format!("Databento answered {}", resp.status()));
+        .map_err(|e| Transient(e.to_string()))?;
+    let status = resp.status();
+    if !status.is_success() {
+        let m = format!("Databento answered {status}");
+        return Err(
+            if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                Transient(m)
+            } else {
+                Permanent(m)
+            },
+        );
     }
-    let mut out = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+    let mut out =
+        std::fs::File::create(&part).map_err(|e| Permanent(format!("{}: {e}", part.display())))?;
     let mut hasher = sha2::Sha256::new();
     let mut got = 0u64;
     let mut stream = resp.bytes_stream();
     let mut tick = Instant::now();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| e.to_string())?;
+        let chunk = chunk.map_err(|e| Transient(e.to_string()))?;
         out.write_all(&chunk)
-            .map_err(|e| format!("{}: {e}", part.display()))?;
+            .map_err(|e| Permanent(format!("{}: {e}", part.display())))?;
         hasher.update(&chunk);
         got += chunk.len() as u64;
         if tick.elapsed() >= Duration::from_secs(1) {
@@ -2771,7 +3108,7 @@ async fn copy_to_file(
         }
     }
     out.sync_all()
-        .map_err(|e| format!("{}: {e}", part.display()))?;
+        .map_err(|e| Permanent(format!("{}: {e}", part.display())))?;
     drop(out);
     let hash: String = hasher
         .finalize()
@@ -2780,12 +3117,17 @@ async fn copy_to_file(
         .collect();
     if got != size || (!sha256.is_empty() && hash != sha256) {
         let _ = std::fs::remove_file(&part);
-        return Err(format!(
-            "got {got} bytes with SHA-256 {hash}; Databento lists {size} bytes, {sha256}"
-        ));
+        let m =
+            format!("got {got} bytes with SHA-256 {hash}; Databento lists {size} bytes, {sha256}");
+        // Cut short is the connection's doing; the whole size with another hash isn't.
+        return Err(if got < size {
+            Transient(m)
+        } else {
+            Permanent(m)
+        });
     }
     let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o644));
-    std::fs::rename(&part, path).map_err(|e| format!("{}: {e}", path.display()))
+    std::fs::rename(&part, path).map_err(|e| Permanent(format!("{}: {e}", path.display())))
 }
 
 /// The SHA-256 of a file, as lowercase hex.
