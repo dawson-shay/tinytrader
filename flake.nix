@@ -31,12 +31,16 @@
         ./nix/web.nix
         ./nix/images.nix
         ./nix/watch.nix
+        ./nix/darwin-check.nix
       ];
 
       flake = {
         nixosModules.services = ./infra/modules/services.nix;
         # The same service definitions as launchd agents or daemons on macOS (nix-darwin).
         darwinModules.services = ./infra/modules/darwin-services.nix;
+        # For a deployment's own launchd jobs: `launchd.waitForNix argv` starts a
+        # job once the Nix store is mounted (infra/lib/launchd.nix).
+        lib.launchd = import ./infra/lib/launchd.nix;
 
         # The example host's services as plain systemd unit files, for Linux
         # distributions other than NixOS that have Nix installed: copy the

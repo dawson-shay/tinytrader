@@ -19,6 +19,22 @@ repository, the recipients and what leaves its premises (see
 | Market data | Captured and purchased datasets | Only if purchased again |
 | Caches | Build outputs, downloaded catalogs | Yes |
 
+## After a power cut
+
+On macOS the Nix store is a volume of its own, mounted a little after launchd
+starts the boot's daemons. A job whose program is in `/nix/store` then fails
+to start. launchd marks it `EX_CONFIG` (78), stops trying, and `KeepAlive`
+doesn't bring it back. So every native service the platform defines starts
+through `/bin/wait4path /nix/store` first, as nix-darwin's own `command` jobs
+do: it waits for the store, then becomes the service.
+
+- A deployment's own launchd jobs that set `ProgramArguments` should do the
+  same: tinytrader's flake exports `lib.launchd.waitForNix`.
+- A job that launchd gave up on before this fix stays down until someone
+  starts it: `launchctl print system/<label>` shows `last exit code = 78`, and
+  `sudo launchctl kickstart -k system/<label>` (or `gui/<uid>/<label>` for an
+  agent) starts it.
+
 ## Gaps
 
 Each gap names what's missing and where the fix belongs.

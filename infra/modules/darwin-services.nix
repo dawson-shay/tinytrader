@@ -2,7 +2,9 @@
 # on NixOS (service-options.nix), run as the host's primary user, so a service
 # sees the drives that user attaches.
 #
-# Each service is com.tinytrader.<name>, restarted when it exits (at most
+# Each service is com.tinytrader.<name>, started once the Nix store is
+# mounted (/bin/wait4path: at boot it may not be yet, and launchd never
+# retries a job that failed to exec), restarted when it exits (at most
 # every 10 s), logging to ~/Library/Logs/tinytrader/<name>.log. The system's
 # newsyslog rotates those logs past 10 MB, keeping 7. Its `launchd` option
 # says how it starts:
@@ -34,11 +36,13 @@ let
   home = "/Users/${user}";
   logs = "${home}/Library/Logs/tinytrader";
   label = name: "com.tinytrader.${name}";
+  inherit (import ../lib/launchd.nix) waitForNix;
 
   # What an agent and a daemon share.
   serviceConfig = name: svc: {
     Label = label name;
-    ProgramArguments = [ (lib.getExe svc.package) ] ++ svc.args;
+    # Once the Nix store is mounted: at boot it may not be yet (infra/lib/launchd.nix).
+    ProgramArguments = waitForNix ([ (lib.getExe svc.package) ] ++ svc.args);
     EnvironmentVariables =
       lib.optionalAttrs (svc.observe.port != null) {
         TINYTRADER_LISTEN = "${svc.observe.bind}:${toString svc.observe.port}";
