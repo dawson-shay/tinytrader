@@ -28,6 +28,7 @@
           ../libs/alpaca
           ../libs/openapi
           ../docs/api/openapi # the committed documents the tests compare with
+          ../clients/python/tests/fixtures # the replay file the relay's writer must reproduce
           ../apps/tui
           ../apps/tt
           ../services/ticker

@@ -90,6 +90,10 @@ jobs:
           python-version: "3.12"
       - name: Install the client
         run: pip install ./clients/python
+      # The relay's replay file read by databento's own reader
+      # (tests/test_replay_file.py); pinned, as research's environment is.
+      - name: Install databento
+        run: pip install databento==0.90.0
       - name: Test the client against a session
         working-directory: clients/python
         run: python -W error::ResourceWarning -m unittest discover -s tests -v
