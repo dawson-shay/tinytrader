@@ -21,6 +21,8 @@
 | `HISTORY_YIELD_TO`, `HISTORY_CAPTURE_HOURS` | Hold off while capture is live. |
 | `HISTORY_MAX_RPM` | Requests a minute (default 190), shared by every day in flight. |
 | `HISTORY_CONCURRENCY` | Days in flight at once, 1 to 8 (default 3). |
+| `HISTORY_MIN_FREE_GB` | Free space the spool's disk must have before a day starts (default 20); below it days wait, with an event. |
+| `HISTORY_SPOOL_MAX_AGE_DAYS` | A day's spool untouched this long is removed at startup (default 14). |
 
 ## Endpoints
 
@@ -40,19 +42,21 @@
   "order": "oldest-first", "trading_days": 1717, "days": ["2020-01-02", "..."], "symbol_days": 3434,
   "held": 250, "partly_held": 12, "to_fetch": 3184,
   "estimate": { "basis": "the mean of 250 days of this feed fetched", "days_measured": 250,
-                "pages_per_day": 320, "requests": 1018880, "minutes_at_max_rpm": 5363, "bytes": 190000000000 } }
+                "pages_per_day": 320, "requests": 1018880, "minutes_at_max_rpm": 5363, "bytes": 190000000000,
+                "partly_held_requests": 3840, "partly_held_note": "12 symbol-days are held without every sidecar ..." } }
 ```
 
-`through` is cut to the last day that has ended. `held` symbol-days have every batch in the store; `partly_held` have their records but not every sidecar (a SIP day filed before quote conditions), and are fetched again to file the rest. The estimate is the mean pages and bytes of the days this service has committed for the feed (the run's symbols if it has any, else any), or assumed (200 pages, 50 MB) with none.
+`through` is cut to the last day that has ended. `held` symbol-days have every batch in the store; `partly_held` have their records but not every sidecar (a SIP day filed before quote conditions), and are fetched again to file the rest: each is a full refetch of both lanes, counted in `to_fetch` and `requests` and called out in `partly_held_requests`. The estimate is the mean pages and bytes of the days this service has committed for the feed (the run's symbols if it has any, else any), or assumed (200 pages, 50 MB) with none.
 
 ## How a day is fetched
 
 - **Pages are spooled as they arrive** (`HISTORY_STATE/spool/lanes/`): each page's body, its receipt and the lane's next page token, synced before the next page is asked for. A restart, a rate limit, an outage or live capture beginning resumes the lane at its next page; nothing fetched is asked for again. A day's pages are removed once its batches are written and checked.
-- **Rate limits and outages wait.** A 429, a 5xx or a dropped connection that persists past the pace's own retries makes the lane wait (doubling, up to five minutes) and ask for the same page again; after eight waits the day is left for the run's next pass, its pages kept. A 400 for a page token starts that lane again from its first page (at most twice).
-- **A failed day is tried again**, up to three times in the run (an event says so each time), then left `failed`; `POST /runs/{id}/resume` tries it again.
+- **Rate limits and outages wait.** A 429, a 5xx or a dropped connection that persists past the pace's own retries makes the lane wait (doubling, up to five minutes) and ask for the same page again; after eight waits the day is left for the run's next pass, its pages kept. `Retry-After` (seconds or an HTTP date) is honoured on 429 and 503. The pace keeps back from Alpaca's advertised remaining count at least as many requests as can be in flight (two a day). A 400 for a page token starts that lane again from its first page (at most twice). Every wait wakes as soon as the service holds for live capture; a lane that fails stops its sibling at its next page, and both are awaited before the day is retried, so no write to a day's spool outlives its attempt.
+- **A failed day is tried again**, up to three times in the run (an event says so each time), then left `failed` and its spool removed; `POST /runs/{id}/resume` tries it again. A trade whose conditions the layout can't hold fails the day at once, for good, without fetching again (doing so would only repeat it). A quote whose conditions can't be held (more than four codes, a code that isn't one printable ASCII byte, no tape) never fails it: its quote-conditions record is marked unparsed, counted in the outcome and the binding (`unparsed`), with an event.
 - **Streamed.** The day is written from the spool a page at a time: memory doesn't grow with the day, however large. Uploads to the store are streamed from disk too.
 - **Checked.** Read back, the main file's trades (`T`) must match the trades lane's pages, and its quotes (`M`) the quotes lane's, each by count and by first and last time; the trade conditions must number its trades, the quote conditions its quotes. Any mismatch fails the day.
-- **Concurrent.** Up to `HISTORY_CONCURRENCY` days are in flight, each with both lanes, on the one pace. Live capture (`HISTORY_YIELD_TO`) is checked before each day and every 30 seconds while days are in flight; when it's live, each lane stops at its next page, its pages kept.
+- **Concurrent.** Up to `HISTORY_CONCURRENCY` days are in flight, each with both lanes, on the one pace. Live capture (`HISTORY_YIELD_TO`) is checked before each day and every 30 seconds while days are in flight; when it's live (or can't be reached, which counts as live), each lane stops at its next page, its pages kept.
+- **Disk.** A heavy SIP day (SPY in 2020 or 2022) peaks at about 1 GB of spooled pages plus 1 to 2 GB of built batches, so the spool's peak is that times `HISTORY_CONCURRENCY` (about 9 GB at 3). No day starts below `HISTORY_MIN_FREE_GB`. A day's pages go once its batches are written; its batches once it's filed, refused, or failed for good. At startup, spools untouched for `HISTORY_SPOOL_MAX_AGE_DAYS` are removed, and complete spools built by another encoder lose their batches (their pages, if any, are kept and rebuilt from).
 
 ## Batches
 

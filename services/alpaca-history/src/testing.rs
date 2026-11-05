@@ -18,6 +18,23 @@ pub const DAY: &str = "2026-10-01";
 pub struct Shape {
     pub pages: usize,
     pub rows: usize,
+    /// Rows on equal times: two quotes a microsecond, and every other trade on
+    /// a quote's time.
+    pub ties: bool,
+    /// The row (by index in its lane) whose conditions can't be held: a
+    /// quote's `["RR"]` and no tape, a trade's five codes.
+    pub bad: Option<usize>,
+}
+
+impl Shape {
+    pub const fn new(pages: usize, rows: usize) -> Self {
+        Self {
+            pages,
+            rows,
+            ties: false,
+            bad: None,
+        }
+    }
 }
 
 /// A request the fake answered: lane, page, status, day.
@@ -76,12 +93,28 @@ pub fn body(lane: &str, day: &str, page: usize, shape: Shape) -> String {
     let mut rows = Vec::with_capacity(shape.rows);
     for i in 0..shape.rows {
         let k = page * shape.rows + i;
-        // Trades and quotes interleave: quotes at even microseconds, trades at odd ones.
+        // Trades and quotes interleave: quotes at even microseconds, trades at
+        // odd ones; with ties, quotes in pairs on one time and every other
+        // trade on that time too.
+        let (qt, tt) = if shape.ties {
+            (k / 2 * 2, k / 2 * 2 + k % 2)
+        } else {
+            (2 * k, 2 * k + 1)
+        };
+        let bad = shape.bad == Some(k);
         rows.push(if lane == "trades" {
-            format!(r#"{{"t":"{}","x":"V","p":774.51,"s":100,"i":{k},"c":["@","I"],"z":"B"}}"#, ts_text(day, 2 * k + 1))
+            let c = if bad { r#"["@","F","I","T","Z"]"# } else { r#"["@","I"]"# };
+            format!(r#"{{"t":"{}","x":"V","p":774.51,"s":100,"i":{k},"c":{c},"z":"B"}}"#, ts_text(day, tt))
         } else {
             let c: Vec<String> = quote_codes(k).iter().map(|b| format!("\"{}\"", *b as char)).collect();
-            format!(r#"{{"t":"{}","bp":774.5,"bs":2,"bx":"Q","ap":774.6,"as":3,"ax":"P","c":[{}],"z":"B"}}"#, ts_text(day, 2 * k), c.join(","))
+            let (c, z) = if bad { (r#""RR""#.to_owned(), String::new()) } else { (c.join(","), r#","z":"B""#.to_owned()) };
+            // A bid that moves each quote, so which book a trade carries shows.
+            format!(
+                r#"{{"t":"{}","bp":{}.{:02},"bs":2,"bx":"Q","ap":900.5,"as":3,"ax":"P","c":[{c}]{z}}}"#,
+                ts_text(day, qt),
+                700 + k / 100,
+                k % 100
+            )
         });
     }
     let next = if page + 1 < shape.pages {
@@ -164,7 +197,7 @@ impl FakeAlpaca {
             data: self.url.clone(),
             key_id: "k".into(),
             secret: "s".into(),
-            pace: Pace::new(100_000),
+            pace: Pace::new(100_000, 6),
             hold: std::sync::atomic::AtomicBool::new(false),
             events: tinytrader_observe::Events::default(),
         }

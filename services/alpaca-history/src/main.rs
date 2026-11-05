@@ -92,6 +92,13 @@ struct Args {
     /// Days in flight at once (1 to 8), sharing the one pace.
     #[arg(long, env = "HISTORY_CONCURRENCY", default_value_t = 3, value_parser = clap::value_parser!(u32).range(1..=8))]
     concurrency: u32,
+    /// Free space (GB) the spool's disk must have before a day starts; below
+    /// it, days wait.
+    #[arg(long, env = "HISTORY_MIN_FREE_GB", default_value_t = 20.0)]
+    min_free_gb: f64,
+    /// Spools untouched this many days are removed at startup.
+    #[arg(long, env = "HISTORY_SPOOL_MAX_AGE_DAYS", default_value_t = 14)]
+    spool_max_age_days: u64,
 }
 
 /// Times a day is tried before it's left failed.
@@ -292,10 +299,13 @@ fn queue(a: &App, ask: Ask, from: &str) -> Result<Run, String> {
 async fn sessions(a: &App, start: &str, through: &str) -> Result<Vec<String>, String> {
     let body = a
         .alpaca
-        .get(&format!(
-            "{}/v2/calendar?start={start}&end={through}",
-            a.args.calendar_url
-        ))
+        .get(
+            &format!(
+                "{}/v2/calendar?start={start}&end={through}",
+                a.args.calendar_url
+            ),
+            &AtomicBool::new(false),
+        )
         .await
         .map_err(|e| format!("market calendar: {e}"))?;
     let v: Vec<Value> =
@@ -330,6 +340,7 @@ async fn held(a: &App) -> Result<std::collections::HashSet<String>, String> {
 /// The capture service that is live, or when its hours begin too soon to start a day.
 async fn yielding(a: &App) -> Option<String> {
     for (name, url) in &a.yield_to {
+        // Unreachable, or not saying it's idle, counts as live: fail safe.
         let Ok(r) = a
             .http
             .get(format!("{url}/health"))
@@ -337,7 +348,7 @@ async fn yielding(a: &App) -> Option<String> {
             .send()
             .await
         else {
-            continue;
+            return Some(format!("{name} is unreachable (counted as live)"));
         };
         let st = r
             .json::<Value>()
@@ -430,6 +441,14 @@ async fn work(a: &Shared, id: &str) {
     let Some(run) = lock(&a.runs).iter().find(|r| r.id == id).cloned() else {
         return;
     };
+    // Live capture: no day starts while it's live, and days in flight stop at
+    // their next page (their pages kept) once it is.
+    if let Some(why) = yielding(a).await {
+        a.observer
+            .set_state(State::Idle, &format!("waiting: {why}"));
+        return;
+    }
+    a.alpaca.hold.store(false, Ordering::Relaxed);
     let plan = match plan_of(a, &run.start, &run.through, &run.symbols, run.newest_first).await {
         Ok((_, p)) => p,
         Err(e) => {
@@ -441,14 +460,6 @@ async fn work(a: &Shared, id: &str) {
         r.planned = plan.len();
         r.state = "running".into();
     });
-    // Live capture: no day starts while it's live, and days in flight stop at
-    // their next page (their pages kept) once it is.
-    if let Some(why) = yielding(a).await {
-        a.observer
-            .set_state(State::Idle, &format!("waiting: {why}"));
-        return;
-    }
-    a.alpaca.hold.store(false, Ordering::Relaxed);
     let _ = std::fs::create_dir_all(a.args.state.join("spool"));
     let mut set: tokio::task::JoinSet<(String, DayEnd)> = tokio::task::JoinSet::new();
     let mut flying: HashSet<String> = HashSet::new();
@@ -600,15 +611,36 @@ async fn run_day(a: &App, id: &str, feed: Feed, sym: &str, d: &str) -> DayEnd {
     };
     let built = match kept {
         Some(kept) => Ok(kept),
-        None => day::build(&a.alpaca, feed, sym, d, &spool).await,
+        None => {
+            // Room for the day's spool and batches first.
+            let free = fs4::available_space(&spool).unwrap_or(0);
+            let floor = (a.args.min_free_gb * 1e9) as u64;
+            if free < floor {
+                let why = format!(
+                    "{:.1} GB free in {}, under HISTORY_MIN_FREE_GB ({}); {sym} {d} waits",
+                    free as f64 / 1e9,
+                    spool.display(),
+                    a.args.min_free_gb
+                );
+                a.events
+                    .push(format!("waiting for disk {sym} {d}"), why.clone());
+                return DayEnd::Wait { why, backoff: true };
+            }
+            day::build(&a.alpaca, feed, sym, d, &spool).await
+        }
     };
     let attempts = lock(&a.runs)
         .iter()
         .find(|r| r.id == id)
         .and_then(|r| r.days.get(&key))
         .map_or(0, |r| r.attempts);
-    let failed = |e: String| {
-        let n = attempts + 1;
+    // A day failed: tried again while it has attempts left (its lanes kept, so
+    // a retry resumes them); for good (`last`), its spool goes.
+    let fail = |e: String, last: bool| {
+        let n = if last { ATTEMPTS } else { attempts + 1 };
+        if n >= ATTEMPTS {
+            day::clear_spool(feed, sym, d, &spool);
+        }
         a.observer.record_error(&format!("{sym} {d}: {e}"));
         let again = if n < ATTEMPTS {
             "; tried again later in the run"
@@ -623,6 +655,7 @@ async fn run_day(a: &App, id: &str, feed: Feed, sym: &str, d: &str) -> DayEnd {
         rec.attempts = n;
         record(rec)
     };
+    let failed = |e: String| fail(e, false);
     let built = match built {
         Ok(b) => b,
         Err(f) if f.transient() => {
@@ -632,6 +665,8 @@ async fn run_day(a: &App, id: &str, feed: Feed, sym: &str, d: &str) -> DayEnd {
                 backoff,
             };
         }
+        // A row the layouts can't hold: fetching again would only repeat it.
+        Err(f @ Failure::Encode(_)) => return fail(f.to_string(), true),
         Err(f) => return failed(f.to_string()),
     };
     let filed = async {
@@ -662,6 +697,15 @@ async fn run_day(a: &App, id: &str, feed: Feed, sym: &str, d: &str) -> DayEnd {
         Ok(()) => {
             day::clear_spool(feed, sym, d, &spool);
             let out = built.outcome;
+            if out.unparsed_quote_conditions > 0 {
+                a.events.push(
+                    format!("quote conditions unparsed {sym} {d}"),
+                    format!(
+                        "{} quotes' conditions couldn't be held; their records are marked unparsed",
+                        out.unparsed_quote_conditions
+                    ),
+                );
+            }
             a.events.push(
                 format!("filed {sym} {d}"),
                 format!(
@@ -831,6 +875,10 @@ async fn dry_run(a: &App, ask: &Ask) -> Result<Value, String> {
         "held": whole, "partly_held": partly, "to_fetch": to_fetch,
         "estimate": {
             "basis": basis, "days_measured": n, "pages_per_day": pages.round(), "requests": requests,
+            "partly_held_requests": (pages * partly as f64).ceil(),
+            "partly_held_note": format!(
+                "{partly} symbol-days are held without every sidecar (a SIP day filed before quote conditions): each is a full refetch of both lanes, counted in to_fetch and requests"
+            ),
             "minutes_at_max_rpm": (requests / f64::from(a.args.max_rpm.max(1))).ceil(),
             "bytes": (bytes * to_fetch as f64).round(),
         },
@@ -962,7 +1010,7 @@ fn build_app(
             data: args.data_url.trim_end_matches('/').to_owned(),
             key_id,
             secret: secret_key,
-            pace: Pace::new(args.max_rpm),
+            pace: Pace::new(args.max_rpm, 2 * args.concurrency),
             hold: AtomicBool::new(false),
             events: events.clone(),
         },
@@ -1077,7 +1125,12 @@ async fn main() {
         .ok()
         .and_then(|b| serde_json::from_slice(&b).ok())
         .unwrap_or_default();
+    let spool = args.state.join("spool");
+    let max_age = Duration::from_secs(args.spool_max_age_days * 86_400);
     let app = build_app(args, key_id, secret_key, store_token, runs);
+    for (what, why) in day::sweep(&spool, max_age) {
+        app.events.push(format!("swept {what}"), why);
+    }
     let listen = listen_address("HISTORY_LISTEN", "127.0.0.1:9124");
     let router = router(&app);
     let listener = match tokio::net::TcpListener::bind(&listen).await {
@@ -1102,7 +1155,7 @@ mod tests {
     use super::*;
     use crate::testing::{DAY, FakeAlpaca, FakeStore, Shape, scratch};
 
-    const SMALL: Shape = Shape { pages: 2, rows: 5 };
+    const SMALL: Shape = Shape::new(2, 5);
 
     fn app_for(f: &FakeAlpaca, s: &FakeStore, name: &str, extra: &[&str]) -> Shared {
         let dir = scratch(name);
@@ -1118,6 +1171,9 @@ mod tests {
             "100000",
         ];
         argv.extend(["--state", dir.to_str().unwrap()]);
+        if !extra.contains(&"--min-free-gb") {
+            argv.extend(["--min-free-gb", "0"]);
+        }
         argv.extend(extra);
         build_app(
             Args::parse_from(argv),
@@ -1268,6 +1324,13 @@ mod tests {
             "{v}"
         );
         assert_eq!(v["estimate"]["requests"], json!(1000.0));
+        assert_eq!(v["estimate"]["partly_held_requests"], json!(200.0));
+        assert!(
+            v["estimate"]["partly_held_note"]
+                .as_str()
+                .unwrap()
+                .contains("full refetch")
+        );
         let runs: Value = http
             .get(format!("{url}/runs"))
             .send()
@@ -1369,6 +1432,73 @@ mod tests {
         let yield_to = format!("relay=http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, live).await.unwrap() });
         let a = app_for(&f, &s, "yield", &["--yield-to", &yield_to]);
+        let id = queue(&a, ask(&["SPY"], DAY, DAY), "test").unwrap().id;
+        work(&a, &id).await;
+        assert!(run_of(&a, &id).days.is_empty());
+        assert!(f.log().is_empty());
+    }
+
+    /// A trade the layout can't hold fails the day for good at once: no page
+    /// fetched again, no retries, its spool gone.
+    #[tokio::test]
+    async fn a_day_that_cant_be_encoded_fails_at_once() {
+        let t = Shape {
+            bad: Some(3),
+            ..SMALL
+        };
+        let (f, s) = (FakeAlpaca::start(t, SMALL).await, FakeStore::start().await);
+        let a = app_for(&f, &s, "encode", &[]);
+        let id = queue(&a, ask(&["SPY"], DAY, DAY), "test").unwrap().id;
+        work(&a, &id).await;
+        let r = run_of(&a, &id);
+        let d = &r.days[&format!("SPY {DAY}")];
+        assert_eq!(
+            (r.state.as_str(), d.state.as_str(), d.attempts),
+            ("failed", "failed", ATTEMPTS),
+            "{r:?}"
+        );
+        assert!(d.note.contains("can't encode"), "{}", d.note);
+        assert!(
+            f.log().iter().all(|x| x.2 == 200) && f.log().len() == 4,
+            "{:?}",
+            f.log()
+        );
+        let spool = a.args.state.join("spool");
+        assert_eq!(
+            std::fs::read_dir(&spool).unwrap().count(),
+            0,
+            "the spool is gone"
+        );
+    }
+
+    /// Under the free-space floor no day starts; the run waits.
+    #[tokio::test]
+    async fn a_day_waits_for_disk() {
+        let (f, s) = (
+            FakeAlpaca::start(SMALL, SMALL).await,
+            FakeStore::start().await,
+        );
+        let a = app_for(&f, &s, "disk", &["--min-free-gb", "1000000000"]);
+        let id = queue(&a, ask(&["SPY"], DAY, DAY), "test").unwrap().id;
+        work(&a, &id).await;
+        let r = run_of(&a, &id);
+        assert!(r.days.is_empty() && r.state == "running", "{r:?}");
+        assert!(f.log().is_empty());
+    }
+
+    /// Capture that can't be reached counts as live: nothing starts.
+    #[tokio::test]
+    async fn unreachable_capture_counts_as_live() {
+        let (f, s) = (
+            FakeAlpaca::start(SMALL, SMALL).await,
+            FakeStore::start().await,
+        );
+        let a = app_for(
+            &f,
+            &s,
+            "unreachable",
+            &["--yield-to", "relay=http://127.0.0.1:9"],
+        );
         let id = queue(&a, ask(&["SPY"], DAY, DAY), "test").unwrap().id;
         work(&a, &id).await;
         assert!(run_of(&a, &id).days.is_empty());

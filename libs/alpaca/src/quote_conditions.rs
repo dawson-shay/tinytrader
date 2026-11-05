@@ -13,10 +13,10 @@
 //! | 4 | u32 | instrument id of the joined quote |
 //! | 8 | u64 | `ts_event` of the joined quote |
 //! | 16 | [u8; 4] | condition codes, one printable ASCII byte each, in source order, NUL after `count` |
-//! | 20 | u8 | tape: `A`, `B` or `C` |
+//! | 20 | u8 | tape: `A`, `B` or `C` (0 allowed only when unparsed) |
 //! | 21 | u8 | number of codes, 0 to 4 |
 //! | 22 | u8 | layout revision: 1 |
-//! | 23 | u8 | reserved, 0 |
+//! | 23 | u8 | flags: bit 0 *unparsed*, the venue's conditions or tape couldn't be held (no codes are kept); other bits 0 |
 //! | 24 | u32 | ordinal of the joined quote among the quotes of its stream |
 //! | 28 | u32 | reserved, 0 |
 //!
@@ -35,6 +35,8 @@ pub const LEN: usize = 32;
 pub const REVISION: u8 = 1;
 /// Most condition codes one record holds.
 pub const MAX_CODES: usize = 4;
+/// Flag: the quote's conditions as sent couldn't be held.
+pub const UNPARSED: u8 = 1;
 /// The record's name and version.
 pub const NAME: &str = "tinytrader.quote-conditions/1";
 
@@ -51,6 +53,8 @@ pub struct QuoteConditions {
     pub tape: u8,
     /// Ordinal of the joined quote among its stream's quotes.
     pub quote_seq: u32,
+    /// The quote's conditions or tape couldn't be held: `count` is 0.
+    pub unparsed: bool,
 }
 
 impl QuoteConditions {
@@ -68,7 +72,10 @@ impl QuoteConditions {
         if self.codes[n..].iter().any(|b| *b != 0) {
             return Err(Invalid::Padding);
         }
-        if !(b'A'..=b'C').contains(&self.tape) {
+        if self.unparsed && n > 0 {
+            return Err(Invalid::Codes);
+        }
+        if !(b'A'..=b'C').contains(&self.tape) && !(self.unparsed && self.tape == 0) {
             return Err(Invalid::Tape);
         }
         if self.ts_event == UNDEF_TIMESTAMP
@@ -98,6 +105,7 @@ impl QuoteConditions {
         b[20] = self.tape;
         b[21] = self.count;
         b[22] = REVISION;
+        b[23] = if self.unparsed { UNPARSED } else { 0 };
         b[24..28].copy_from_slice(&self.quote_seq.to_le_bytes());
         Ok(b)
     }
@@ -114,7 +122,7 @@ impl QuoteConditions {
         if b[22] != REVISION {
             return Err(Invalid::Revision);
         }
-        if b[23] != 0 || b[28..32].iter().any(|x| *x != 0) {
+        if b[23] & !UNPARSED != 0 || b[28..32].iter().any(|x| *x != 0) {
             return Err(Invalid::Padding);
         }
         let u32_at = |i: usize| u32::from_le_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]);
@@ -128,6 +136,7 @@ impl QuoteConditions {
             tape: b[20],
             count: b[21],
             quote_seq: u32_at(24),
+            unparsed: b[23] & UNPARSED != 0,
         };
         rec.check()?;
         Ok(rec)
@@ -149,6 +158,7 @@ mod tests {
             count,
             tape: b'B',
             quote_seq: 9,
+            unparsed: false,
         }
     }
 
@@ -172,6 +182,26 @@ mod tests {
         let mut b = sample().encode().unwrap();
         b[30] = 1;
         assert_eq!(QuoteConditions::decode(&b), Err(Invalid::Padding));
+        let mut b = sample().encode().unwrap();
+        b[23] = 2;
+        assert_eq!(QuoteConditions::decode(&b), Err(Invalid::Padding));
+        // Unparsed: no codes, tape may be absent.
+        let u = QuoteConditions {
+            codes: [0; 4],
+            count: 0,
+            tape: 0,
+            unparsed: true,
+            ..sample()
+        };
+        assert_eq!(QuoteConditions::decode(&u.encode().unwrap()), Ok(u));
+        assert_eq!(
+            QuoteConditions {
+                tape: 0,
+                ..sample()
+            }
+            .encode(),
+            Err(Invalid::Tape)
+        );
         let mut b = sample().encode().unwrap();
         b[22] = 2;
         assert_eq!(QuoteConditions::decode(&b), Err(Invalid::Revision));

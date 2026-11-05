@@ -13,6 +13,8 @@ workspace = true
 axum.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 dbn = { version = "0.71", default-features = false, features = ["zstd"] }
+fs4 = "1.1"
+httpdate = "1"
 reqwest = { workspace = true, features = ["stream"] }
 rustls.workspace = true
 serde.workspace = true

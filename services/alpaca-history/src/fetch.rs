@@ -25,7 +25,8 @@ use tokio::sync::Mutex;
 
 use crate::spool::{LaneSpool, LaneState, Parse};
 
-/// Requests left in Alpaca's window below which the pace waits for the reset.
+/// Requests left in Alpaca's window below which the pace waits for the reset,
+/// at least: it's raised to cover every request that can be in flight.
 const RESERVE: u64 = 6;
 const RETRIES: u32 = 5;
 /// How often a lane waits out a rate limit or an outage before the day is
@@ -42,6 +43,8 @@ const LANE_WAIT_MAX: Duration = if cfg!(test) {
 } else {
     Duration::from_secs(300)
 };
+/// The longest a wait sleeps before checking whether to stop.
+const NAP: Duration = Duration::from_millis(if cfg!(test) { 2 } else { 250 });
 /// Times a lane is started again because Alpaca refused its page token.
 const RESTARTS: u32 = 2;
 
@@ -62,6 +65,9 @@ pub enum Failure {
     Paused,
     /// The spool couldn't be written or read.
     Spool(String),
+    /// A row the layouts can't hold (a trade's conditions): fetching the day
+    /// again would only repeat it.
+    Encode(String),
 }
 
 impl Failure {
@@ -83,6 +89,7 @@ impl std::fmt::Display for Failure {
             Self::Unavailable(e) => write!(f, "unavailable: {e}"),
             Self::Paused => write!(f, "paused"),
             Self::Spool(e) => write!(f, "spool: {e}"),
+            Self::Encode(e) => write!(f, "can't encode: {e}"),
         }
     }
 }
@@ -90,6 +97,7 @@ impl std::fmt::Display for Failure {
 /// One pace for every request the service makes.
 pub struct Pace {
     gap: Duration,
+    reserve: u64,
     state: Mutex<PaceState>,
     /// Requests made, and 429s seen, for `/metrics`.
     pub requests: Arc<AtomicU64>,
@@ -102,9 +110,12 @@ struct PaceState {
 }
 
 impl Pace {
-    pub fn new(per_minute: u32) -> Self {
+    /// `in_flight`: the most requests that can be out at once (two lanes a
+    /// day in flight), kept in reserve so they can't overdraw the window.
+    pub fn new(per_minute: u32, in_flight: u32) -> Self {
         Self {
             gap: Duration::from_secs_f64(60.0 / f64::from(per_minute.max(1))),
+            reserve: RESERVE.max(u64::from(in_flight) + 2),
             state: Mutex::new(PaceState {
                 next: Instant::now(),
                 in_a_row: 0,
@@ -140,7 +151,7 @@ impl Pace {
         }
         if let (Some(left), Some(reset)) =
             (header("x-ratelimit-remaining"), header("x-ratelimit-reset"))
-            && left <= RESERVE
+            && left <= self.reserve
         {
             let now = tinytrader_observe::unix_seconds();
             let secs = (reset as f64 - now).clamp(0.0, 60.0);
@@ -151,14 +162,16 @@ impl Pace {
     }
 
     /// A 429: pause; the third in a row stops.
-    async fn limited(&self, retry_after: Option<u64>) -> Result<(), Failure> {
+    async fn limited(&self, retry_after: Option<Duration>) -> Result<(), Failure> {
         let mut s = self.state.lock().await;
         self.limited.fetch_add(1, Ordering::Relaxed);
         s.in_a_row += 1;
         let pause = if cfg!(test) {
             Duration::from_millis(2)
         } else {
-            Duration::from_secs(retry_after.unwrap_or(5).clamp(1, 60))
+            retry_after
+                .unwrap_or(Duration::from_secs(5))
+                .clamp(Duration::from_secs(1), Duration::from_secs(60))
         };
         s.next = s.next.max(Instant::now() + pause);
         if s.in_a_row >= 3 {
@@ -183,13 +196,44 @@ pub struct Alpaca {
     pub events: Events,
 }
 
+/// `Retry-After`, as seconds or as an HTTP date.
+pub fn retry_after(v: &str) -> Option<Duration> {
+    let v = v.trim();
+    if let Ok(s) = v.parse::<u64>() {
+        return Some(Duration::from_secs(s));
+    }
+    let at = httpdate::parse_http_date(v).ok()?;
+    Some(
+        at.duration_since(std::time::SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
 impl Alpaca {
-    /// One GET, paced and retried: the body as received.
-    pub async fn get(&self, url: &str) -> Result<Vec<u8>, Failure> {
+    /// Sleep, but wake (as `Paused`) as soon as the service holds or `stop`
+    /// is set.
+    pub async fn nap(&self, d: Duration, stop: &AtomicBool) -> Result<(), Failure> {
+        let until = Instant::now() + d;
+        loop {
+            if self.hold.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
+                return Err(Failure::Paused);
+            }
+            let now = Instant::now();
+            if now >= until {
+                return Ok(());
+            }
+            tokio::time::sleep((until - now).min(NAP)).await;
+        }
+    }
+
+    /// One GET, paced and retried: the body as received. Waits wake on hold or
+    /// `stop` (`Paused`).
+    pub async fn get(&self, url: &str, stop: &AtomicBool) -> Result<Vec<u8>, Failure> {
         let mut backoff = Duration::from_millis(if cfg!(test) { 2 } else { 500 });
         let mut last = String::new();
         for _ in 0..RETRIES {
             self.pace.turn().await;
+            self.nap(Duration::ZERO, stop).await?;
             let sent = self
                 .http
                 .get(url)
@@ -202,21 +246,26 @@ impl Alpaca {
                 Ok(resp) => {
                     self.pace.heard(&resp).await;
                     let status = resp.status();
+                    let after = resp
+                        .headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(retry_after);
                     if status.is_success() {
                         match resp.bytes().await {
                             Ok(b) => return Ok(b.to_vec()),
                             Err(e) => last = format!("reading the answer: {e}"),
                         }
                     } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
-                        let after = resp
-                            .headers()
-                            .get("retry-after")
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|v| v.parse().ok());
                         self.pace.limited(after).await?;
                         continue;
                     } else if status.is_server_error() {
                         last = format!("Alpaca answered {status}");
+                        // A 503 that says when to come back is honoured.
+                        if let Some(a) = after.filter(|_| !cfg!(test)) {
+                            self.nap(a.min(Duration::from_secs(60)), stop).await?;
+                            continue;
+                        }
                     } else if status == reqwest::StatusCode::BAD_REQUEST {
                         let body = resp.text().await.unwrap_or_default();
                         return Err(Failure::BadRequest(format!(
@@ -233,7 +282,7 @@ impl Alpaca {
                 }
                 Err(e) => last = e.to_string(),
             }
-            tokio::time::sleep(backoff).await;
+            self.nap(backoff, stop).await?;
             backoff = (backoff * 2).min(Duration::from_secs(30));
         }
         Err(Failure::Unavailable(last))
@@ -374,12 +423,32 @@ async fn blocking<R: Send + 'static>(
 /// spool left off to the one without a next token. `parse` turns a page's
 /// body into rows and its next token; rows must stay in time order and within
 /// the day. Only one page is in memory at a time.
+///
+/// `stop` is the day's: a lane that fails sets it, so its sibling stops at its
+/// next page or wait (`Paused`). A lane only ever returns between commits:
+/// its spool is never written once it has returned.
 pub async fn lane<T: 'static>(
     alpaca: &Alpaca,
     spec: &LaneSpec<'_>,
     dir: &Path,
     parse: Parse<T>,
     ts: fn(&T) -> u64,
+    stop: &AtomicBool,
+) -> Result<LaneDone, Failure> {
+    let r = lane_inner(alpaca, spec, dir, parse, ts, stop).await;
+    if r.is_err() {
+        stop.store(true, Ordering::Relaxed);
+    }
+    r
+}
+
+async fn lane_inner<T: 'static>(
+    alpaca: &Alpaca,
+    spec: &LaneSpec<'_>,
+    dir: &Path,
+    parse: Parse<T>,
+    ts: fn(&T) -> u64,
+    stop: &AtomicBool,
 ) -> Result<LaneDone, Failure> {
     let LaneSpec {
         feed,
@@ -411,11 +480,9 @@ pub async fn lane<T: 'static>(
     }
     let (mut waits, mut wait, mut restarts) = (0, LANE_WAIT, 0);
     while !st.done {
-        if alpaca.hold.load(Ordering::Relaxed) {
-            return Err(Failure::Paused);
-        }
+        alpaca.nap(Duration::ZERO, stop).await?;
         match alpaca
-            .get(&page_url(&base, st.next_page_token.as_deref()))
+            .get(&page_url(&base, st.next_page_token.as_deref()), stop)
             .await
         {
             Ok(body) => {
@@ -438,7 +505,7 @@ pub async fn lane<T: 'static>(
                         st.pages, st.pages
                     ),
                 );
-                tokio::time::sleep(wait).await;
+                alpaca.nap(wait, stop).await?;
                 waits += 1;
                 wait = (wait * 2).min(LANE_WAIT_MAX);
             }
@@ -477,5 +544,50 @@ mod tests {
             page_url("u?a=1", Some("A-z_0.9~")),
             "u?a=1&page_token=A-z_0.9~"
         );
+    }
+
+    #[test]
+    fn retry_after_reads_seconds_and_http_dates() {
+        use super::retry_after;
+        use std::time::{Duration, SystemTime};
+        assert_eq!(retry_after(" 7 "), Some(Duration::from_secs(7)));
+        let soon = httpdate::fmt_http_date(SystemTime::now() + Duration::from_secs(30));
+        let d = retry_after(&soon).unwrap();
+        assert!(
+            d > Duration::from_secs(27) && d <= Duration::from_secs(30),
+            "{d:?}"
+        );
+        assert_eq!(
+            retry_after("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(Duration::ZERO),
+            "past: now"
+        );
+        assert_eq!(retry_after("soon"), None);
+    }
+
+    /// A long wait wakes as soon as the service holds or the day stops.
+    #[tokio::test]
+    async fn waits_wake_on_hold_and_stop() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::{Duration, Instant};
+        let a = crate::testing::FakeAlpaca::start(
+            crate::testing::Shape::new(1, 1),
+            crate::testing::Shape::new(1, 1),
+        )
+        .await
+        .client();
+        let stop = AtomicBool::new(false);
+        let t = Instant::now();
+        let (r, ()) = tokio::join!(a.nap(Duration::from_secs(30), &stop), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            a.hold.store(true, Ordering::Relaxed);
+        });
+        assert!(matches!(r, Err(super::Failure::Paused)) && t.elapsed() < Duration::from_secs(2));
+        a.hold.store(false, Ordering::Relaxed);
+        let (r, ()) = tokio::join!(a.nap(Duration::from_secs(30), &stop), async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(matches!(r, Err(super::Failure::Paused)) && t.elapsed() < Duration::from_secs(4));
     }
 }

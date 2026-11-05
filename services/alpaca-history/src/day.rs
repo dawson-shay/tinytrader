@@ -24,6 +24,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tinytrader_alpaca::{iex, sip};
 
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::AtomicBool;
+
 use crate::fetch::{Alpaca, Failure, LaneDone, LaneSpec, day_ns, lane};
 use crate::spool::{LaneSpool, Pages, Parse};
 
@@ -84,7 +87,20 @@ pub struct Outcome {
     pub quotes: usize,
     pub pages: usize,
     pub bytes: u64,
+    /// Quotes whose conditions couldn't be held (their records say so).
+    #[serde(default)]
+    pub unparsed_quote_conditions: usize,
+    /// What built the day: a complete spool by another encoder isn't filed.
+    #[serde(default)]
+    pub encoder: String,
 }
+
+/// The encoder this build writes with, as kept in a day's complete marker.
+pub const ENCODER: &str = concat!(
+    "tinytrader-alpaca ",
+    env!("CARGO_PKG_VERSION"),
+    " (quote-conditions/1)"
+);
 
 /// A day built: its batch folders (records first, then sidecars) and outcome.
 #[derive(Debug)]
@@ -455,16 +471,24 @@ pub async fn build(
         },
     );
     let (tdir, qdir) = (lanes.join("trades"), lanes.join("quotes"));
-    // Both lanes at once, sharing the pace.
-    let fetched = match feed {
-        Feed::Sip => tokio::try_join!(
-            lane(alpaca, &ts, &tdir, sip_trades, |r: &sip::Trade| r.ts),
-            lane(alpaca, &qs, &qdir, sip_quotes, |r: &sip::Quote| r.ts),
+    // Both lanes at once, sharing the pace. Both are awaited to the end (never
+    // dropped mid-commit): one that fails stops the other at its next page, so
+    // nothing writes to the day's spool once `build` returns.
+    let stop = AtomicBool::new(false);
+    let (t, q) = match feed {
+        Feed::Sip => tokio::join!(
+            lane(alpaca, &ts, &tdir, sip_trades, |r: &sip::Trade| r.ts, &stop),
+            lane(alpaca, &qs, &qdir, sip_quotes, |r: &sip::Quote| r.ts, &stop),
         ),
-        Feed::Iex => tokio::try_join!(
-            lane(alpaca, &ts, &tdir, iex_trades, |r: &iex::Trade| r.ts),
-            lane(alpaca, &qs, &qdir, iex_quotes, |r: &iex::Quote| r.ts),
+        Feed::Iex => tokio::join!(
+            lane(alpaca, &ts, &tdir, iex_trades, |r: &iex::Trade| r.ts, &stop),
+            lane(alpaca, &qs, &qdir, iex_quotes, |r: &iex::Quote| r.ts, &stop),
         ),
+    };
+    // The lane that failed, rather than the one it stopped.
+    let fetched = match (t, q) {
+        (Ok(t), Ok(q)) => Ok((t, q)),
+        (Err(Failure::Paused), Err(e)) | (Err(e), _) | (_, Err(e)) => Err(e),
     };
     let (t, q) = fetched.inspect_err(|e| {
         if matches!(e, Failure::PageIntegrity(_)) {
@@ -537,13 +561,25 @@ fn write_day(
         LaneSpool::at(lanes.join("trades")),
         LaneSpool::at(lanes.join("quotes")),
     );
-    // Errors while streaming: a page that doesn't read back, or a row the
-    // layouts can't hold, is the day's; a file that can't be written isn't.
-    let mut failure: Option<Failure> = None;
-    let mut io = |e: String| {
-        failure.get_or_insert(Failure::Spool(e.clone()));
+    // Errors while streaming: a page that doesn't read back is the pages'
+    // (fetched again), a trade the layout can't hold the day's for good
+    // (fetching again would only repeat it), a file that can't be written the
+    // disk's (tried later). A quote whose conditions can't be held is never
+    // an error: its conditions record is marked unparsed, and counted.
+    let failure: RefCell<Option<Failure>> = RefCell::new(None);
+    let io = |e: String| {
+        failure
+            .borrow_mut()
+            .get_or_insert(Failure::Spool(e.clone()));
         e
     };
+    let refuse = |e: String| {
+        failure
+            .borrow_mut()
+            .get_or_insert(Failure::Encode(e.clone()));
+        e
+    };
+    let unparsed = Cell::new(0usize);
     let peak;
     let streamed = match feed {
         Feed::Sip => {
@@ -567,20 +603,25 @@ fn write_day(
                         Either::Trade(t) => sip::Row::Trade(t),
                         Either::Quote(q) => sip::Row::Quote(q),
                     };
-                    let (rec, c) = enc.push(&row)?;
-                    main.push(rec).map_err(&mut io)?;
+                    let (rec, c) = enc.push(&row).map_err(refuse)?;
+                    main.push(rec).map_err(io)?;
                     match c {
                         sip::Conditions::Trade(c) => cond
-                            .raw(&c.encode().map_err(|e| e.to_string())?)
-                            .map_err(&mut io),
-                        sip::Conditions::Quote(c) => qcond
-                            .raw(&c.encode().map_err(|e| e.to_string())?)
-                            .map_err(&mut io),
+                            .raw(&c.encode().map_err(|e| refuse(e.to_string()))?)
+                            .map_err(io),
+                        sip::Conditions::Quote(c) => {
+                            if c.unparsed {
+                                unparsed.set(unparsed.get() + 1);
+                            }
+                            qcond
+                                .raw(&c.encode().map_err(|e| refuse(e.to_string()))?)
+                                .map_err(io)
+                        }
                     }
                 },
             )
-            .and_then(|()| main.finish().map_err(&mut io))
-            .and_then(|()| qcond.finish().map_err(&mut io));
+            .and_then(|()| main.finish().map_err(io))
+            .and_then(|()| qcond.finish().map_err(io));
             peak = tp.peak.max(qp.peak);
             r
         }
@@ -602,22 +643,23 @@ fn write_day(
                 |row| match row {
                     Either::Trade(t) => {
                         let (rec, c) = enc.trade(&t, UNDEF_TIMESTAMP);
-                        let c = c.map_err(|e| format!("trade {} at {}: {e}", t.id, t.ts))?;
-                        main.push(rec).map_err(&mut io)?;
-                        cond.raw(&c.encode().map_err(|e| e.to_string())?)
-                            .map_err(&mut io)
+                        let c =
+                            c.map_err(|e| refuse(format!("trade {} at {}: {e}", t.id, t.ts)))?;
+                        main.push(rec).map_err(io)?;
+                        cond.raw(&c.encode().map_err(|e| refuse(e.to_string()))?)
+                            .map_err(io)
                     }
-                    Either::Quote(q) => main.push(enc.quote(&q, UNDEF_TIMESTAMP)).map_err(&mut io),
+                    Either::Quote(q) => main.push(enc.quote(&q, UNDEF_TIMESTAMP)).map_err(io),
                 },
             )
-            .and_then(|()| main.finish().map_err(&mut io));
+            .and_then(|()| main.finish().map_err(io));
             peak = tp.peak.max(qp.peak);
             r
         }
     }
-    .and_then(|()| cond.finish().map_err(&mut io));
+    .and_then(|()| cond.finish().map_err(io));
     if let Err(e) = streamed {
-        return Err(failure.unwrap_or(Failure::PageIntegrity(e)));
+        return Err(failure.into_inner().unwrap_or(Failure::PageIntegrity(e)));
     }
 
     // Read back: trades and quotes each against their lane, sidecars against them.
@@ -632,6 +674,8 @@ fn write_day(
         quotes: q.rows,
         pages: t.receipts.len() + q.receipts.len(),
         bytes: 0,
+        unparsed_quote_conditions: unparsed.get(),
+        encoder: ENCODER.to_owned(),
     };
     let mut built = write_manifests(
         feed, symbol, day, &ids, &dirs, &names, &paths, t, q, main_tally, outcome,
@@ -689,8 +733,8 @@ fn write_manifests(
     let binding = |s: &str| match s {
         QUOTE_CONDITIONS => json!({
             "format": "tinytrader.alpaca-history.quote-conditions-binding/1", "batch": ids[0],
-            "main": main_ref, "quotes": outcome.quotes,
-            "rule": "the nth quote conditions record belongs to the nth quote (action M) of the main file",
+            "main": main_ref, "quotes": outcome.quotes, "unparsed": outcome.unparsed_quote_conditions,
+            "rule": "the nth quote conditions record belongs to the nth quote (action M) of the main file; an unparsed one (flag bit 0) holds no codes, the venue's couldn't be held",
         }),
         _ => json!({
             "format": "tinytrader.alpaca-history.conditions-binding/1", "batch": ids[0],
@@ -766,6 +810,10 @@ pub fn spooled(feed: Feed, symbol: &str, day: &str, dir: &Path) -> Result<Option
     let Ok(outcome) = serde_json::from_slice::<Outcome>(&text) else {
         return Ok(None);
     };
+    // Built by another encoder: rebuilt, not filed.
+    if outcome.encoder != ENCODER {
+        return Ok(None);
+    }
     let dirs: Vec<PathBuf> = feed
         .batches(symbol, day)
         .into_iter()
@@ -977,6 +1025,79 @@ pub fn clear_spool(feed: Feed, symbol: &str, day: &str, dir: &Path) {
         let _ = std::fs::remove_dir_all(dir.join(id));
     }
     clear_lanes(feed, symbol, day, dir);
+}
+
+/// The newest modification time of a path and what's below it, two levels deep.
+fn newest(p: &Path, depth: u32) -> Option<std::time::SystemTime> {
+    let mut t = std::fs::metadata(p).and_then(|m| m.modified()).ok()?;
+    if depth > 0
+        && let Ok(rd) = std::fs::read_dir(p)
+    {
+        for e in rd.flatten() {
+            if let Some(u) = newest(&e.path(), depth - 1) {
+                t = t.max(u);
+            }
+        }
+    }
+    Some(t)
+}
+
+/// At startup, bound the spool: a day whose spool (batches, marker, lanes) is
+/// untouched for `max_age` is removed whole; a complete spool built by
+/// another encoder loses its batches and marker (its fetched pages, if any,
+/// are kept: they're Alpaca's bytes, not the encoder's). Returns what went,
+/// and why.
+pub fn sweep(dir: &Path, max_age: std::time::Duration) -> Vec<(String, String)> {
+    use std::collections::BTreeMap;
+    let mut days: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let day_of = |name: &str| -> String {
+        let n = name.strip_suffix(".complete.json").unwrap_or(name);
+        let n = n.strip_suffix(&format!("-{QUOTE_CONDITIONS}")).unwrap_or(n);
+        n.strip_suffix(&format!("-{CONDITIONS}"))
+            .unwrap_or(n)
+            .to_owned()
+    };
+    for (base, _) in [(dir.to_path_buf(), ()), (dir.join("lanes"), ())] {
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with("ALPACA-") {
+                days.entry(day_of(&name)).or_default().push(e.path());
+            }
+        }
+    }
+    let now = std::time::SystemTime::now();
+    let mut gone = Vec::new();
+    for (day, paths) in days {
+        let latest = paths.iter().filter_map(|p| newest(p, 2)).max();
+        let old = latest.is_some_and(|t| now.duration_since(t).unwrap_or_default() > max_age);
+        let marker = dir.join(format!("{day}.complete.json"));
+        let other_encoder = std::fs::read(&marker)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Outcome>(&b).ok())
+            .is_some_and(|o| o.encoder != ENCODER);
+        if old {
+            for p in &paths {
+                let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+            }
+            gone.push((
+                day,
+                format!(
+                    "its spool was untouched for over {} days",
+                    max_age.as_secs() / 86_400
+                ),
+            ));
+        } else if other_encoder {
+            for p in paths.iter().filter(|p| !p.starts_with(dir.join("lanes"))) {
+                let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+            }
+            gone.push((day, "its batches were built by another encoder; they're built again from its pages or a new fetch".into()));
+        }
+    }
+    let _ = std::fs::remove_dir(dir.join("lanes"));
+    gone
 }
 
 /// A filing that didn't happen: the store busy past the wait (`busy`: try the day
@@ -1264,7 +1385,7 @@ mod spool_tests {
 
     /// A fake Alpaca with one trade and one quote for `DAY`.
     async fn alpaca() -> Alpaca {
-        FakeAlpaca::start(Shape { pages: 1, rows: 1 }, Shape { pages: 1, rows: 1 })
+        FakeAlpaca::start(Shape::new(1, 1), Shape::new(1, 1))
             .await
             .client()
     }
@@ -1586,11 +1707,12 @@ mod spool_tests {
 mod stream_tests {
     use super::*;
     use crate::testing::{DAY, FakeAlpaca, FakeStore, Shape, body, quote_codes, scratch};
+    use serde_json::json;
     use std::time::Duration;
     use tinytrader_alpaca::quote_conditions::QuoteConditions;
 
-    const T3: Shape = Shape { pages: 3, rows: 50 };
-    const Q3: Shape = Shape { pages: 3, rows: 70 };
+    const T3: Shape = Shape::new(3, 50);
+    const Q3: Shape = Shape::new(3, 70);
 
     fn data_file(batch: &Path) -> PathBuf {
         std::fs::read_dir(batch)
@@ -1956,16 +2078,7 @@ mod stream_tests {
     /// rows of a lane in memory, however many pages.
     #[tokio::test]
     async fn a_large_day_streams_in_bounded_memory() {
-        let (t, q) = (
-            Shape {
-                pages: 4,
-                rows: 10_000,
-            },
-            Shape {
-                pages: 24,
-                rows: 10_000,
-            },
-        );
+        let (t, q) = (Shape::new(4, 10_000), Shape::new(24, 10_000));
         let f = FakeAlpaca::start(t, q).await;
         let b = build(&f.client(), Feed::Sip, "SPY", DAY, &scratch("large"))
             .await
@@ -1991,5 +2104,313 @@ mod stream_tests {
         assert_eq!(read_back(&data_file(&b.batches[1])).unwrap().n, 150);
         let m = read_main(&data_file(&b.batches[0])).unwrap();
         assert_eq!((m.trades.n, m.quotes.n, m.other), (150, 210, 0));
+    }
+
+    /// main's SIP encoder (`encode_day` before this branch), verbatim but for
+    /// the quote type's new fields: the reference the streamed day must match
+    /// byte for byte.
+    fn main_encode_day(
+        symbol: &str,
+        rows: &[sip::Row],
+    ) -> (Vec<Cmbp1Msg>, Vec<tinytrader_dbn::TradeConditions>) {
+        use dbn::{ConsolidatedBidAskPair, RecordHeader, UNDEF_PRICE, rtype};
+        use sip::Row;
+        use tinytrader_dbn::TradeConditions;
+        fn level(q: &sip::Quote) -> ConsolidatedBidAskPair {
+            ConsolidatedBidAskPair {
+                bid_px: q.bid.px,
+                ask_px: q.ask.px,
+                bid_sz: q.bid.sz,
+                ask_sz: q.ask.sz,
+                bid_pb: q.bid_pb,
+                ask_pb: q.ask_pb,
+                ..Default::default()
+            }
+        }
+        let absent = tinytrader_alpaca::iex::Side {
+            px: UNDEF_PRICE,
+            sz: 0,
+        };
+        let instrument = sip::instrument_id(symbol);
+        let mut book = sip::Quote {
+            ts: 0,
+            bid: absent,
+            ask: absent,
+            bid_pb: 0,
+            ask_pb: 0,
+            codes: [0; 4],
+            count: 0,
+            tape: 0,
+            unparsed: false,
+        };
+        let mut records = Vec::with_capacity(rows.len());
+        let mut conditions = Vec::new();
+        let mut seq: u32 = 0;
+        for (i, row) in rows.iter().enumerate() {
+            let (publisher, ts, action, px, sz, lv) = match row {
+                Row::Quote(q) => {
+                    book = *q;
+                    (sip::PUBLISHER, q.ts, b'M', UNDEF_PRICE, 0, level(q))
+                }
+                Row::Trade(t) => {
+                    let (codes, count) = TradeConditions::codes_from(&t.codes).unwrap();
+                    let c = TradeConditions {
+                        publisher_id: t.exchange,
+                        instrument_id: instrument,
+                        ts_event: t.ts,
+                        price: t.px,
+                        trade_id: t.id,
+                        size: t.sz,
+                        codes,
+                        count,
+                        tape: t.tape,
+                        update: t.update,
+                        trade_seq: seq,
+                    };
+                    c.encode().unwrap();
+                    conditions.push(c);
+                    seq = seq.wrapping_add(1);
+                    (t.exchange, t.ts, b'T', t.px, t.sz, level(&book))
+                }
+            };
+            let last = rows.get(i + 1).is_none_or(|next| next.ts() != row.ts());
+            let mut rec = Cmbp1Msg::default_for_schema(dbn::Schema::Cmbp1);
+            rec.hd = RecordHeader::new::<Cmbp1Msg>(rtype::CMBP_1, publisher, instrument, ts);
+            rec.price = px;
+            rec.size = sz;
+            rec.action = action as std::ffi::c_char;
+            rec.side = b'N' as std::ffi::c_char;
+            rec.flags = if last {
+                FlagSet::empty().set_last()
+            } else {
+                FlagSet::empty()
+            };
+            rec.ts_recv = UNDEF_TIMESTAMP;
+            rec.ts_in_delta = 0;
+            rec.levels = [lv];
+            records.push(rec);
+        }
+        (records, conditions)
+    }
+
+    /// Write records as a day file, as `write_day` does.
+    fn reference_file<R: DbnEncodable>(
+        path: &Path,
+        feed: Feed,
+        schema: Option<Schema>,
+        id: u32,
+        recs: &[R],
+    ) -> Vec<u8> {
+        let mut w = DbnFile::create(
+            path.to_path_buf(),
+            &metadata(feed, "SPY", DAY, schema, id).unwrap(),
+        )
+        .unwrap();
+        recs.iter().for_each(|r| w.record(r).unwrap());
+        w.finish().unwrap();
+        std::fs::read(path).unwrap()
+    }
+    fn reference_sidecar(path: &Path, feed: Feed, id: u32, recs: &[Vec<u8>]) -> Vec<u8> {
+        let mut w = DbnFile::create(
+            path.to_path_buf(),
+            &metadata(feed, "SPY", DAY, None, id).unwrap(),
+        )
+        .unwrap();
+        recs.iter().for_each(|r| w.raw(r).unwrap());
+        w.finish().unwrap();
+        std::fs::read(path).unwrap()
+    }
+
+    const TT: Shape = Shape {
+        ties: true,
+        ..Shape::new(3, 50)
+    };
+    const QT: Shape = Shape {
+        ties: true,
+        ..Shape::new(3, 70)
+    };
+
+    /// Trades and quotes on equal times (several quotes on one time, trades on
+    /// a quote's time, across page boundaries): trades come first on a tie and
+    /// carry the book before the quotes of their time, `F_LAST` closes each
+    /// time, the quote conditions stay aligned with the quotes, and the files
+    /// are byte for byte main's encoder's (SIP) and `iex::encode_day`'s (IEX).
+    #[tokio::test]
+    async fn equal_times_match_mains_encoder() {
+        let f = FakeAlpaca::start(TT, QT).await;
+        let b = build(&f.client(), Feed::Sip, "SPY", DAY, &scratch("ties"))
+            .await
+            .unwrap();
+        let (mut trades, mut quotes) = (Vec::new(), Vec::new());
+        for p in 0..3 {
+            trades.extend(sip_trades(body("trades", DAY, p, TT).as_bytes()).unwrap().0);
+            quotes.extend(sip_quotes(body("quotes", DAY, p, QT).as_bytes()).unwrap().0);
+        }
+        let rows = sip::merge(trades, quotes).unwrap();
+        let (recs, conds) = main_encode_day("SPY", &rows);
+        let out = scratch("ties-ref");
+        let id = sip::instrument_id("SPY");
+        assert_eq!(
+            std::fs::read(data_file(&b.batches[0])).unwrap(),
+            reference_file(&out.join("m"), Feed::Sip, Some(Schema::Cmbp1), id, &recs)
+        );
+        let tc: Vec<Vec<u8>> = conds.iter().map(|c| c.encode().unwrap().to_vec()).collect();
+        assert_eq!(
+            std::fs::read(data_file(&b.batches[1])).unwrap(),
+            reference_sidecar(&out.join("c"), Feed::Sip, id, &tc)
+        );
+
+        // And what that means, checked directly.
+        // A trade carries the last quote before it in tape order, which (no
+        // trade ever following a quote of its own time) is the book before
+        // its time.
+        let (mut book, mut quote_ts) = (dbn::UNDEF_PRICE, Vec::new());
+        let mut trade_after_quote_same_time = 0;
+        let mut trades_on_a_quote_time = 0;
+        for (i, r) in recs.iter().enumerate() {
+            let ts = r.hd.ts_event;
+            let next = recs.get(i + 1).map(|n| n.hd.ts_event);
+            assert_eq!(r.flags.is_last(), next != Some(ts), "F_LAST at record {i}");
+            if r.action as u8 == b'M' {
+                book = r.levels[0].bid_px;
+                quote_ts.push(ts);
+            } else {
+                assert_eq!(r.levels[0].bid_px, book, "trade at record {i}");
+                let prev = i.checked_sub(1).map(|p| &recs[p]);
+                if prev.is_some_and(|p| p.hd.ts_event == ts && p.action as u8 == b'M') {
+                    trade_after_quote_same_time += 1;
+                }
+                if recs[i + 1..]
+                    .iter()
+                    .take_while(|n| n.hd.ts_event == ts)
+                    .any(|n| n.action as u8 == b'M')
+                {
+                    trades_on_a_quote_time += 1;
+                }
+            }
+        }
+        assert!(trades_on_a_quote_time > 0, "trades share times with quotes");
+        assert_eq!(
+            trade_after_quote_same_time, 0,
+            "a trade never follows a quote of its own time"
+        );
+        assert!(
+            quote_ts.windows(2).any(|w| w[0] == w[1]),
+            "several quotes share a time"
+        );
+        let mut d = dbn::decode::dbn::Decoder::from_zstd_file(data_file(&b.batches[2])).unwrap();
+        let mut k = 0;
+        while let Some(r) = d.decode_record_ref().unwrap() {
+            let c = QuoteConditions::decode(r.as_ref()).unwrap();
+            assert_eq!(
+                (c.quote_seq as usize, c.ts_event, c.codes()),
+                (k, quote_ts[k], quote_codes(k))
+            );
+            k += 1;
+        }
+        assert_eq!(k, 210);
+
+        // IEX: against iex::encode_day, untouched on this branch.
+        let b = build(&f.client(), Feed::Iex, "SPY", DAY, &scratch("ties-iex"))
+            .await
+            .unwrap();
+        let (mut trades, mut quotes) = (Vec::new(), Vec::new());
+        for p in 0..3 {
+            trades.extend(iex_trades(body("trades", DAY, p, TT).as_bytes()).unwrap().0);
+            quotes.extend(iex_quotes(body("quotes", DAY, p, QT).as_bytes()).unwrap().0);
+        }
+        let (recs, conds) = iex::encode_day("SPY", &iex::merge(trades, quotes).unwrap()).unwrap();
+        let id = iex::instrument_id("SPY");
+        assert_eq!(
+            std::fs::read(data_file(&b.batches[0])).unwrap(),
+            reference_file(&out.join("im"), Feed::Iex, Some(Schema::Mbp1), id, &recs)
+        );
+        let tc: Vec<Vec<u8>> = conds.iter().map(|c| c.encode().unwrap().to_vec()).collect();
+        assert_eq!(
+            std::fs::read(data_file(&b.batches[1])).unwrap(),
+            reference_sidecar(&out.join("ic"), Feed::Iex, id, &tc)
+        );
+    }
+
+    /// A quote whose conditions can't be held (two-character code, no tape)
+    /// is kept, its conditions record marked unparsed and counted; nothing is
+    /// fetched again.
+    #[tokio::test]
+    async fn a_quote_whose_conditions_cant_be_held_is_marked() {
+        let q = Shape {
+            bad: Some(75),
+            ..Q3
+        };
+        let f = FakeAlpaca::start(T3, q).await;
+        let b = build(&f.client(), Feed::Sip, "SPY", DAY, &scratch("bad-quote"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (b.outcome.quotes, b.outcome.unparsed_quote_conditions),
+            (210, 1)
+        );
+        each_page_once(&f);
+        let mut d = dbn::decode::dbn::Decoder::from_zstd_file(data_file(&b.batches[2])).unwrap();
+        let mut marked = Vec::new();
+        let mut k = 0;
+        while let Some(r) = d.decode_record_ref().unwrap() {
+            if QuoteConditions::decode(r.as_ref()).unwrap().unparsed {
+                marked.push(k);
+            }
+            k += 1;
+        }
+        assert_eq!((k, marked), (210, vec![75]));
+        let binding: Value =
+            serde_json::from_slice(&std::fs::read(b.batches[2].join("binding.json")).unwrap())
+                .unwrap();
+        assert_eq!(binding["unparsed"], 1);
+    }
+
+    /// A trade the layout can't hold (five codes) fails the day as `Encode`,
+    /// without fetching any page again.
+    #[tokio::test]
+    async fn a_trade_the_layout_cant_hold_fails_without_refetching() {
+        let t = Shape {
+            bad: Some(60),
+            ..T3
+        };
+        let f = FakeAlpaca::start(t, Q3).await;
+        let e = build(&f.client(), Feed::Sip, "SPY", DAY, &scratch("bad-trade"))
+            .await
+            .unwrap_err();
+        assert!(matches!(e, Failure::Encode(_)) && !e.transient(), "{e}");
+        each_page_once(&f);
+    }
+
+    /// The startup sweep: an old day's spool goes whole; a complete spool by
+    /// another encoder loses its batches and marker but keeps its pages.
+    #[tokio::test]
+    async fn the_sweep_bounds_the_spool() {
+        let dir = scratch("sweep");
+        let f = FakeAlpaca::start(T3, Q3).await;
+        build(&f.client(), Feed::Sip, "SPY", DAY, &dir)
+            .await
+            .unwrap();
+        let ids = Feed::Sip.batches("SPY", DAY);
+        let marker = dir.join(format!("{}.complete.json", ids[0]));
+        let mut o: Value = serde_json::from_slice(&std::fs::read(&marker).unwrap()).unwrap();
+        o["encoder"] = json!("tinytrader-alpaca 0.0.1");
+        std::fs::write(&marker, o.to_string()).unwrap();
+        std::fs::create_dir_all(dir.join("lanes").join(&ids[0]).join("quotes")).unwrap();
+        assert!(
+            spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_none(),
+            "another encoder's spool isn't filed"
+        );
+        let gone = sweep(&dir, std::time::Duration::from_secs(3600));
+        assert_eq!(gone.len(), 1, "{gone:?}");
+        assert!(!marker.exists() && ids.iter().all(|id| !dir.join(id).exists()));
+        assert!(
+            dir.join("lanes").join(&ids[0]).exists(),
+            "the pages are kept"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let gone = sweep(&dir, std::time::Duration::from_millis(1));
+        assert!(gone[0].1.contains("untouched"), "{gone:?}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing left");
     }
 }

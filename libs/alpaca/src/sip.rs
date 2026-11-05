@@ -116,8 +116,12 @@ pub struct Quote {
     /// Condition codes in source order (the first `count`), one byte each.
     pub codes: [u8; 4],
     pub count: u8,
-    /// `b'A'`, `b'B'` or `b'C'`; 0 when Alpaca sent none.
+    /// `b'A'`, `b'B'` or `b'C'`; 0 when Alpaca sent none (or another).
     pub tape: u8,
+    /// The conditions or tape Alpaca sent can't be held (more than four codes,
+    /// a code that isn't one printable ASCII byte, no tape): the quote is kept,
+    /// and its conditions record says so.
+    pub unparsed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -144,8 +148,16 @@ impl RawQuote<'_> {
         let ts = timestamp(self.t)?;
         let lot = quote_lot(ts);
         let (bid, ask) = (side(self.bp, self.bs, lot)?, side(self.ap, self.as_, lot)?);
-        let (codes, count) = TradeConditions::codes_from(&self.c)
-            .map_err(|e| format!("quote conditions {:?}: {e}", self.c))?;
+        // Conditions that don't fit never refuse the quote: they're marked.
+        let tape = self
+            .z
+            .bytes()
+            .next()
+            .filter(|t| (b'A'..=b'C').contains(t) && self.z.len() == 1);
+        let ((codes, count), unparsed) = match (TradeConditions::codes_from(&self.c), tape) {
+            (Ok(c), Some(_)) => (c, false),
+            _ => (([0; 4], 0), true),
+        };
         Ok(Quote {
             ts,
             bid,
@@ -154,7 +166,8 @@ impl RawQuote<'_> {
             ask_pb: side_exchange(ask, &self.ax)?,
             codes,
             count,
-            tape: self.z.bytes().next().unwrap_or(0),
+            tape: tape.unwrap_or(0),
+            unparsed,
         })
     }
 }
@@ -253,6 +266,7 @@ const EMPTY: Quote = Quote {
     codes: [0; 4],
     count: 0,
     tape: 0,
+    unparsed: false,
 };
 
 /// Turns one symbol-day's rows, in tape order, into records one at a time:
@@ -299,6 +313,7 @@ impl Encoder {
                     count: q.count,
                     tape: q.tape,
                     quote_seq: self.quotes,
+                    unparsed: q.unparsed,
                 };
                 c.encode().map_err(|e| format!("quote at {}: {e}", q.ts))?;
                 self.quotes = self.quotes.wrapping_add(1);
@@ -420,6 +435,7 @@ mod tests {
             codes: [b'R', 0, 0, 0],
             count: 1,
             tape: b'B',
+            unparsed: false,
         }
     }
     fn t(ts: u64, x: u16) -> Trade {
@@ -484,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn quote_conditions_are_parsed_and_refused_when_they_dont_fit() {
+    fn quote_conditions_are_parsed_and_marked_when_they_dont_fit() {
         let row: RawQuote = serde_json::from_str(
             r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":774.6,"as":1,"ax":"P","c":["R","Y"],"z":"B"}"#,
         )
@@ -498,13 +514,28 @@ mod tests {
             r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":0,"as":0,"c":["RR"],"z":"B"}"#,
         )
         .unwrap();
-        assert!(bad.parse().is_err());
-        // No tape: the quote parses, but its conditions record is refused.
+        let five: RawQuote = serde_json::from_str(
+            r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":0,"as":0,"c":["A","B","C","D","E"],"z":"B"}"#,
+        )
+        .unwrap();
+        let multi: RawQuote = serde_json::from_str(
+            r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":0,"as":0,"c":["\u00e9"],"z":"B"}"#,
+        )
+        .unwrap();
         let none: RawQuote = serde_json::from_str(
             r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":0,"as":0}"#,
         )
         .unwrap();
-        let q = none.parse().unwrap();
-        assert!(Encoder::new("SPY").push(&Row::Quote(q)).is_err());
+        // Each still a quote, its conditions record marked unparsed, never refused.
+        for (raw, tape) in [(bad, b'B'), (five, b'B'), (multi, b'B'), (none, 0)] {
+            let q = raw.parse().unwrap();
+            assert!(q.unparsed && q.count == 0 && q.tape == tape, "{q:?}");
+            let (_, c) = Encoder::new("SPY").push(&Row::Quote(q)).unwrap();
+            let Conditions::Quote(c) = c else {
+                panic!("a quote")
+            };
+            let back = QuoteConditions::decode(&c.encode().unwrap()).unwrap();
+            assert!(back.unparsed && back.codes().is_empty());
+        }
     }
 }
