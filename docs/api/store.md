@@ -22,7 +22,7 @@ Shared conventions are in the [API overview](README.md).
 | `GET /incoming` | read | Batches uploaded and waiting to be filed. |
 | `GET /batches/{provider}` | read | Which batches the volumes hold, and how. |
 | `PUT /incoming/{provider}/{batch}/{file}?size=&sha256=` | write | Upload one file of a batch, verified on arrival. |
-| `POST /incorporate/{provider}/{batch}?parent=` | write | File a complete batch into the standard layout; a parent's whole chain supersedes partial days of it ([below](#a-complete-day-supersedes-a-partial-day)). With `parent` (such as `SPY.OPT`), a batch bought as a list of that parent's contracts is filed as partial days, as an import. |
+| `POST /incorporate/{provider}/{batch}?parent=` | write | File a complete batch into the standard layout; a parent's whole chain supersedes partial days of it ([below](#a-complete-day-supersedes-a-partial-day)). With `parent` (such as `SPY.OPT`), a batch bought as a list of that parent's contracts is filed as partial days, as an import. Besides DBN's own schemas, it files tinytrader's extension schemas `conditions` and `quote-conditions` ([datasets](../datasets.md)), whose files' headers name no schema. |
 | `POST /import/{provider}/{id}` | write | File DBN that didn't come from a provider batch, uploaded with an `import.json` ([below](#partial-days)). |
 | `POST /adopt/{provider}` | write | File a download folder already on a volume, where it is. |
 | `POST /volumes/approve` | write | Approve a drive found in the mount directory. |

@@ -23,6 +23,7 @@ tinytrader is the boundary layer between markets and your code: relays stream li
 | [Job queue](queue.md) | templates `tinytrader/v1` `JobTemplate` | HTTP JSON, YAML | same-origin writes | experimental |
 | [econ-calendar](econ-calendar.md) | (unversioned) | HTTP JSON | none (reads) | `/events`, `/earnings` stable |
 | Trade conditions records ([datasets](../datasets.md)) | `tinytrader.trade-conditions/1` | DBN records | — | stable |
+| Quote conditions records ([datasets](../datasets.md)) | `tinytrader.quote-conditions/1` | DBN records | — | experimental |
 | [Predictive publications](predictive.md) | `tinytrader.predictive/1` | store records, written through the trading runtime's inbound port | as the store | experimental |
 
 **Stable** means clients may rely on it: changes are additive (new optional fields, new endpoints, new enum values clients must tolerate), and anything breaking ships under a new schema name served alongside the old one for an announced overlap. **Experimental** means it may change with its one in-tree client (usually the console); pin a commit if you depend on it.

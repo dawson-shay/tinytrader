@@ -13,7 +13,9 @@ workspace = true
 axum.workspace = true
 clap = { version = "4", features = ["derive", "env"] }
 dbn = { version = "0.71", default-features = false, features = ["zstd"] }
-reqwest.workspace = true
+fs4 = "1.1"
+httpdate = "1"
+reqwest = { workspace = true, features = ["stream"] }
 rustls.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
@@ -25,3 +27,6 @@ tinytrader-observe.workspace = true
 tinytrader-schedule.workspace = true
 tokio = { workspace = true, features = ["fs"] }
 zstd = "0.13"
+
+[dev-dependencies]
+futures-util.workspace = true
