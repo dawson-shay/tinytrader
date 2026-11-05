@@ -1042,12 +1042,41 @@ fn newest(p: &Path, depth: u32) -> Option<std::time::SystemTime> {
     Some(t)
 }
 
+/// Why a day's spool is kept from the sweep.
+pub enum Keep {
+    /// Still wanted by a run that isn't finished: never swept for age (its
+    /// batches may still be rebuilt if another encoder built them).
+    Wanted(String),
+    /// Kept for a person (conditions that don't bind): never touched.
+    Untouchable(String),
+}
+
+/// A day's store batch id split: (feed name, symbol, `YYYY-MM-DD`).
+pub fn parse_batch(main: &str) -> Option<(String, String, String)> {
+    let rest = main.strip_prefix("ALPACA-")?;
+    let (feed, rest) = rest.split_once('-')?;
+    let (sym, d) = rest.rsplit_once('-')?;
+    (d.len() == 8 && d.bytes().all(|b| b.is_ascii_digit())).then(|| {
+        (
+            feed.to_lowercase(),
+            sym.to_owned(),
+            format!("{}-{}-{}", &d[..4], &d[4..6], &d[6..]),
+        )
+    })
+}
+
 /// At startup, bound the spool: a day whose spool (batches, marker, lanes) is
 /// untouched for `max_age` is removed whole; a complete spool built by
 /// another encoder loses its batches and marker (its fetched pages, if any,
-/// are kept: they're Alpaca's bytes, not the encoder's). Returns what went,
-/// and why.
-pub fn sweep(dir: &Path, max_age: std::time::Duration) -> Vec<(String, String)> {
+/// are kept: they're Alpaca's bytes, not the encoder's). `keep` says, by a
+/// day's main batch id, what mustn't be: a day an unfinished run still wants
+/// isn't swept for age, and one kept for a person isn't touched. Returns
+/// every day swept or kept past its age, and why (`true` when swept).
+pub fn sweep(
+    dir: &Path,
+    max_age: std::time::Duration,
+    keep: impl Fn(&str) -> Option<Keep>,
+) -> Vec<(String, bool, String)> {
     use std::collections::BTreeMap;
     let mut days: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     let day_of = |name: &str| -> String {
@@ -1078,12 +1107,34 @@ pub fn sweep(dir: &Path, max_age: std::time::Duration) -> Vec<(String, String)> 
             .ok()
             .and_then(|b| serde_json::from_slice::<Outcome>(&b).ok())
             .is_some_and(|o| o.encoder != ENCODER);
+        let kept = keep(&day);
+        if let Some(Keep::Untouchable(why)) = kept {
+            if old || other_encoder {
+                gone.push((day, false, format!("kept: {why}")));
+            }
+            continue;
+        }
+        if let (true, Some(Keep::Wanted(why))) = (old, &kept) {
+            if other_encoder {
+                for p in paths.iter().filter(|p| !p.starts_with(dir.join("lanes"))) {
+                    let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
+                }
+                gone.push((
+                    day.clone(),
+                    true,
+                    "its batches were built by another encoder; its pages are kept".into(),
+                ));
+            }
+            gone.push((day, false, format!("kept past its age: {why}")));
+            continue;
+        }
         if old {
             for p in &paths {
                 let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
             }
             gone.push((
                 day,
+                true,
                 format!(
                     "its spool was untouched for over {} days",
                     max_age.as_secs() / 86_400
@@ -1093,7 +1144,7 @@ pub fn sweep(dir: &Path, max_age: std::time::Duration) -> Vec<(String, String)> 
             for p in paths.iter().filter(|p| !p.starts_with(dir.join("lanes"))) {
                 let _ = std::fs::remove_dir_all(p).or_else(|_| std::fs::remove_file(p));
             }
-            gone.push((day, "its batches were built by another encoder; they're built again from its pages or a new fetch".into()));
+            gone.push((day, true, "its batches were built by another encoder; they're built again from its pages or a new fetch".into()));
         }
     }
     let _ = std::fs::remove_dir(dir.join("lanes"));
@@ -2401,7 +2452,7 @@ mod stream_tests {
             spooled(Feed::Sip, "SPY", DAY, &dir).unwrap().is_none(),
             "another encoder's spool isn't filed"
         );
-        let gone = sweep(&dir, std::time::Duration::from_secs(3600));
+        let gone = sweep(&dir, std::time::Duration::from_secs(3600), |_| None);
         assert_eq!(gone.len(), 1, "{gone:?}");
         assert!(!marker.exists() && ids.iter().all(|id| !dir.join(id).exists()));
         assert!(
@@ -2409,8 +2460,8 @@ mod stream_tests {
             "the pages are kept"
         );
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let gone = sweep(&dir, std::time::Duration::from_millis(1));
-        assert!(gone[0].1.contains("untouched"), "{gone:?}");
+        let gone = sweep(&dir, std::time::Duration::from_millis(1), |_| None);
+        assert!(gone[0].1 && gone[0].2.contains("untouched"), "{gone:?}");
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing left");
     }
 }

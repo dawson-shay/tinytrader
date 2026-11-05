@@ -36,7 +36,7 @@ mod testing;
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -96,6 +96,10 @@ struct Args {
     /// it, days wait.
     #[arg(long, env = "HISTORY_MIN_FREE_GB", default_value_t = 20.0)]
     min_free_gb: f64,
+    /// Disk (GB) reserved for each day being built (its spool and batches; a
+    /// heavy SIP day peaks near 3), against the floor.
+    #[arg(long, env = "HISTORY_DAY_RESERVE_GB", default_value_t = 3.0)]
+    day_reserve_gb: f64,
     /// Spools untouched this many days are removed at startup.
     #[arg(long, env = "HISTORY_SPOOL_MAX_AGE_DAYS", default_value_t = 14)]
     spool_max_age_days: u64,
@@ -187,6 +191,8 @@ struct App {
     observer: Observer,
     yield_to: Vec<(String, String)>,
     last_topoff: Mutex<String>,
+    /// Disk reserved by the days being built (`HISTORY_DAY_RESERVE_GB` each).
+    reserved: AtomicU64,
 }
 type Shared = Arc<App>;
 
@@ -609,17 +615,25 @@ async fn run_day(a: &App, id: &str, feed: Feed, sym: &str, d: &str) -> DayEnd {
             ));
         }
     };
+    // Held from the build through filing: the day's disk is in use till then.
+    let mut _reservation: Option<Reservation> = None;
     let built = match kept {
         Some(kept) => Ok(kept),
         None => {
-            // Room for the day's spool and batches first.
+            // Room for the day's spool and batches first: the floor, after
+            // what the days already started have reserved and this day's own.
             let free = fs4::available_space(&spool).unwrap_or(0);
             let floor = (a.args.min_free_gb * 1e9) as u64;
-            if free < floor {
+            let estimate = (a.args.day_reserve_gb * 1e9) as u64;
+            let before = a.reserved.fetch_add(estimate, Ordering::SeqCst);
+            _reservation = Some(Reservation(&a.reserved, estimate));
+            if !room(free, before, floor, estimate) {
                 let why = format!(
-                    "{:.1} GB free in {}, under HISTORY_MIN_FREE_GB ({}); {sym} {d} waits",
+                    "{:.1} GB free in {}, {:.1} GB reserved by days started, {:.1} GB for this one: under HISTORY_MIN_FREE_GB ({}); {sym} {d} waits",
                     free as f64 / 1e9,
                     spool.display(),
+                    before as f64 / 1e9,
+                    estimate as f64 / 1e9,
                     a.args.min_free_gb
                 );
                 a.events
@@ -957,6 +971,44 @@ async fn resume_run(
     }
 }
 
+/// A day a person has dealt with (one whose conditions don't bind, or any
+/// day not filed): its record and spool removed, so resuming the run fetches
+/// it afresh and the sweep may take what's left.
+async fn clear_day(
+    AxState(a): AxState<Shared>,
+    UrlPath((id, symbol, d)): UrlPath<(String, String, String)>,
+) -> (StatusCode, Json<Value>) {
+    let key = format!("{symbol} {d}");
+    let mut found: Option<Option<(Feed, String)>> = None;
+    set_run(&a, &id, |r| {
+        found = Some(match r.days.get(&key).map(|x| x.state.clone()) {
+            Some(s) if s != "committed" && s != "held" => {
+                r.days.remove(&key);
+                Some((r.feed, s))
+            }
+            _ => None,
+        });
+    });
+    match found {
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "no such run" })),
+        ),
+        Some(None) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": format!("{key} isn't a day of this run left unfiled") })),
+        ),
+        Some(Some((feed, was))) => {
+            day::clear_spool(feed, &symbol, &d, &a.args.state.join("spool"));
+            a.events.push(
+                format!("cleared {key}"),
+                format!("run {id}: it was {was}; its spool is removed"),
+            );
+            (StatusCode::OK, Json(json!({ "cleared": key, "was": was })))
+        }
+    }
+}
+
 fn runs_view(a: &App) -> Value {
     let runs = lock(&a.runs).clone();
     let list: Vec<Value> = runs
@@ -973,6 +1025,66 @@ fn runs_view(a: &App) -> Value {
         })
         .collect();
     json!({ "runs": list })
+}
+
+/// Bound the spool (at startup): what no run still needs, by age or encoder.
+/// Days an unfinished run (queued, running, stopped) covers, and days any run
+/// has deferred, are kept from the age sweep; a day whose conditions don't
+/// bind is never touched until it's cleared (`POST
+/// /runs/{id}/clear/{symbol}/{day}`). Each sweep, and each day kept past its
+/// age, is logged with its reason.
+fn sweep_spool(a: &App, spool: &std::path::Path, max_age: Duration) {
+    let runs = lock(&a.runs).clone();
+    let keep = |main: &str| -> Option<day::Keep> {
+        let (feed, sym, d) = day::parse_batch(main)?;
+        let key = format!("{sym} {d}");
+        let mine = runs.iter().filter(|r| r.feed.name() == feed);
+        for r in mine.clone() {
+            if r.days
+                .get(&key)
+                .is_some_and(|x| x.state == "conditions_unbound")
+            {
+                return Some(day::Keep::Untouchable(format!(
+                    "run {} has its conditions unbound, for a person to compare",
+                    r.id
+                )));
+            }
+        }
+        for r in mine {
+            let covers = r.symbols.contains(&sym) && r.start <= d && d <= r.through;
+            if covers && matches!(r.state.as_str(), "queued" | "running" | "stopped") {
+                return Some(day::Keep::Wanted(format!("run {} is {}", r.id, r.state)));
+            }
+            if r.days.get(&key).is_some_and(|x| x.state == "deferred") {
+                return Some(day::Keep::Wanted(format!("run {} deferred it", r.id)));
+            }
+        }
+        None
+    };
+    for (what, swept, why) in day::sweep(spool, max_age, keep) {
+        eprintln!(
+            "alpaca-history: {} {what}: {why}",
+            if swept { "swept" } else { "kept" }
+        );
+        a.events.push(
+            format!("{} {what}", if swept { "swept" } else { "kept" }),
+            why,
+        );
+    }
+}
+
+/// Whether a day may start: the disk's free space, less what days already
+/// started have reserved, still leaves the floor after this day's estimate.
+fn room(free: u64, reserved: u64, floor: u64, estimate: u64) -> bool {
+    free.saturating_sub(reserved) >= floor.saturating_add(estimate)
+}
+
+/// A day's disk reservation, released when the day ends.
+struct Reservation<'a>(&'a AtomicU64, u64);
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(self.1, Ordering::SeqCst);
+    }
 }
 
 /// The service, ready to work: its pace, its store, its runs.
@@ -1033,6 +1145,7 @@ fn build_app(
             })
             .collect(),
         last_topoff: Mutex::new(String::new()),
+        reserved: AtomicU64::new(0),
         args,
     });
     {
@@ -1087,6 +1200,7 @@ fn router(app: &Shared) -> Router {
         )
         .route("/runs/{id}/stop", post(stop_run))
         .route("/runs/{id}/resume", post(resume_run))
+        .route("/runs/{id}/clear/{symbol}/{day}", post(clear_day))
         // A web page of another origin can't start, stop or resume a run.
         .layer(axum::middleware::from_fn(
             tinytrader_observe::guard::same_origin_writes,
@@ -1128,9 +1242,7 @@ async fn main() {
     let spool = args.state.join("spool");
     let max_age = Duration::from_secs(args.spool_max_age_days * 86_400);
     let app = build_app(args, key_id, secret_key, store_token, runs);
-    for (what, why) in day::sweep(&spool, max_age) {
-        app.events.push(format!("swept {what}"), why);
-    }
+    sweep_spool(&app, &spool, max_age);
     let listen = listen_address("HISTORY_LISTEN", "127.0.0.1:9124");
     let router = router(&app);
     let listener = match tokio::net::TcpListener::bind(&listen).await {
@@ -1503,5 +1615,97 @@ mod tests {
         work(&a, &id).await;
         assert!(run_of(&a, &id).days.is_empty());
         assert!(f.log().is_empty());
+    }
+
+    /// Builds a complete spool for `sym` on `DAY` in the app's spool, made old.
+    async fn old_spool(f: &FakeAlpaca, a: &App, sym: &str) -> Vec<String> {
+        let spool = a.args.state.join("spool");
+        crate::day::build(&f.client(), Feed::Sip, sym, DAY, &spool)
+            .await
+            .unwrap();
+        Feed::Sip.batches(sym, DAY)
+    }
+
+    /// The sweep consults the runs: a stopped run's old spool survives, an
+    /// unbound day's batches survive even once its run is done (until the day
+    /// is cleared), and a finished day's old spool goes.
+    #[tokio::test]
+    async fn the_sweep_spares_what_runs_still_need() {
+        let (f, s) = (
+            FakeAlpaca::start(SMALL, SMALL).await,
+            FakeStore::start().await,
+        );
+        let a = app_for(&f, &s, "sweep-runs", &[]);
+        let spool = a.args.state.join("spool");
+        let (spy, qqq, iwm) = (
+            old_spool(&f, &a, "SPY").await,
+            old_spool(&f, &a, "QQQ").await,
+            old_spool(&f, &a, "IWM").await,
+        );
+        let stopped = queue(&a, ask(&["SPY"], DAY, DAY), "test").unwrap().id;
+        set_run(&a, &stopped, |r| r.state = "stopped".into());
+        // Run ids are by the millisecond.
+        std::thread::sleep(Duration::from_millis(5));
+        let done = queue(&a, ask(&["QQQ", "IWM"], DAY, DAY), "test")
+            .unwrap()
+            .id;
+        set_run(&a, &done, |r| {
+            r.state = "done".into();
+            r.days.insert(
+                format!("QQQ {DAY}"),
+                DayRecord::noted("conditions_unbound", "compare".into()),
+            );
+            r.days.insert(
+                format!("IWM {DAY}"),
+                DayRecord::noted("committed", String::new()),
+            );
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        sweep_spool(&a, &spool, Duration::from_millis(1));
+        let all = |ids: &[String]| ids.iter().all(|b| spool.join(b).exists());
+        assert!(all(&spy), "a stopped run's spool survives");
+        assert!(all(&qqq), "an unbound day's batches survive");
+        assert!(
+            iwm.iter().all(|b| !spool.join(b).exists()),
+            "a finished day's old spool goes"
+        );
+        // Cleared by a person, the unbound day's spool goes with it.
+        let url = serve(&a).await;
+        let r = reqwest::Client::new()
+            .post(format!("{url}/runs/{done}/clear/QQQ/{DAY}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+        assert!(qqq.iter().all(|b| !spool.join(b).exists()));
+        let r = reqwest::Client::new()
+            .post(format!("{url}/runs/{done}/clear/IWM/{DAY}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 409, "a filed day isn't cleared");
+    }
+
+    /// Days already started hold their reservation: the floor counts it.
+    #[test]
+    fn the_floor_counts_days_already_started() {
+        const GB: u64 = 1_000_000_000;
+        // 28 GB free, a 20 GB floor, 3 GB a day: two days fit, a third doesn't.
+        assert!(room(28 * GB, 0, 20 * GB, 3 * GB));
+        assert!(room(28 * GB, 3 * GB, 20 * GB, 3 * GB));
+        assert!(!room(28 * GB, 6 * GB, 20 * GB, 3 * GB));
+        let reserved = AtomicU64::new(0);
+        {
+            let _a = Reservation(&reserved, 3 * GB);
+            reserved.fetch_add(3 * GB, Ordering::SeqCst);
+            let _b = Reservation(&reserved, 3 * GB);
+            reserved.fetch_add(3 * GB, Ordering::SeqCst);
+            assert_eq!(reserved.load(Ordering::SeqCst), 6 * GB);
+        }
+        assert_eq!(
+            reserved.load(Ordering::SeqCst),
+            0,
+            "released when the days end"
+        );
     }
 }

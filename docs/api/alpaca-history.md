@@ -22,7 +22,8 @@
 | `HISTORY_MAX_RPM` | Requests a minute (default 190), shared by every day in flight. |
 | `HISTORY_CONCURRENCY` | Days in flight at once, 1 to 8 (default 3). |
 | `HISTORY_MIN_FREE_GB` | Free space the spool's disk must have before a day starts (default 20); below it days wait, with an event. |
-| `HISTORY_SPOOL_MAX_AGE_DAYS` | A day's spool untouched this long is removed at startup (default 14). |
+| `HISTORY_DAY_RESERVE_GB` | Disk reserved for each day being built, from its start until it's filed (default 3), counted against the floor. |
+| `HISTORY_SPOOL_MAX_AGE_DAYS` | A day's spool untouched this long is removed at startup (default 14), unless a run still needs it. |
 
 ## Endpoints
 
@@ -31,6 +32,7 @@
 | `GET /runs` | `{"runs": [{id, feed, symbols, start, through, state, note, from, planned, committed, held, failed, bytes, days: {"SYM YYYY-MM-DD": {state, trades?, quotes?, pages?, bytes?, note?, attempts?}}}]}`, newest first. A run's `state` is `queued`, `running`, `done`, `stopped` or `failed`; a day's is `committed`, `held`, `failed`, `deferred` or `conditions_unbound`, and `attempts` counts its failures. |
 | `POST /runs` | `{feed: "sip" \| "iex", symbols: [1..50], start, through, order?: "oldest-first" \| "newest-first", dry_run?: bool}` → the run. With `dry_run`, nothing is queued: the plan below. |
 | `POST /runs/{id}/stop` | `{"stopped": id}`, after the days in flight. |
+| `POST /runs/{id}/clear/{symbol}/{day}` | `{"cleared": "SYM YYYY-MM-DD", "was": state}`: a day of the run left unfiled (such as `conditions_unbound`, once a person has compared its batches) loses its record and spool; resuming the run fetches it afresh. `409` for a filed or held day. |
 | `POST /runs/{id}/resume` | `{"resumed": id}`: a `stopped` or `failed` run is `queued` again. Its `failed` and `deferred` days are tried afresh (their attempts reset); the days it filed or found held are skipped, and every day is checked against the store again before it's fetched. `conditions_unbound` days stay as they are, for a person. `409` for a run in any other state. |
 
 ### Dry run
@@ -56,7 +58,7 @@
 - **Streamed.** The day is written from the spool a page at a time: memory doesn't grow with the day, however large. Uploads to the store are streamed from disk too.
 - **Checked.** Read back, the main file's trades (`T`) must match the trades lane's pages, and its quotes (`M`) the quotes lane's, each by count and by first and last time; the trade conditions must number its trades, the quote conditions its quotes. Any mismatch fails the day.
 - **Concurrent.** Up to `HISTORY_CONCURRENCY` days are in flight, each with both lanes, on the one pace. Live capture (`HISTORY_YIELD_TO`) is checked before each day and every 30 seconds while days are in flight; when it's live (or can't be reached, which counts as live), each lane stops at its next page, its pages kept.
-- **Disk.** A heavy SIP day (SPY in 2020 or 2022) peaks at about 1 GB of spooled pages plus 1 to 2 GB of built batches, so the spool's peak is that times `HISTORY_CONCURRENCY` (about 9 GB at 3). No day starts below `HISTORY_MIN_FREE_GB`. A day's pages go once its batches are written; its batches once it's filed, refused, or failed for good. At startup, spools untouched for `HISTORY_SPOOL_MAX_AGE_DAYS` are removed, and complete spools built by another encoder lose their batches (their pages, if any, are kept and rebuilt from).
+- **Disk.** A heavy SIP day (SPY in 2020 or 2022) peaks at about 1 GB of spooled pages plus 1 to 2 GB of built batches, so the spool's peak is that times `HISTORY_CONCURRENCY` (about 9 GB at 3). No day starts unless the free space, less `HISTORY_DAY_RESERVE_GB` for each day already being built and for itself, stays above `HISTORY_MIN_FREE_GB`. A day's pages go once its batches are written; its batches once it's filed, refused, or failed for good. At startup, spools untouched for `HISTORY_SPOOL_MAX_AGE_DAYS` are removed, unless a run that isn't finished (queued, running or stopped) covers the day or a run deferred it; complete spools built by another encoder lose their batches (their pages, if any, are kept and rebuilt from). A `conditions_unbound` day's batches are never swept, whatever their age or encoder, until the day is cleared. Each day swept, or kept past its age, is logged and told as an event with its reason.
 
 ## Batches
 
