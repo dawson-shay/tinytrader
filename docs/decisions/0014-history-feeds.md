@@ -68,3 +68,22 @@ The encoders live in `libs/alpaca`, shared with the relay's live IEX feed.
 - A crash mid-day loses that day's work, not its correctness: the day is
   fetched again (about three minutes for SPY).
 - A question only the raw pages could answer means fetching them again.
+
+## Amended: a multi-year backfill
+
+Backfilling years of SPY and QQQ needed more than a day at a time:
+
+- Each lane's pages are spooled as they arrive, with the next page token, so
+  a crash, a restart, a rate limit or an outage resumes mid-lane and never
+  asks for a page twice (as Hyphae's recorder does). A rate limit or an
+  outage waits and asks again; a 400 for a page token restarts that lane.
+  A failed day is tried again up to three times. This replaces the
+  consequence above: a crash loses no fetched pages.
+- A day is written from the spool as a stream, and uploaded as one, so memory
+  doesn't grow with the day.
+- The check reads trades and quotes back separately, each against its own
+  lane, so a lost trade and a duplicated quote can't cancel out.
+- SIP quote conditions are kept, as `tinytrader.quote-conditions/1` in a
+  third batch (schema `quote-conditions`), which the store files as it files
+  `conditions`.
+- Several days are in flight at once on the one pace (`HISTORY_CONCURRENCY`).

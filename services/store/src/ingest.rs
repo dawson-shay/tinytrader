@@ -57,7 +57,9 @@ pub fn provider_dir(provider: &str) -> Option<&'static str> {
 }
 
 /// Schemas that aren't DBN's own: their files' headers name no schema.
-const EXTENSION_SCHEMAS: &[&str] = &["conditions"];
+/// `conditions` holds `tinytrader.trade-conditions/1` records and
+/// `quote-conditions` `tinytrader.quote-conditions/1` (decision 0014).
+const EXTENSION_SCHEMAS: &[&str] = &["conditions", "quote-conditions"];
 
 /// A single path component safe to use as a batch or file name.
 #[must_use]
@@ -1304,6 +1306,80 @@ mod tests {
             (cov[0]["kind"].clone(), cov[0]["condition"]["state"].clone()),
             (json!("complete"), json!("degraded"))
         );
+        let _ = fs::remove_dir_all(vol);
+    }
+
+    /// An Alpaca sidecar batch (its header names no schema) is filed under
+    /// its extension schema, trade and quote conditions alike; a header that
+    /// names a schema is refused there, and an unknown schema is refused.
+    #[test]
+    fn files_extension_schema_sidecars() {
+        let vol = scratch("sidecars");
+        let root = vol.join("Alpaca");
+        let day = "2026-10-01";
+        let sidecar = |schema: Option<dbn::Schema>| {
+            let start = day_ns(day).unwrap();
+            let metadata = dbn::Metadata::builder()
+                .dataset("ALPACA.SIP".to_owned())
+                .schema(schema)
+                .start(start)
+                .end(std::num::NonZeroU64::new(start + 86_400 * 1_000_000_000))
+                .stype_in(Some(dbn::SType::RawSymbol))
+                .stype_out(dbn::SType::InstrumentId)
+                .build();
+            let mut out = Vec::new();
+            drop(dbn::encode::dbn::Encoder::with_zstd(&mut out, &metadata).unwrap());
+            out
+        };
+        let stage = |root: &Path, batch: &str, schema: &str, data: &[u8]| {
+            let inc = root.join(INCOMING).join(batch);
+            let name = format!("alpaca-sip-20261001.{schema}.dbn.zst");
+            let sha = upload(&inc, &name, data);
+            let metadata = json!({
+                "job_id": batch,
+                "query": { "dataset": "ALPACA.SIP", "schema": schema, "symbols": ["SPY"], "stype_in": "raw_symbol", "encoding": "dbn", "compression": "zstd" },
+                "customizations": { "split_symbols": false, "split_duration": "day" },
+            })
+            .to_string();
+            let msha = upload(&inc, "metadata.json", metadata.as_bytes());
+            let manifest = json!({ "job_id": batch, "files": [
+                { "filename": name, "size": data.len(), "hash": format!("sha256:{sha}") },
+                { "filename": "metadata.json", "size": metadata.len(), "hash": format!("sha256:{msha}") },
+            ] })
+            .to_string();
+            upload(&inc, "manifest.json", manifest.as_bytes());
+        };
+        for (batch, schema) in [
+            ("ALPACA-SIP-SPY-20261001-conditions", "conditions"),
+            (
+                "ALPACA-SIP-SPY-20261001-quote-conditions",
+                "quote-conditions",
+            ),
+        ] {
+            let data = sidecar(None);
+            stage(&root, batch, schema, &data);
+            incorporate(&one(&root, batch), &[], batch, "2026-10-06").unwrap();
+            assert_eq!(
+                fs::read(root.join(format!("ALPACA.SIP/SPY/{schema}/{day}.dbn.zst"))).unwrap(),
+                data,
+                "{schema}"
+            );
+        }
+        // A sidecar whose header names a DBN schema isn't what its name says.
+        let other = vol.join("other/Alpaca");
+        stage(
+            &other,
+            "QC-NAMED",
+            "quote-conditions",
+            &sidecar(Some(dbn::Schema::Cmbp1)),
+        );
+        let err = incorporate(&one(&other, "QC-NAMED"), &[], "QC-NAMED", "2026-10-06").unwrap_err();
+        assert!(err.contains("its header says schema"), "{err}");
+        // Nor is an extension the store doesn't know.
+        stage(&other, "QC-UNKNOWN", "book-conditions", &sidecar(None));
+        let err =
+            incorporate(&one(&other, "QC-UNKNOWN"), &[], "QC-UNKNOWN", "2026-10-06").unwrap_err();
+        assert!(err.contains("unknown schema"), "{err}");
         let _ = fs::remove_dir_all(vol);
     }
 

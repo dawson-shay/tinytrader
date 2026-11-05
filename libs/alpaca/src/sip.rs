@@ -1,5 +1,6 @@
 //! Alpaca SIP (consolidated) quotes and trades as DBN `CMBP-1`, with trade
-//! conditions as `tinytrader.trade-conditions/1` records. For history
+//! conditions as `tinytrader.trade-conditions/1` records and quote conditions
+//! as `tinytrader.quote-conditions/1` records ([`crate::quote_conditions`]). For history
 //! (`alpaca-history`, decision 0014); the conventions are IEX's ([`crate::iex`])
 //! where they apply:
 //!
@@ -25,6 +26,7 @@ use tinytrader_dbn::dbn;
 use tinytrader_dbn::{TradeConditions, TradeUpdate};
 
 use crate::iex::{ABSENT, Side, price, quote_lot, side, timestamp};
+use crate::quote_conditions::QuoteConditions;
 
 /// The dataset name.
 pub const DATASET: &str = "ALPACA.SIP";
@@ -77,6 +79,12 @@ pub struct RawQuote<'a> {
     pub as_: u64,
     #[serde(default)]
     pub ax: String,
+    /// Quote conditions, as sent.
+    #[serde(default)]
+    pub c: Vec<String>,
+    /// Tape (`A`, `B` or `C`).
+    #[serde(default)]
+    pub z: String,
 }
 
 /// A SIP trade row from Alpaca's history.
@@ -105,6 +113,11 @@ pub struct Quote {
     /// Quoting exchanges' publisher ids; 0 for an absent side.
     pub bid_pb: u16,
     pub ask_pb: u16,
+    /// Condition codes in source order (the first `count`), one byte each.
+    pub codes: [u8; 4],
+    pub count: u8,
+    /// `b'A'`, `b'B'` or `b'C'`; 0 when Alpaca sent none.
+    pub tape: u8,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,12 +144,17 @@ impl RawQuote<'_> {
         let ts = timestamp(self.t)?;
         let lot = quote_lot(ts);
         let (bid, ask) = (side(self.bp, self.bs, lot)?, side(self.ap, self.as_, lot)?);
+        let (codes, count) = TradeConditions::codes_from(&self.c)
+            .map_err(|e| format!("quote conditions {:?}: {e}", self.c))?;
         Ok(Quote {
             ts,
             bid,
             ask,
             bid_pb: side_exchange(bid, &self.bx)?,
             ask_pb: side_exchange(ask, &self.ax)?,
+            codes,
+            count,
+            tape: self.z.bytes().next().unwrap_or(0),
         })
     }
 }
@@ -172,7 +190,9 @@ pub enum Row {
 }
 
 impl Row {
-    fn ts(&self) -> u64 {
+    /// The row's event time.
+    #[must_use]
+    pub fn ts(&self) -> u64 {
         match self {
             Self::Quote(q) => q.ts,
             Self::Trade(t) => t.ts,
@@ -230,27 +250,67 @@ const EMPTY: Quote = Quote {
     ask: ABSENT,
     bid_pb: 0,
     ask_pb: 0,
+    codes: [0; 4],
+    count: 0,
+    tape: 0,
 };
 
-/// Encode a day from history: its CMBP-1 records and their trade conditions
-/// (the nth for the nth trade). Rows from history have no receive time.
-///
-/// # Errors
-/// Refuses a trade whose conditions the layout can't hold.
-pub fn encode_day(
-    symbol: &str,
-    rows: &[Row],
-) -> Result<(Vec<Cmbp1Msg>, Vec<TradeConditions>), String> {
-    let instrument = instrument_id(symbol);
-    let mut book = EMPTY;
-    let mut records = Vec::with_capacity(rows.len());
-    let mut conditions = Vec::new();
-    let mut seq: u32 = 0;
-    for (i, row) in rows.iter().enumerate() {
-        let (publisher, ts, action, px, sz, lv) = match row {
+/// Turns one symbol-day's rows, in tape order, into records one at a time:
+/// each with its conditions record (the nth trade conditions for the nth
+/// trade, the nth quote conditions for the nth quote). `F_LAST` depends on
+/// the next row; the caller sets it ([`encode_day`] does).
+pub struct Encoder {
+    instrument: u32,
+    book: Quote,
+    trades: u32,
+    quotes: u32,
+}
+
+/// A row's conditions record.
+pub enum Conditions {
+    Trade(TradeConditions),
+    Quote(QuoteConditions),
+}
+
+impl Encoder {
+    #[must_use]
+    pub fn new(symbol: &str) -> Self {
+        Self {
+            instrument: instrument_id(symbol),
+            book: EMPTY,
+            trades: 0,
+            quotes: 0,
+        }
+    }
+
+    /// The next row's record (`F_LAST` unset) and its conditions.
+    ///
+    /// # Errors
+    /// Refuses conditions the layouts can't hold.
+    pub fn push(&mut self, row: &Row) -> Result<(Cmbp1Msg, Conditions), String> {
+        let (publisher, ts, action, px, sz, lv, cond) = match row {
             Row::Quote(q) => {
-                book = *q;
-                (PUBLISHER, q.ts, b'M', UNDEF_PRICE, 0, level(q))
+                self.book = *q;
+                let c = QuoteConditions {
+                    publisher_id: PUBLISHER,
+                    instrument_id: self.instrument,
+                    ts_event: q.ts,
+                    codes: q.codes,
+                    count: q.count,
+                    tape: q.tape,
+                    quote_seq: self.quotes,
+                };
+                c.encode().map_err(|e| format!("quote at {}: {e}", q.ts))?;
+                self.quotes = self.quotes.wrapping_add(1);
+                (
+                    PUBLISHER,
+                    q.ts,
+                    b'M',
+                    UNDEF_PRICE,
+                    0,
+                    level(q),
+                    Conditions::Quote(c),
+                )
             }
             // Ties go to trades, so the book here is the one before the trade.
             Row::Trade(t) => {
@@ -258,7 +318,7 @@ pub fn encode_day(
                     .map_err(|e| format!("trade {} at {}: {e:?}", t.id, t.ts))?;
                 let c = TradeConditions {
                     publisher_id: t.exchange,
-                    instrument_id: instrument,
+                    instrument_id: self.instrument,
                     ts_event: t.ts,
                     price: t.px,
                     trade_id: t.id,
@@ -267,33 +327,61 @@ pub fn encode_day(
                     count,
                     tape: t.tape,
                     update: t.update,
-                    trade_seq: seq,
+                    trade_seq: self.trades,
                 };
                 c.encode()
                     .map_err(|e| format!("trade {} at {}: {e:?}", t.id, t.ts))?;
-                conditions.push(c);
-                seq = seq.wrapping_add(1);
-                (t.exchange, t.ts, b'T', t.px, t.sz, level(&book))
+                self.trades = self.trades.wrapping_add(1);
+                (
+                    t.exchange,
+                    t.ts,
+                    b'T',
+                    t.px,
+                    t.sz,
+                    level(&self.book),
+                    Conditions::Trade(c),
+                )
             }
         };
-        let last = rows.get(i + 1).is_none_or(|next| next.ts() != row.ts());
         let mut rec = Cmbp1Msg::default_for_schema(dbn::Schema::Cmbp1);
-        rec.hd = RecordHeader::new::<Cmbp1Msg>(rtype::CMBP_1, publisher, instrument, ts);
+        rec.hd = RecordHeader::new::<Cmbp1Msg>(rtype::CMBP_1, publisher, self.instrument, ts);
         rec.price = px;
         rec.size = sz;
         rec.action = action as std::ffi::c_char;
         rec.side = b'N' as std::ffi::c_char;
-        rec.flags = if last {
-            FlagSet::empty().set_last()
-        } else {
-            FlagSet::empty()
-        };
+        rec.flags = FlagSet::empty();
         rec.ts_recv = UNDEF_TIMESTAMP;
         rec.ts_in_delta = 0;
         rec.levels = [lv];
+        Ok((rec, cond))
+    }
+}
+
+/// A day encoded whole: its records, trade conditions and quote conditions.
+pub type Day = (Vec<Cmbp1Msg>, Vec<TradeConditions>, Vec<QuoteConditions>);
+
+/// Encode a day from history: its CMBP-1 records, their trade conditions
+/// (the nth for the nth trade) and quote conditions (the nth for the nth
+/// quote). Rows from history have no receive time.
+///
+/// # Errors
+/// Refuses conditions the layouts can't hold.
+pub fn encode_day(symbol: &str, rows: &[Row]) -> Result<Day, String> {
+    let mut enc = Encoder::new(symbol);
+    let mut records = Vec::with_capacity(rows.len());
+    let (mut trades, mut quotes) = (Vec::new(), Vec::new());
+    for (i, row) in rows.iter().enumerate() {
+        let (mut rec, cond) = enc.push(row)?;
+        if rows.get(i + 1).is_none_or(|next| next.ts() != row.ts()) {
+            rec.flags = FlagSet::empty().set_last();
+        }
+        match cond {
+            Conditions::Trade(c) => trades.push(c),
+            Conditions::Quote(c) => quotes.push(c),
+        }
         records.push(rec);
     }
-    Ok((records, conditions))
+    Ok((records, trades, quotes))
 }
 
 /// The day's instrument definition: a US equity in USD, one-cent tick.
@@ -329,6 +417,9 @@ mod tests {
             ask: ABSENT,
             bid_pb: bx,
             ask_pb: 0,
+            codes: [b'R', 0, 0, 0],
+            count: 1,
+            tape: b'B',
         }
     }
     fn t(ts: u64, x: u16) -> Trade {
@@ -369,7 +460,7 @@ mod tests {
     #[test]
     fn trades_carry_the_prior_book_and_their_exchange() {
         let rows = merge(vec![t(2, 40121)], vec![q(1, 7, 40116), q(2, 9, 40116)]).unwrap();
-        let (recs, conds) = encode_day("SPY", &rows).unwrap();
+        let (recs, conds, qconds) = encode_day("SPY", &rows).unwrap();
         assert_eq!(recs.len(), 3);
         let trade = &recs[1];
         assert_eq!(trade.action as u8, b'T');
@@ -380,6 +471,40 @@ mod tests {
         assert_eq!(recs[2].hd.publisher_id, PUBLISHER);
         // F_LAST only where the next record's time differs.
         assert!(recs[0].flags.is_last() && !recs[1].flags.is_last() && recs[2].flags.is_last());
-        assert_eq!((conds.len(), conds[0].trade_seq, conds[0].publisher_id), (1, 0, 40121));
+        assert_eq!(
+            (conds.len(), conds[0].trade_seq, conds[0].publisher_id),
+            (1, 0, 40121)
+        );
+        // One quote conditions record a quote, in order, with its codes and tape.
+        let q: Vec<(u32, u64, &[u8], u8)> = qconds
+            .iter()
+            .map(|c| (c.quote_seq, c.ts_event, c.codes(), c.tape))
+            .collect();
+        assert_eq!(q, [(0, 1, &b"R"[..], b'B'), (1, 2, &b"R"[..], b'B')]);
+    }
+
+    #[test]
+    fn quote_conditions_are_parsed_and_refused_when_they_dont_fit() {
+        let row: RawQuote = serde_json::from_str(
+            r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":774.6,"as":1,"ax":"P","c":["R","Y"],"z":"B"}"#,
+        )
+        .unwrap();
+        let p = row.parse().unwrap();
+        assert_eq!(
+            (&p.codes[..usize::from(p.count)], p.tape),
+            (&b"RY"[..], b'B')
+        );
+        let bad: RawQuote = serde_json::from_str(
+            r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":0,"as":0,"c":["RR"],"z":"B"}"#,
+        )
+        .unwrap();
+        assert!(bad.parse().is_err());
+        // No tape: the quote parses, but its conditions record is refused.
+        let none: RawQuote = serde_json::from_str(
+            r#"{"t":"2026-10-01T13:30:00.5Z","bp":774.5,"bs":2,"bx":"Q","ap":0,"as":0}"#,
+        )
+        .unwrap();
+        let q = none.parse().unwrap();
+        assert!(Encoder::new("SPY").push(&Row::Quote(q)).is_err());
     }
 }

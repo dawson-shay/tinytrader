@@ -2,11 +2,11 @@
 
 | | |
 |---|---|
-| **Purpose** | Fetch past days of Alpaca stock trades and quotes, encode them as DBN (`ALPACA.SIP` `cmbp-1`, `ALPACA.IEX` `mbp-1`, with `tinytrader.trade-conditions/1` sidecars) and file them in the [store](store.md) ([decision 0014](../decisions/0014-history-feeds.md)). |
+| **Purpose** | Fetch past days of Alpaca stock trades and quotes, encode them as DBN (`ALPACA.SIP` `cmbp-1`, `ALPACA.IEX` `mbp-1`, with `tinytrader.trade-conditions/1` sidecars, and for SIP `tinytrader.quote-conditions/1` sidecars) and file them in the [store](store.md) ([decision 0014](../decisions/0014-history-feeds.md)). |
 | **Transport** | HTTP/1.1, JSON, on `HISTORY_LISTEN` (default `127.0.0.1:9124`). |
-| **Versioning** | Unversioned paths. Files it writes carry `tinytrader.alpaca-history.receipts/1` and `tinytrader.alpaca-history.conditions-binding/1`. |
+| **Versioning** | Unversioned paths. Files it writes carry `tinytrader.alpaca-history.receipts/1`, `tinytrader.alpaca-history.conditions-binding/1` and `tinytrader.alpaca-history.quote-conditions-binding/1`. |
 | **Auth** | Writes are refused from a web page of another origin; no token of its own yet. It writes to the store with `HISTORY_STORE_TOKEN` (or `_FILE`). |
-| **Errors** | `{"error": "..."}`: `400` invalid run, `404` unknown run. |
+| **Errors** | `{"error": "..."}`: `400` invalid run, `404` unknown run, `409` a run that can't resume, `503` a dry run that couldn't ask Alpaca's calendar or the store. |
 | **Health** | [Observe](observe.md) endpoints and `/events`. `idle` with nothing queued or while waiting. |
 | **Stability** | **Experimental.** |
 
@@ -19,12 +19,41 @@
 | `HISTORY_STATE` | Where runs and the spool are kept (default `/data`). |
 | `HISTORY_TOPOFF` | Symbols to top off every evening (none by default). |
 | `HISTORY_YIELD_TO`, `HISTORY_CAPTURE_HOURS` | Hold off while capture is live. |
-| `HISTORY_MAX_RPM` | Requests a minute (default 190). |
+| `HISTORY_MAX_RPM` | Requests a minute (default 190), shared by every day in flight. |
+| `HISTORY_CONCURRENCY` | Days in flight at once, 1 to 8 (default 3). |
 
 ## Endpoints
 
 | Endpoint | |
 |---|---|
-| `GET /runs` | `{"runs": [{id, feed, symbols, start, through, state, from, planned, committed, held, failed, bytes, days: {"SYM YYYY-MM-DD": {state, trades, quotes, pages, bytes}}}]}`, newest first. `state` is `queued`, `running`, `done`, `stopped` or `failed`. |
-| `POST /runs` | `{feed: "sip" \| "iex", symbols: [1..50], start, through, order?: "oldest-first" \| "newest-first"}` → the run. |
-| `POST /runs/{id}/stop` | `{"stopped": id}`, after the current day. |
+| `GET /runs` | `{"runs": [{id, feed, symbols, start, through, state, note, from, planned, committed, held, failed, bytes, days: {"SYM YYYY-MM-DD": {state, trades?, quotes?, pages?, bytes?, note?, attempts?}}}]}`, newest first. A run's `state` is `queued`, `running`, `done`, `stopped` or `failed`; a day's is `committed`, `held`, `failed`, `deferred` or `conditions_unbound`, and `attempts` counts its failures. |
+| `POST /runs` | `{feed: "sip" \| "iex", symbols: [1..50], start, through, order?: "oldest-first" \| "newest-first", dry_run?: bool}` → the run. With `dry_run`, nothing is queued: the plan below. |
+| `POST /runs/{id}/stop` | `{"stopped": id}`, after the days in flight. |
+| `POST /runs/{id}/resume` | `{"resumed": id}`: a `stopped` or `failed` run is `queued` again. Its `failed` and `deferred` days are tried afresh (their attempts reset); the days it filed or found held are skipped, and every day is checked against the store again before it's fetched. `conditions_unbound` days stay as they are, for a person. `409` for a run in any other state. |
+
+### Dry run
+
+`POST /runs` with `"dry_run": true` plans the run without queueing it:
+
+```json
+{ "dry_run": true, "feed": "sip", "symbols": ["SPY", "QQQ"], "start": "2020-01-02", "through": "2026-10-30",
+  "order": "oldest-first", "trading_days": 1717, "days": ["2020-01-02", "..."], "symbol_days": 3434,
+  "held": 250, "partly_held": 12, "to_fetch": 3184,
+  "estimate": { "basis": "the mean of 250 days of this feed fetched", "days_measured": 250,
+                "pages_per_day": 320, "requests": 1018880, "minutes_at_max_rpm": 5363, "bytes": 190000000000 } }
+```
+
+`through` is cut to the last day that has ended. `held` symbol-days have every batch in the store; `partly_held` have their records but not every sidecar (a SIP day filed before quote conditions), and are fetched again to file the rest. The estimate is the mean pages and bytes of the days this service has committed for the feed (the run's symbols if it has any, else any), or assumed (200 pages, 50 MB) with none.
+
+## How a day is fetched
+
+- **Pages are spooled as they arrive** (`HISTORY_STATE/spool/lanes/`): each page's body, its receipt and the lane's next page token, synced before the next page is asked for. A restart, a rate limit, an outage or live capture beginning resumes the lane at its next page; nothing fetched is asked for again. A day's pages are removed once its batches are written and checked.
+- **Rate limits and outages wait.** A 429, a 5xx or a dropped connection that persists past the pace's own retries makes the lane wait (doubling, up to five minutes) and ask for the same page again; after eight waits the day is left for the run's next pass, its pages kept. A 400 for a page token starts that lane again from its first page (at most twice).
+- **A failed day is tried again**, up to three times in the run (an event says so each time), then left `failed`; `POST /runs/{id}/resume` tries it again.
+- **Streamed.** The day is written from the spool a page at a time: memory doesn't grow with the day, however large. Uploads to the store are streamed from disk too.
+- **Checked.** Read back, the main file's trades (`T`) must match the trades lane's pages, and its quotes (`M`) the quotes lane's, each by count and by first and last time; the trade conditions must number its trades, the quote conditions its quotes. Any mismatch fails the day.
+- **Concurrent.** Up to `HISTORY_CONCURRENCY` days are in flight, each with both lanes, on the one pace. Live capture (`HISTORY_YIELD_TO`) is checked before each day and every 30 seconds while days are in flight; when it's live, each lane stops at its next page, its pages kept.
+
+## Batches
+
+A day is filed as its batches: `ALPACA-<FEED>-<SYM>-<YYYYMMDD>` (the records), `…-conditions` (`tinytrader.trade-conditions/1`, the nth for the nth trade) and, for SIP, `…-quote-conditions` (`tinytrader.quote-conditions/1`, the nth for the nth quote; see [datasets](../datasets.md)). Each sidecar carries a `binding.json` naming the main file's size and SHA-256. When the store already holds a day's records, a sidecar is filed only if it was built against them.

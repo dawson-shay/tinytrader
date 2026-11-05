@@ -26,6 +26,7 @@ listed with their extensions once they are defined.
 | `ALPACA.IEX` | `mbp-1` | IEX's own book and trades, one publisher |
 | `ALPACA.SIP`, `ALPACA.IEX` | `definition` | The day's instrument definition |
 | `ALPACA.SIP`, `ALPACA.IEX` | `conditions` | `tinytrader.trade-conditions/1` (rtype `0xD4`, byte-identical to Hyphae's `hyphae.dbn.equity-conditions@1`): the nth record belongs to the nth trade of the day's main file |
+| `ALPACA.SIP` | `quote-conditions` | `tinytrader.quote-conditions/1` (rtype `0xD5`, 32 bytes; `libs/alpaca/src/quote_conditions.rs` documents the layout): each quote's condition codes and tape, the nth record belonging to the nth quote (action `M`) of the day's main file |
 
 These days come from Alpaca's history, filed one file per symbol, schema and
 day ([0014](decisions/0014-history-feeds.md)). Publisher ids: `40001` IEX,
