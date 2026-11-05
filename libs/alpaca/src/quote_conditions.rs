@@ -75,7 +75,7 @@ impl QuoteConditions {
         if self.unparsed && n > 0 {
             return Err(Invalid::Codes);
         }
-        if !(b'A'..=b'C').contains(&self.tape) && !(self.unparsed && self.tape == 0) {
+        if !((b'A'..=b'C').contains(&self.tape) || self.unparsed && self.tape == 0) {
             return Err(Invalid::Tape);
         }
         if self.ts_event == UNDEF_TIMESTAMP
