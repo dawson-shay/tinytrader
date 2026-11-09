@@ -30,7 +30,7 @@
 | Endpoint | |
 |---|---|
 | `GET /runs` | `{"runs": [{id, feed, symbols, start, through, state, note, from, planned, committed, held, failed, bytes, days: {"SYM YYYY-MM-DD": {state, trades?, quotes?, pages?, bytes?, note?, attempts?}}}]}`, newest first. A run's `state` is `queued`, `running`, `done`, `stopped` or `failed`; a day's is `committed`, `held`, `failed`, `deferred` or `conditions_unbound`, and `attempts` counts its failures. |
-| `POST /runs` | `{feed: "sip" \| "iex", symbols: [1..50], start, through, order?: "oldest-first" \| "newest-first", dry_run?: bool}` → the run. With `dry_run`, nothing is queued: the plan below. |
+| `POST /runs` | `{feed: "sip" \| "iex", symbols: [1..50], start, through, order?: "oldest-first" \| "newest-first", origin?: "manual" \| "scheduled", dry_run?: bool}` → the run. With `dry_run`, nothing is queued: the plan below. `origin` (default `manual`) says who asked: see [manual and scheduled runs](#manual-and-scheduled-runs). |
 | `POST /runs/{id}/stop` | `{"stopped": id}`, after the days in flight. |
 | `POST /runs/{id}/clear/{symbol}/{day}` | `{"cleared": "SYM YYYY-MM-DD", "was": state}`: a day of the run left unfiled (such as `conditions_unbound`, once a person has compared its batches) loses its record and spool; resuming the run fetches it afresh. `409` for a filed or held day. |
 | `POST /runs/{id}/resume` | `{"resumed": id}`: a `stopped` or `failed` run is `queued` again. Its `failed` and `deferred` days are tried afresh (their attempts reset); the days it filed or found held are skipped, and every day is checked against the store again before it's fetched. `conditions_unbound` days stay as they are, for a person. `409` for a run in any other state. |
@@ -57,7 +57,17 @@
 - **A failed day is tried again**, up to three times in the run (an event says so each time), then left `failed` and its spool removed; `POST /runs/{id}/resume` tries it again. A trade whose conditions the layout can't hold fails the day at once, for good, without fetching again (doing so would only repeat it). A quote whose conditions can't be held (more than four codes, a code that isn't one printable ASCII byte, no tape) never fails it: its quote-conditions record is marked unparsed, counted in the outcome and the binding (`unparsed`), with an event.
 - **Streamed.** The day is written from the spool a page at a time: memory doesn't grow with the day, however large. Uploads to the store are streamed from disk too.
 - **Checked.** Read back, the main file's trades (`T`) must match the trades lane's pages, and its quotes (`M`) the quotes lane's, each by count and by first and last time; the trade conditions must number its trades, the quote conditions its quotes. Any mismatch fails the day.
-- **Concurrent.** Up to `HISTORY_CONCURRENCY` days are in flight, each with both lanes, on the one pace. Live capture (`HISTORY_YIELD_TO`) is checked before each day and every 30 seconds while days are in flight; when it's live (or can't be reached, which counts as live), each lane stops at its next page, its pages kept.
+- **Concurrent.** Up to `HISTORY_CONCURRENCY` days are in flight, each with both lanes, on the one pace. For a scheduled run, live capture (`HISTORY_YIELD_TO`) is checked before each day and every 30 seconds while days are in flight; when it's live (or can't be reached, which counts as live), each lane stops at its next page, its pages kept.
+
+### Manual and scheduled runs
+
+Decision 0033 (the user's rule): **scheduled work yields; work launched by hand runs at once.**
+
+- **A manual run** (`origin: "manual"`, the default for `POST /runs`) starts at once and never waits for live capture. It is taken before any scheduled run, in the order asked.
+- **A scheduled run** (`origin: "scheduled"`, and the nightly top-off) waits while capture is live, as above. While a manual run is queued, a scheduled run in progress stops at its next page (its pages kept) and resumes once no manual run is left.
+- **The limits that aren't about priority hold for both:** the free-space floor, Alpaca's pace and rate limits, a busy store, and `HISTORY_CONCURRENCY`.
+- A run's `origin` is in `GET /runs`. Runs kept from before origins existed count as scheduled if they came from the top-off, and manual otherwise.
+- An automation that asks for runs (a cron script, say) must pass `"origin": "scheduled"`, or it runs at once in market hours.
 - **Disk.** A heavy SIP day (SPY in 2020 or 2022) peaks at about 1 GB of spooled pages plus 1 to 2 GB of built batches, so the spool's peak is that times `HISTORY_CONCURRENCY` (about 9 GB at 3). No day starts unless the free space, less `HISTORY_DAY_RESERVE_GB` for each day already being built and for itself, stays above `HISTORY_MIN_FREE_GB`. A day's pages go once its batches are written; its batches once it's filed, refused, or failed for good. At startup, spools untouched for `HISTORY_SPOOL_MAX_AGE_DAYS` are removed, unless a run that isn't finished (queued, running or stopped) covers the day or a run deferred it; complete spools built by another encoder lose their batches (their pages, if any, are kept and rebuilt from). A `conditions_unbound` day's batches are never swept, whatever their age or encoder, until the day is cleared. Each day swept, or kept past its age, is logged and told as an event with its reason.
 
 ## Batches

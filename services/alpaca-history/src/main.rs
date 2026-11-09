@@ -177,6 +177,18 @@ struct Run {
     planned: usize,
     #[serde(default)]
     from: String,
+    /// `manual` (asked for by hand: it runs at once, first, and never yields to
+    /// capture) or `scheduled` (the top-off, an automation: it yields), decision
+    /// 0033. Runs kept from before it: `scheduled` if from the top-off.
+    #[serde(default)]
+    origin: String,
+}
+
+impl Run {
+    /// Whether it was started by a schedule, and so yields (decision 0033).
+    fn scheduled(&self) -> bool {
+        self.origin == "scheduled" || (self.origin.is_empty() && self.from == "top-off")
+    }
 }
 
 struct App {
@@ -246,6 +258,10 @@ struct Ask {
     /// Only plan the run: nothing is queued.
     #[serde(default)]
     dry_run: bool,
+    /// `manual` (the default: what a person asks for runs at once) or
+    /// `scheduled` (an automation's: it yields to capture), decision 0033.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 /// An asked-for run's symbols and order, checked.
@@ -271,6 +287,11 @@ fn checked(ask: &Ask) -> Result<(Vec<String>, bool), String> {
 
 fn queue(a: &App, ask: Ask, from: &str) -> Result<Run, String> {
     let (symbols, newest_first) = checked(&ask)?;
+    let origin = match ask.origin.as_deref() {
+        None | Some("manual") => "manual",
+        Some("scheduled") => "scheduled",
+        Some(o) => return Err(format!("origin {o:?}: manual or scheduled")),
+    };
     let created = unix_seconds();
     let run = Run {
         id: format!("r{}", (created * 1000.0) as u64),
@@ -285,6 +306,7 @@ fn queue(a: &App, ask: Ask, from: &str) -> Result<Run, String> {
         days: BTreeMap::new(),
         planned: 0,
         from: from.into(),
+        origin: origin.into(),
     };
     lock(&a.runs).push(run.clone());
     save(a);
@@ -447,9 +469,10 @@ async fn work(a: &Shared, id: &str) {
     let Some(run) = lock(&a.runs).iter().find(|r| r.id == id).cloned() else {
         return;
     };
-    // Live capture: no day starts while it's live, and days in flight stop at
-    // their next page (their pages kept) once it is.
-    if let Some(why) = yielding(a).await {
+    // A scheduled run (decision 0033): no day starts while capture is live or a
+    // manual run waits, and days in flight stop at their next page (their pages
+    // kept) once either is so. A manual run doesn't wait for either.
+    if let Some(why) = pause_for(a, &run).await {
         a.observer
             .set_state(State::Idle, &format!("waiting: {why}"));
         return;
@@ -511,7 +534,7 @@ async fn work(a: &Shared, id: &str) {
                 None => break,
             },
             _ = tick.tick() => {
-                if let Some(why) = yielding(a).await {
+                if let Some(why) = pause_for(a, &run).await {
                     a.alpaca.hold.store(true, Ordering::Relaxed);
                     wait.get_or_insert((format!("waiting: {why}"), false));
                 }
@@ -784,6 +807,32 @@ async fn run_day(a: &App, id: &str, feed: Feed, sym: &str, d: &str) -> DayEnd {
     }
 }
 
+/// The run to work on next: a manual one first (decision 0033), each kind in the
+/// order queued.
+fn next_run(runs: &[Run]) -> Option<String> {
+    let open = |r: &&Run| r.state == "queued" || r.state == "running";
+    runs.iter()
+        .filter(open)
+        .find(|r| !r.scheduled())
+        .or_else(|| runs.iter().filter(open).find(|r| r.scheduled()))
+        .map(|r| r.id.clone())
+}
+
+/// Why a scheduled run should pause now: capture is live, or a manual run is
+/// waiting (it goes first). A manual run never pauses for either.
+async fn pause_for(a: &App, run: &Run) -> Option<String> {
+    if !run.scheduled() {
+        return None;
+    }
+    if let Some(m) = lock(&a.runs)
+        .iter()
+        .find(|r| r.id != run.id && !r.scheduled() && (r.state == "queued" || r.state == "running"))
+    {
+        return Some(format!("paused for the manual run {}", m.id));
+    }
+    yielding(a).await
+}
+
 async fn worker(a: Shared) {
     loop {
         // The nightly top-off: the last ten days, after 20:40 New York.
@@ -806,15 +855,13 @@ async fn worker(a: Shared) {
                         through: today,
                         order: None,
                         dry_run: false,
+                        origin: Some("scheduled".into()),
                     },
                     "top-off",
                 );
             }
         }
-        let next = lock(&a.runs)
-            .iter()
-            .find(|r| r.state == "queued" || r.state == "running")
-            .map(|r| r.id.clone());
+        let next = next_run(&lock(&a.runs));
         match next {
             Some(id) => work(&a, &id).await,
             None => a.observer.set_state(State::Idle, "no runs queued"),
@@ -1304,6 +1351,15 @@ mod tests {
             through: through.into(),
             order: None,
             dry_run: false,
+            origin: None,
+        }
+    }
+
+    /// As [`ask`], asked for by a schedule.
+    fn scheduled(symbols: &[&str], start: &str, through: &str) -> Ask {
+        Ask {
+            origin: Some("scheduled".into()),
+            ..ask(symbols, start, through)
         }
     }
 
@@ -1529,9 +1585,69 @@ mod tests {
         assert_eq!(post(format!("{url}/runs/nope/resume")).await, 404);
     }
 
-    /// While live capture runs, no day starts; the run waits, nothing recorded.
+    /// A capture service answering `ready`: live.
+    async fn live_relay() -> String {
+        let live = axum::Router::new().route(
+            "/health",
+            get(|| async { axum::Json(json!({ "state": "ready" })) }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = format!("relay=http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, live).await.unwrap() });
+        at
+    }
+
+    /// Decision 0033: while capture is live, a run asked for by hand (the
+    /// default) runs at once and files its day; a scheduled one waits.
     #[tokio::test]
-    async fn live_capture_holds_the_run() {
+    async fn a_manual_run_runs_through_live_capture() {
+        let (f, s) = (
+            FakeAlpaca::start(SMALL, SMALL).await,
+            FakeStore::start().await,
+        );
+        let yield_to = live_relay().await;
+        let a = app_for(&f, &s, "manual-live", &["--yield-to", &yield_to]);
+        let id = queue(&a, ask(&["SPY"], DAY, DAY), "request").unwrap().id;
+        assert_eq!(run_of(&a, &id).origin, "manual");
+        work(&a, &id).await;
+        let r = run_of(&a, &id);
+        assert_eq!(r.days[&format!("SPY {DAY}")].state, "committed", "{r:?}");
+        assert!(!f.log().is_empty());
+    }
+
+    /// The worker takes a manual run first; a scheduled run pauses for one that
+    /// waits, and never the other way round. An unknown origin is refused.
+    #[tokio::test]
+    async fn manual_runs_go_first() {
+        let (f, s) = (
+            FakeAlpaca::start(SMALL, SMALL).await,
+            FakeStore::start().await,
+        );
+        let a = app_for(&f, &s, "manual-first", &[]);
+        let sched = queue(&a, scheduled(&["SPY"], DAY, DAY), "top-off").unwrap();
+        assert_eq!(next_run(&lock(&a.runs)), Some(sched.id.clone()));
+        let man = queue(&a, ask(&["QQQ"], DAY, DAY), "request").unwrap();
+        assert_eq!(next_run(&lock(&a.runs)), Some(man.id.clone()));
+        let why = pause_for(&a, &run_of(&a, &sched.id)).await.unwrap();
+        assert!(why.contains(&man.id), "{why}");
+        assert_eq!(pause_for(&a, &run_of(&a, &man.id)).await, None);
+        // A run kept from before origins: the top-off's is scheduled.
+        let mut old = run_of(&a, &sched.id);
+        old.origin = String::new();
+        assert!(old.scheduled());
+        old.from = "request".into();
+        assert!(!old.scheduled());
+        let bad = Ask {
+            origin: Some("whenever".into()),
+            ..ask(&["SPY"], DAY, DAY)
+        };
+        assert!(queue(&a, bad, "request").unwrap_err().contains("origin"));
+    }
+
+    /// While live capture runs, no day of a scheduled run starts; the run
+    /// waits, nothing recorded.
+    #[tokio::test]
+    async fn live_capture_holds_a_scheduled_run() {
         let (f, s) = (
             FakeAlpaca::start(SMALL, SMALL).await,
             FakeStore::start().await,
@@ -1544,7 +1660,7 @@ mod tests {
         let yield_to = format!("relay=http://{}", l.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(l, live).await.unwrap() });
         let a = app_for(&f, &s, "yield", &["--yield-to", &yield_to]);
-        let id = queue(&a, ask(&["SPY"], DAY, DAY), "test").unwrap().id;
+        let id = queue(&a, scheduled(&["SPY"], DAY, DAY), "test").unwrap().id;
         work(&a, &id).await;
         assert!(run_of(&a, &id).days.is_empty());
         assert!(f.log().is_empty());
@@ -1611,7 +1727,7 @@ mod tests {
             "unreachable",
             &["--yield-to", "relay=http://127.0.0.1:9"],
         );
-        let id = queue(&a, ask(&["SPY"], DAY, DAY), "test").unwrap().id;
+        let id = queue(&a, scheduled(&["SPY"], DAY, DAY), "test").unwrap().id;
         work(&a, &id).await;
         assert!(run_of(&a, &id).days.is_empty());
         assert!(f.log().is_empty());
