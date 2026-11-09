@@ -10,7 +10,7 @@
 //! a `ReplayCompleted` system record, so every client knows every instrument
 //! without its own provider session. Market data itself is never cached.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,10 +51,21 @@ enum Sent {
 const EXPIRY_GRACE_NS: u64 = 2 * 86_400 * 1_000_000_000;
 
 /// The latest reference records, by instrument.
+///
+/// An instrument id names one contract only for a day: OPRA assigns them
+/// afresh each trading day, so Friday's id for a contract is another
+/// contract's (or none) on Monday. A definition is therefore the truth about
+/// its id and its symbol: when one arrives, any other id holding the same
+/// symbol is forgotten (its definition, statistics and quote), and an id that
+/// now names another contract loses what it held for the old one. Without
+/// that, a contract had two ids after a weekend, and `/quotes` showed
+/// whichever came last, often Friday's close (2026-11-09).
 #[derive(Default)]
 struct Reference {
     /// Definition bytes and expiration, by instrument id.
     definitions: BTreeMap<u32, (u64, Vec<u8>)>,
+    /// The id holding each symbol's definition.
+    by_symbol: HashMap<String, u32>,
     /// Statistic bytes, by instrument id and statistic type.
     statistics: BTreeMap<(u32, u16), Vec<u8>>,
 }
@@ -69,14 +80,38 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
     Some(u64::from_le_bytes(b.get(at..at + 8)?.try_into().ok()?))
 }
 
+/// A definition's symbol (its `raw_symbol`), if it has one.
+fn def_symbol(def: &[u8]) -> Option<&str> {
+    let at = offset_of!(InstrumentDefMsg, raw_symbol);
+    let raw = def.get(at..at + 71)?;
+    let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
+    std::str::from_utf8(&raw[..end])
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 impl Reference {
-    /// Keep the reference records in a chunk of DBN records.
-    fn absorb(&mut self, chunk: &[u8]) {
+    /// Forgets an id's definition and statistics.
+    fn forget(&mut self, id: u32) {
+        if let Some((_, def)) = self.definitions.remove(&id)
+            && let Some(sym) = def_symbol(&def)
+            && self.by_symbol.get(sym) == Some(&id)
+        {
+            self.by_symbol.remove(sym);
+        }
+        self.statistics.retain(|(i, _), _| *i != id);
+    }
+
+    /// Keep the reference records in a chunk of DBN records. Returns the ids
+    /// whose quotes no longer belong to them: another id now holds their
+    /// symbol, or they now name another contract.
+    fn absorb(&mut self, chunk: &[u8]) -> Vec<u32> {
+        let mut stale = Vec::new();
         let mut at = 0;
         while at < chunk.len() {
             let len = usize::from(chunk[at]) * 4;
             let Some(rec) = chunk.get(at..at + len).filter(|r| r.len() >= 16) else {
-                return;
+                return stale;
             };
             at += len;
             let Some(id) = u32_at(rec, offset_of!(RecordHeader, instrument_id)) else {
@@ -86,6 +121,27 @@ impl Reference {
                 rtype::INSTRUMENT_DEF if len >= size_of::<InstrumentDefMsg>() => {
                     let expires = u64_at(rec, offset_of!(InstrumentDefMsg, expiration))
                         .unwrap_or(UNDEF_TIMESTAMP);
+                    let sym = def_symbol(rec).map(str::to_owned);
+                    // This id named another contract (an earlier day's id).
+                    let was = self
+                        .definitions
+                        .get(&id)
+                        .and_then(|(_, d)| def_symbol(d).map(str::to_owned));
+                    if was.is_some() && was != sym {
+                        self.forget(id);
+                        stale.push(id);
+                    }
+                    // Another id held this symbol (the contract's earlier id).
+                    if let Some(sym) = &sym
+                        && let Some(&other) = self.by_symbol.get(sym)
+                        && other != id
+                    {
+                        self.forget(other);
+                        stale.push(other);
+                    }
+                    if let Some(sym) = sym {
+                        self.by_symbol.insert(sym, id);
+                    }
                     self.definitions.insert(id, (expires, rec.to_vec()));
                 }
                 rtype::STATISTICS if len >= size_of::<StatMsg>() => {
@@ -102,6 +158,7 @@ impl Reference {
                 _ => {}
             }
         }
+        stale
     }
 
     /// Every current definition, then every statistic, dropping instruments
@@ -114,6 +171,7 @@ impl Reference {
             *expires == UNDEF_TIMESTAMP || expires.saturating_add(EXPIRY_GRACE_NS) > now
         });
         let defs = &self.definitions;
+        self.by_symbol.retain(|_, id| defs.contains_key(id));
         self.statistics.retain(|(id, _), _| defs.contains_key(id));
         let mut out = Vec::new();
         for (_, rec) in self.definitions.values() {
@@ -159,13 +217,7 @@ impl Reference {
 
     /// The instrument's symbol, from its definition (borrowed: no copy per record).
     fn symbol(&self, id: u32) -> Option<&str> {
-        let (_, def) = self.definitions.get(&id)?;
-        let at = offset_of!(InstrumentDefMsg, raw_symbol);
-        let raw = def.get(at..at + 71)?;
-        let end = raw.iter().position(|b| *b == 0).unwrap_or(raw.len());
-        std::str::from_utf8(&raw[..end])
-            .ok()
-            .filter(|s| !s.is_empty())
+        def_symbol(&self.definitions.get(&id)?.1)
     }
 }
 
@@ -201,6 +253,8 @@ pub struct Hub {
     pub bars: Arc<crate::bars::Bars>,
     /// The latest quote of each instrument, for pricing chains.
     pub quotes: crate::quotes::Quotes,
+    /// The New York trading day the held quotes are from.
+    quote_day: Mutex<Option<String>>,
     /// The latest trades and quote changes of the relay's own stock symbols, for the tape.
     pub tape: crate::tape::Tape,
     pub series: Series,
@@ -244,6 +298,7 @@ impl Hub {
             series: Series::new(900, 1000, 6),
             bars: Arc::new(crate::bars::Bars::default()),
             quotes: crate::quotes::Quotes::default(),
+            quote_day: Mutex::new(None),
             tape: crate::tape::Tape::default(),
             events: Events::default(),
             clients: AtomicU64::new(0),
@@ -343,7 +398,11 @@ impl Hub {
             .store(protocol::now_ns(), Ordering::Relaxed);
         self.bytes.fetch_add(plain.len() as u64, Ordering::Relaxed);
         let mut reference = lock(&self.reference);
-        reference.absorb(&plain);
+        let stale = reference.absorb(&plain);
+        // Before this chunk's quotes, which are the new ids' own.
+        if !stale.is_empty() {
+            self.quotes.forget(&stale);
+        }
         self.chart(&reference, &plain);
         self.quotes.absorb(&plain);
         self.tape.absorb(&plain, |id| reference.symbol(id));
@@ -420,6 +479,34 @@ impl Hub {
         keep: impl Fn(&str) -> bool,
     ) -> Vec<(String, i64, u64)> {
         lock(&self.reference).stats_matching(kind, &keep)
+    }
+
+    /// A provider session has started. On a new trading day (New York), every
+    /// quote held is from an earlier day's ids, so the quotes are dropped: a
+    /// contract has none until it quotes today. A reconnect on the same day
+    /// keeps them, as ids hold for the day.
+    pub fn session_started(&self, now_ns: u64) {
+        let day =
+            tinytrader_schedule::ny_date_time(i64::try_from(now_ns / 1_000_000_000).unwrap_or(0)).0;
+        let mut held = lock(&self.quote_day);
+        if held.as_deref() != Some(day.as_str()) {
+            if let Some(was) = held.as_deref() {
+                let n = self.quotes.len();
+                self.quotes.clear();
+                let text = format!("a new trading day ({day}): {n} quotes from {was} dropped");
+                eprintln!("relay: {text}");
+                self.events.push(text.clone(), text);
+            }
+            *held = Some(day);
+        }
+    }
+
+    /// How many of the quotes of defined instruments are older than
+    /// `older_ns` at `now_ns`, of how many.
+    pub fn stale_quotes(&self, now_ns: u64, older_ns: u64) -> (usize, usize) {
+        let reference = lock(&self.reference);
+        self.quotes
+            .stale(|id| reference.symbol(id).is_some(), now_ns, older_ns)
     }
 
     /// Reference records held for joining clients.
@@ -1066,6 +1153,100 @@ mod tests {
             .1;
         assert_eq!((put.bid, put.ask), (None, Some(0.3)));
         assert_eq!(hub.quotes.len(), 2);
+    }
+
+    /// A definition record with a symbol, and a `cmbp-1` quote, for the
+    /// session-crossing tests.
+    fn def_rec(id: u32, sym: &str) -> Vec<u8> {
+        let mut d = InstrumentDefMsg {
+            hd: RecordHeader::new::<InstrumentDefMsg>(rtype::INSTRUMENT_DEF, 1, id, 0),
+            expiration: u64::MAX,
+            ..Default::default()
+        };
+        d.raw_symbol = databento::dbn::record::str_to_c_chars(sym).unwrap();
+        databento::dbn::RecordRef::from(&d).as_ref().to_vec()
+    }
+
+    fn quote_rec(id: u32, bid: i64, ask: i64, ts: u64) -> Vec<u8> {
+        use databento::dbn::{Cmbp1Msg, ConsolidatedBidAskPair};
+        let mut m = Cmbp1Msg::default_for_schema(databento::dbn::Schema::Cmbp1);
+        m.hd = RecordHeader::new::<Cmbp1Msg>(rtype::CMBP_1, 1, id, ts);
+        m.ts_recv = ts;
+        m.levels = [ConsolidatedBidAskPair {
+            bid_px: bid,
+            ask_px: ask,
+            bid_sz: 1,
+            ask_sz: 1,
+            ..Default::default()
+        }];
+        databento::dbn::RecordRef::from(&m).as_ref().to_vec()
+    }
+
+    const C775: &str = "SPY   261016C00775000";
+    const C780: &str = "SPY   261016C00780000";
+
+    /// Across a weekend OPRA gives a contract a new id and its old id to
+    /// another contract. Each contract's quote is then only its own, today's:
+    /// never the old id's Friday quote, under either symbol (2026-11-09: a
+    /// share of contracts showed Friday's close all Monday).
+    #[test]
+    fn a_new_days_ids_never_show_the_last_days_quotes() {
+        let hub = Hub::new(metadata(), 8, Duration::from_secs(10));
+        // Friday: 775C is id 7, 780C id 8.
+        let mut fri = def_rec(7, C775);
+        fri.extend(def_rec(8, C780));
+        fri.extend(quote_rec(7, 330_000_000, 340_000_000, 100));
+        fri.extend(quote_rec(8, 100_000_000, 110_000_000, 100));
+        hub.publish(fri, 4);
+        // Monday: 775C is id 9 and quotes; id 7 is now 780C, which hasn't yet.
+        let mut mon = def_rec(9, C775);
+        mon.extend(def_rec(7, C780));
+        mon.extend(quote_rec(9, 3_500_000_000, 3_600_000_000, 200));
+        hub.publish(mon, 3);
+        let got: std::collections::BTreeMap<String, crate::quotes::Quote> =
+            hub.quotes_matching(|_| true).into_iter().collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        let q = got["SPY261016C00775000"];
+        assert_eq!((q.bid, q.ts), (Some(3.5), 200), "today's, never Friday's");
+        // One definition per symbol for joining clients: the old ids are gone.
+        let mut snap = lock(&hub.reference);
+        let defs: Vec<(u32, String)> = snap
+            .definitions
+            .iter()
+            .map(|(id, (_, d))| (*id, def_symbol(d).unwrap().to_owned()))
+            .collect();
+        assert_eq!(defs, [(7, C780.to_owned()), (9, C775.to_owned())]);
+        assert_eq!(snap.snapshot(0).len() % size_of::<InstrumentDefMsg>(), 0);
+    }
+
+    /// A provider session on a new New York day drops the last day's quotes;
+    /// a reconnect on the same day keeps them.
+    #[test]
+    fn a_new_trading_day_drops_the_quotes_a_reconnect_keeps_them() {
+        let hub = Hub::new(metadata(), 8, Duration::from_secs(10));
+        let fri_10am = 1_793_458_800_000_000_000; // Fri 2026-11-06 10:00 New York
+        hub.session_started(fri_10am);
+        let mut c = def_rec(7, C775);
+        c.extend(quote_rec(7, 330_000_000, 340_000_000, fri_10am));
+        hub.publish(c, 2);
+        hub.session_started(fri_10am + 3_600_000_000_000); // a reconnect at 11:00
+        assert_eq!(hub.quotes.len(), 1);
+        hub.session_started(fri_10am + 3 * 86_400_000_000_000); // Monday
+        assert_eq!(hub.quotes.len(), 0);
+    }
+
+    /// The stale count: quotes of defined instruments older than the limit.
+    #[test]
+    fn counts_stale_quotes() {
+        let hub = Hub::new(metadata(), 8, Duration::from_secs(10));
+        let mut c = def_rec(7, C775);
+        c.extend(def_rec(8, C780));
+        c.extend(quote_rec(7, 1, 2, 1_000));
+        c.extend(quote_rec(8, 1, 2, 9_000));
+        c.extend(quote_rec(5, 1, 2, 1_000)); // no definition: not counted
+        hub.publish(c, 5);
+        assert_eq!(hub.stale_quotes(10_000, 5_000), (1, 2));
+        assert_eq!(hub.stale_quotes(10_000, 10_000), (0, 2));
     }
 
     #[test]

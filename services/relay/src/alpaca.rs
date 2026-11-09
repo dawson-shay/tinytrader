@@ -202,6 +202,7 @@ impl Alpaca {
                     }
                     "subscription" if !live => {
                         live = true;
+                        hub.session_started(crate::protocol::now_ns());
                         hub.upstream_up();
                         observer.set_state(State::Ready, "live");
                         eprintln!(

@@ -75,6 +75,18 @@ struct Args {
     #[arg(long, env = "RELAY_SCHEMA", default_value = "cmbp-1")]
     schema: String,
 
+    /// In market hours the relay is `degraded` while more than
+    /// `RELAY_STALE_SHARE` of its quotes are older than this many minutes.
+    /// On 2026-11-09 no XSP quote was older than 10 (1.2% older than 5), while
+    /// the frozen quotes were days old.
+    #[arg(long, env = "RELAY_STALE_MINUTES", default_value_t = 10)]
+    stale_minutes: u64,
+
+    /// The share of quotes (0 to 1) that may be older than
+    /// `RELAY_STALE_MINUTES` before the relay says so.
+    #[arg(long, env = "RELAY_STALE_SHARE", default_value_t = 0.05)]
+    stale_share: f64,
+
     /// Reference schemas sent live too, and replayed for clients catching
     /// up, comma-separated.
     #[arg(
@@ -171,6 +183,8 @@ async fn run(args: Args) -> Result<(), String> {
             schema,
             reference,
             stype_in,
+            stale_after: Duration::from_secs(args.stale_minutes.saturating_mul(60)),
+            stale_share: args.stale_share,
         }),
         Provider::AlpacaIex => {
             let a = Arc::new(alpaca::Alpaca {

@@ -38,6 +38,29 @@ pub struct Databento {
     /// clients catching up, such as `definition` and `statistics`.
     pub reference: Vec<Schema>,
     pub stype_in: SType,
+    /// In market hours, the relay is `degraded` while more than `stale_share`
+    /// of its quotes are older than `stale_after`.
+    pub stale_after: Duration,
+    pub stale_share: f64,
+}
+
+/// The quotes too old to trust, in market hours (09:35 to 16:00 New York on a
+/// weekday; the relay runs only on trading days): `Some(why)` when more than
+/// `share` of the defined instruments' quotes are older than `after`.
+fn stale_detail(hub: &Hub, now_ns: u64, after: Duration, share: f64) -> Option<String> {
+    let (_, hhmm, weekday) =
+        tinytrader_schedule::ny_date_time(i64::try_from(now_ns / 1_000_000_000).unwrap_or(0));
+    if !(1..=5).contains(&weekday) || hhmm.as_str() < "09:35" || hhmm.as_str() >= "16:00" {
+        return None;
+    }
+    let (stale, total) =
+        hub.stale_quotes(now_ns, u64::try_from(after.as_nanos()).unwrap_or(u64::MAX));
+    (total > 0 && stale as f64 > share * total as f64).then(|| {
+        format!(
+            "{stale} of {total} quotes older than {} min",
+            after.as_secs() / 60
+        )
+    })
 }
 
 impl Databento {
@@ -88,6 +111,7 @@ impl Databento {
             Ok(c) => c,
             Err(e) => return End::Failed(e),
         };
+        hub.session_started(crate::protocol::now_ns());
         hub.upstream_up();
         observer.set_state(State::Ready, "live");
         // The session id lets Databento's support look the session up.
@@ -101,6 +125,13 @@ impl Databento {
         let mut minute = Minute::new(Instant::now());
         // Whether the health detail says the relay is behind, and when it last said so.
         let (mut said_behind, mut said_at) = (false, Instant::now());
+        // Quotes too old to trust (checked each minute), and the detail last said.
+        let mut stale: Option<String> = None;
+        let mut detail = "live".to_owned();
+        let say = |observer: &Observer, detail: &str, stale: &Option<String>| match stale {
+            Some(s) => observer.set_state(State::Degraded, &format!("{detail}; {s}")),
+            None => observer.set_state(State::Ready, detail),
+        };
         loop {
             let mut chunk = Vec::with_capacity(CHUNK);
             let mut n = 0;
@@ -134,17 +165,33 @@ impl Databento {
                 minute.latest = behind;
                 let late = behind >= BEHIND;
                 if late != said_behind || (late && said_at.elapsed() >= Duration::from_secs(1)) {
-                    let detail = if late {
+                    detail = if late {
                         format!("live, {:.1} s behind Databento", behind.as_secs_f64())
                     } else {
                         "live".to_owned()
                     };
-                    observer.set_state(State::Ready, &detail);
+                    say(observer, &detail, &stale);
                     (said_behind, said_at) = (late, now);
                 }
             }
             if let Some(line) = minute.roll(now) {
                 eprintln!("relay: {line}");
+                let was = stale.is_some();
+                stale = stale_detail(
+                    hub,
+                    crate::protocol::now_ns(),
+                    self.stale_after,
+                    self.stale_share,
+                );
+                if stale.is_some() != was {
+                    let text = match &stale {
+                        Some(s) => format!("quotes stale: {s}"),
+                        None => "quotes fresh again".to_owned(),
+                    };
+                    eprintln!("relay: {text}");
+                    hub.events.push(text.clone(), text);
+                }
+                say(observer, &detail, &stale);
             }
             if let Some(stalled) = stall.note(now, behind, skipped)
                 && may_drop
