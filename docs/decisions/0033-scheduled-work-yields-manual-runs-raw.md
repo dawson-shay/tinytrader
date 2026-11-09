@@ -1,6 +1,6 @@
 # 0033: Scheduled work yields; work launched by hand runs at once
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-11-09
 - **Amends:** [0011](0011-bundles-and-work-classes.md) (work classes: what is
   "background")
