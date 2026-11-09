@@ -583,6 +583,7 @@ impl Rig {
                 confirm_usd,
                 again,
                 approved_by: by.map(Into::into),
+                origin: None,
             }),
         )
         .await;
@@ -1954,11 +1955,79 @@ async fn a_job_is_downloaded_once_however_often_refreshed() {
     assert_eq!(lock(&r.store).incorporated.len(), 1);
     // Already filed (the store says so): nothing is fetched or filed again.
     lock(&r.store).batches = json!({ "OPRA-C1": { "volume": "v1", "how": "filed" } });
-    let (code, _) = download(AxState(r.jobs.clone()), UrlPath("OPRA-C1".into())).await;
+    let (code, _) = download(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-C1".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::ACCEPTED);
     settled(&r).await;
     let s = lock(&r.store);
     assert_eq!((s.incorporated.len(), s.uploaded.len()), (1, 2));
+}
+
+/// Decision 0033: a job bought by hand is downloaded and filed as soon as it's
+/// done, while capture is live (the refresh is paused then); one bought on a
+/// schedule isn't. An expired one is forgotten.
+#[tokio::test]
+async fn a_job_bought_by_hand_is_filed_during_capture() {
+    let r = rig_with("bought-by-hand", |j| {
+        j.yield_to = vec![("relay".into(), j.store.clone())];
+    })
+    .await;
+    lock(&r.store).health = "ready";
+    contract_job(&r, "OPRA-C1");
+    contract_job(&r, "OPRA-C2");
+    lock(&r.jobs.manual).insert("OPRA-C1".into());
+    start_manual_downloads(&r.jobs).await;
+    settled(&r).await;
+    let filed = lock(&r.store).incorporated.clone();
+    assert_eq!(filed.len(), 1, "{filed:?}");
+    assert!(filed[0].starts_with("OPRA-C1"), "{filed:?}");
+    r.fake.add(job(
+        "OPRA-X1",
+        json!("SPY.OPT"),
+        "parent",
+        whole_day(),
+        "expired",
+    ));
+    lock(&r.jobs.manual).insert("OPRA-X1".into());
+    start_manual_downloads(&r.jobs).await;
+    assert!(!lock(&r.jobs.manual).contains("OPRA-X1"));
+}
+
+/// The ledger says which submissions were made by hand; older entries, with no
+/// origin, weren't (they keep yielding).
+#[test]
+fn the_ledger_keeps_who_asked_for_a_submission() {
+    let dir = std::env::temp_dir().join(format!(
+        "tinytrader-jobs-origin-{}-{}",
+        std::process::id(),
+        tinytrader_observe::unix_seconds() as u64
+    ));
+    let mut l = ledger::Ledger::open(&dir.join("submissions.jsonl")).unwrap();
+    for (job, origin) in [
+        ("OPRA-M", Some("manual")),
+        ("OPRA-S", Some("scheduled")),
+        ("OPRA-O", None),
+    ] {
+        l.append(ledger::Entry {
+            at: 1.0,
+            request: job.into(),
+            state: "submitted".into(),
+            job: Some(job.into()),
+            origin: origin.map(Into::into),
+            ..ledger::Entry::default()
+        })
+        .unwrap();
+    }
+    // Read back, as at a restart.
+    drop(l);
+    let l = ledger::Ledger::open(&dir.join("submissions.jsonl")).unwrap();
+    assert_eq!(l.submitted_by_hand(), HashSet::from(["OPRA-M".to_owned()]));
+    assert_eq!(l.submitted().len(), 3);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]
@@ -2044,6 +2113,7 @@ async fn a_submission_shows_its_progress_and_why_it_stopped() {
                     confirm_usd: None,
                     again: None,
                     approved_by: None,
+                    origin: None,
                 }),
             )
             .await
@@ -2357,7 +2427,7 @@ async fn four_downloads_run_at_once_and_a_fifth_waits() {
     let seen = slow_jobs(&r, &FIVE, 1_000).await;
     for id in FIVE.iter().chain(&FIVE) {
         // Each job asked for twice: run once.
-        start_download(&r.jobs, (*id).to_owned());
+        start_download(&r.jobs, (*id).to_owned(), false);
     }
     for _ in 0..1_000 {
         if lock(&r.jobs.in_flight).is_empty() {
@@ -2378,7 +2448,7 @@ async fn with_one_download_at_a_time_they_keep_their_order() {
     .await;
     let seen = slow_jobs(&r, &FIVE, 20).await;
     for id in FIVE {
-        start_download(&r.jobs, id.to_owned());
+        start_download(&r.jobs, id.to_owned(), false);
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     settled(&r).await;
@@ -2394,8 +2464,8 @@ async fn a_filing_in_progress_doesnt_hold_a_download_back() {
     .await;
     let seen = slow_jobs(&r, &FIVE[..2], 10).await;
     lock(&r.store).incorporate_delay_ms = 2_000;
-    start_download(&r.jobs, FIVE[0].to_owned());
-    start_download(&r.jobs, FIVE[1].to_owned());
+    start_download(&r.jobs, FIVE[0].to_owned(), false);
+    start_download(&r.jobs, FIVE[1].to_owned(), false);
     for _ in 0..100 {
         if lock(&seen).2.len() == 2 {
             break;
@@ -2414,7 +2484,7 @@ async fn the_capture_live_pause_holds_every_download() {
     let seen = slow_jobs(&r, &FIVE, 10).await;
     r.jobs.paused_until.store(1, Ordering::Relaxed);
     for id in FIVE {
-        start_download(&r.jobs, id.to_owned());
+        start_download(&r.jobs, id.to_owned(), false);
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(lock(&seen).2.is_empty());
@@ -2434,7 +2504,7 @@ async fn downloads_in_flight_hold_their_room() {
     // Room for one 9-byte job, not two.
     lock(&r.store).catalog.1["roots"][0]["volume"]["available_bytes"] = json!(1e11 + 15.0);
     for id in &FIVE[..2] {
-        start_download(&r.jobs, (*id).to_owned());
+        start_download(&r.jobs, (*id).to_owned(), false);
     }
     let mut waited = false;
     for _ in 0..500 {
@@ -2479,7 +2549,7 @@ async fn bytes_landed_count_once() {
     }
     // 20 bytes free, A's first file in it already.
     lock(&r.store).catalog.1["roots"][0]["volume"]["available_bytes"] = json!(1e11 + 20.0);
-    start_download(&r.jobs, "OPRA-A".into());
+    start_download(&r.jobs, "OPRA-A".into(), false);
     // Its first file landed: only the second is held.
     for _ in 0..300 {
         if lock(&r.jobs.reserved)
@@ -2491,8 +2561,8 @@ async fn bytes_landed_count_once() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert_eq!(lock(&r.jobs.reserved)["OPRA-A"].0, 9);
-    start_download(&r.jobs, "OPRA-B".into());
-    start_download(&r.jobs, "OPRA-C".into());
+    start_download(&r.jobs, "OPRA-B".into(), false);
+    start_download(&r.jobs, "OPRA-C".into(), false);
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(lock(&seen).2.contains(&"B".to_owned()), "B went ahead");
     assert!(!lock(&seen).2.contains(&"C".to_owned()));
@@ -2546,7 +2616,12 @@ async fn a_done_job_is_cached_whole_and_checked_outside_the_store() {
     let dir = folder.clone();
     let r = rig_with("cache", move |j| j.cache_dir = Some(dir)).await;
     cache_job(&r, "OPRA-K1", DBN_BYTES_SHA256);
-    let (code, Json(v)) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-K1".into())).await;
+    let (code, Json(v)) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-K1".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::ACCEPTED, "{v}");
     assert_eq!(cache_done(&r, "OPRA-K1").await, ("cached".into(), None));
     let file = folder.join("OPRA-K1").join(format!(
@@ -2568,7 +2643,12 @@ async fn a_done_job_is_cached_whole_and_checked_outside_the_store() {
     assert!(lock(&r.store).uploaded.is_empty());
     // Again: the whole file is kept, not fetched again.
     let before = std::fs::metadata(&file).unwrap().modified().unwrap();
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-K1".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-K1".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::ACCEPTED);
     assert_eq!(cache_done(&r, "OPRA-K1").await.0, "cached");
     assert_eq!(
@@ -2592,7 +2672,12 @@ async fn a_cached_file_that_fails_its_checksum_is_not_kept() {
     let dir = folder.clone();
     let r = rig_with("cache-bad", move |j| j.cache_dir = Some(dir)).await;
     cache_job(&r, "OPRA-K2", "sha256:00");
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-K2".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-K2".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::ACCEPTED);
     let (state, err) = cache_done(&r, "OPRA-K2").await;
     assert_eq!(state, "failed");
@@ -2617,6 +2702,70 @@ fn cache_rows(v: &Value) -> Vec<(String, String, Option<u64>)> {
         .collect()
 }
 
+/// A scheduled request's origin (decision 0033).
+fn sched() -> Query<OriginQuery> {
+    Query(OriginQuery {
+        origin: Some("scheduled".into()),
+    })
+}
+
+/// Decision 0033: while capture is live, a cache request asked for by hand
+/// (the default) downloads at once; the queue takes it before a scheduled one,
+/// which waits. A download asked for by hand doesn't wait either. An unknown
+/// origin is refused.
+#[tokio::test]
+async fn work_asked_for_by_hand_runs_through_capture() {
+    let folder = cache_folder("manual-live");
+    let dir = folder.clone();
+    let r = rig_with("cache-manual-live", move |j| {
+        j.cache_dir = Some(dir);
+        j.yield_to = vec![("relay".into(), j.store.clone())];
+    })
+    .await;
+    lock(&r.store).health = "ready";
+    cache_job(&r, "OPRA-H1", DBN_BYTES_SHA256);
+    cache_job(&r, "OPRA-H2", DBN_BYTES_SHA256);
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-H1".into()), sched()).await;
+    assert_eq!(code, StatusCode::ACCEPTED);
+    cache_state(&r, "OPRA-H1", "waiting").await;
+    let (code, Json(v)) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-H2".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
+    assert_eq!(
+        (code, v["origin"].as_str()),
+        (StatusCode::ACCEPTED, Some("manual")),
+        "{v}"
+    );
+    // Cached while capture is still live; the scheduled one still waits.
+    assert_eq!(cache_done(&r, "OPRA-H2").await, ("cached".into(), None));
+    assert_ne!(lock(&r.jobs.caching)["OPRA-H1"].state, "cached");
+    // A download asked for by hand doesn't wait for capture either.
+    let (code, Json(v)) = download(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-H2".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
+    assert_eq!(
+        (code, v["origin"].as_str()),
+        (StatusCode::ACCEPTED, Some("manual")),
+        "{v}"
+    );
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-H9".into()),
+        Query(OriginQuery {
+            origin: Some("whenever".into()),
+        }),
+    )
+    .await;
+    assert_eq!(code, StatusCode::BAD_REQUEST);
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 /// A cache request made while capture is live is accepted, queued and shown,
 /// and runs once capture ends: one at a time, in the order asked.
 #[tokio::test]
@@ -2634,7 +2783,7 @@ async fn a_cache_request_during_capture_runs_when_capture_ends() {
     cache_job(&r, "OPRA-L1", DBN_BYTES_SHA256);
     cache_job(&r, "OPRA-L2", DBN_BYTES_SHA256);
     for id in ["OPRA-L1", "OPRA-L2"] {
-        let (code, Json(v)) = cache(AxState(r.jobs.clone()), UrlPath(id.into())).await;
+        let (code, Json(v)) = cache(AxState(r.jobs.clone()), UrlPath(id.into()), sched()).await;
         assert_eq!(
             (code, v["state"].as_str()),
             (StatusCode::ACCEPTED, Some("queued")),
@@ -2643,7 +2792,7 @@ async fn a_cache_request_during_capture_runs_when_capture_ends() {
         assert!(folder.join(id).join("REQUESTED").exists());
     }
     // Asked again while queued: refused, not queued twice.
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-L2".into())).await;
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-L2".into()), sched()).await;
     assert_eq!(code, StatusCode::CONFLICT);
     let mut rows = Vec::new();
     for _ in 0..300 {
@@ -2662,7 +2811,13 @@ async fn a_cache_request_during_capture_runs_when_capture_ends() {
                 "waiting: relay is live".to_owned(),
                 None
             ),
-            ("OPRA-L2".to_owned(), "queued".to_owned(), Some(1)),
+            // Both wait their turns in the queue (decision 0033): neither
+            // holds the worker while capture is live.
+            (
+                "OPRA-L2".to_owned(),
+                "waiting: relay is live".to_owned(),
+                None
+            ),
         ]
     );
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2693,7 +2848,12 @@ async fn a_cache_download_that_fails_for_a_while_is_retried() {
     let r = rig_with("cache-retry", move |j| j.cache_dir = Some(dir)).await;
     lock(&r.store).dl_fail = 7;
     cache_job(&r, "OPRA-R1", DBN_BYTES_SHA256);
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-R1".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-R1".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::ACCEPTED);
     assert_eq!(cache_done(&r, "OPRA-R1").await, ("cached".into(), None));
     assert_eq!(lock(&r.store).dl_fail, 0);
@@ -2764,7 +2924,12 @@ async fn a_cache_download_waits_for_disk_rather_than_fill_it() {
     .await;
     cache_job(&r, "OPRA-D1", DBN_BYTES_SHA256);
     set_floor(&r, u64::MAX / 4);
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-D1".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-D1".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::ACCEPTED);
     let state = cache_state(&r, "OPRA-D1", "waiting for disk").await;
     assert!(state.contains("keeping"), "{state}");
@@ -2806,7 +2971,12 @@ async fn a_stalled_or_dead_cache_job_never_holds_up_the_rest() {
     ));
     cache_job(&r, "OPRA-T2", DBN_BYTES_SHA256);
     for id in ["OPRA-T1", "OPRA-T2"] {
-        let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(id.into())).await;
+        let (code, _) = cache(
+            AxState(r.jobs.clone()),
+            UrlPath(id.into()),
+            Query(OriginQuery::default()),
+        )
+        .await;
         assert_eq!(code, StatusCode::ACCEPTED);
     }
     assert_eq!(cache_done(&r, "OPRA-T2").await, ("cached".into(), None));
@@ -2827,7 +2997,12 @@ async fn a_stalled_or_dead_cache_job_never_holds_up_the_rest() {
         whole_day(),
         "done",
     ));
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-T3".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-T3".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::ACCEPTED);
     {
         let mut f = lock(&r.fake.s);
@@ -2870,7 +3045,12 @@ async fn a_listing_error_is_judged_by_its_status_not_its_text() {
             .insert("OPRA-GONE".into(), (Some(404), "not found".into()));
     }
     for id in ["OPRA-20240401-X404", "OPRA-GONE"] {
-        let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(id.into())).await;
+        let (code, _) = cache(
+            AxState(r.jobs.clone()),
+            UrlPath(id.into()),
+            Query(OriginQuery::default()),
+        )
+        .await;
         assert_eq!(code, StatusCode::ACCEPTED);
     }
     let (state, err) = cache_done(&r, "OPRA-GONE").await;
@@ -2904,15 +3084,15 @@ async fn a_full_cache_queue_answers_busy() {
     for id in &ids {
         cache_job(&r, id, DBN_BYTES_SHA256);
     }
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(ids[0].clone())).await;
+    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(ids[0].clone()), sched()).await;
     assert_eq!(code, StatusCode::ACCEPTED);
     cache_state(&r, &ids[0], "waiting").await;
     for id in &ids[1..=CACHE_QUEUE] {
-        let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(id.clone())).await;
+        let (code, _) = cache(AxState(r.jobs.clone()), UrlPath(id.clone()), sched()).await;
         assert_eq!(code, StatusCode::ACCEPTED, "{id}");
     }
     let last = &ids[CACHE_QUEUE + 1];
-    let (code, Json(v)) = cache(AxState(r.jobs.clone()), UrlPath(last.clone())).await;
+    let (code, Json(v)) = cache(AxState(r.jobs.clone()), UrlPath(last.clone()), sched()).await;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE, "{v}");
     assert!(!folder.join(last).join("REQUESTED").exists());
     let (_, Json(v)) = cache_list(AxState(r.jobs.clone())).await;
@@ -2956,7 +3136,12 @@ async fn a_restart_resumes_more_requests_than_the_queue_holds() {
 async fn caching_needs_a_folder_a_done_job_and_a_job_id() {
     let r = rig("cache-refused").await;
     cache_job(&r, "OPRA-K3", DBN_BYTES_SHA256);
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-K3".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-K3".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
     let dir = std::env::temp_dir().join(format!("tinytrader-jobs-cache-r-{}", std::process::id()));
     let r = rig_with("cache-refused-2", move |j| j.cache_dir = Some(dir)).await;
@@ -2967,9 +3152,19 @@ async fn caching_needs_a_folder_a_done_job_and_a_job_id() {
         whole_day(),
         "processing",
     ));
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("OPRA-K4".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("OPRA-K4".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::CONFLICT);
-    let (code, _) = cache(AxState(r.jobs.clone()), UrlPath("../etc".into())).await;
+    let (code, _) = cache(
+        AxState(r.jobs.clone()),
+        UrlPath("../etc".into()),
+        Query(OriginQuery::default()),
+    )
+    .await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
 }
 

@@ -497,6 +497,14 @@
               "null"
             ]
           },
+          "origin": {
+            "default": null,
+            "description": "`manual` (the default) or `scheduled` (decision 0033): a job bought by\nhand is downloaded as soon as it's done, capture or not.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "quote": {
             "type": "string"
           }
