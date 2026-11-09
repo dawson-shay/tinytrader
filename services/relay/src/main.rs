@@ -77,7 +77,9 @@ struct Args {
 
     /// In market hours the relay is `degraded` while more than
     /// `RELAY_STALE_SHARE` of its quotes are older than this many minutes.
-    #[arg(long, env = "RELAY_STALE_MINUTES", default_value_t = 5)]
+    /// On 2026-11-09 no XSP quote was older than 10 (1.2% older than 5), while
+    /// the frozen quotes were days old.
+    #[arg(long, env = "RELAY_STALE_MINUTES", default_value_t = 10)]
     stale_minutes: u64,
 
     /// The share of quotes (0 to 1) that may be older than
