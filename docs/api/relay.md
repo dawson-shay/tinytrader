@@ -72,6 +72,8 @@ All answers are JSON. Times are Unix seconds unless noted; prices are in dollars
 
 The common service endpoints: state (`ready`, `degraded`, ...), Prometheus metrics, and what the relay is (role, upstream, the streams listed here, its symbols and schedule).
 
+**Stale quotes:** in market hours (09:35 to 16:00 New York), an OPRA relay is `degraded` while more than `RELAY_STALE_SHARE` (default `0.05`) of its contracts' quotes are older than `RELAY_STALE_MINUTES` (default 5). The detail says how many, such as `live; 412 of 5972 quotes older than 5 min`, and `/events` records when it starts and when the quotes are fresh again. It is checked once a minute. On a live `cmbp-1` feed nearly every contract's book changes within minutes, so many old quotes mean the relay isn't applying today's records to them.
+
 ### `GET /events?after=<n>&limit=<n>`
 
 The relay's recent events (the last 500): provider up and down, gaps, schedule changes. Newest last; `after` is the last sequence number seen.
@@ -96,7 +98,8 @@ One-minute bars, `{"symbol", "interval": 60, "bars": [[t, o, h, l, c, v], ...], 
 The latest consolidated quote of each contract the relay carries, from the live `cmbp-1` (or IEX's `mbp-1`).
 
 - `?symbols=SPY261016C00775000,...` for those contracts, or `?underlying=ROOT&from=YYYY-MM-DD&to=YYYY-MM-DD` for a root's contracts expiring in that range.
-- `{"quotes": {OCC: {bid, ask, bid_size, ask_size, ts}}, "as_of", "last_record"}`: compact OCC symbols, `null` for an empty side, `ts` the provider's receive time.
+- `{"quotes": {OCC: {bid, ask, bid_size, ask_size, ts, age}}, "as_of", "last_record"}`: compact OCC symbols, `null` for an empty side, `ts` the provider's receive time, `age` its age in seconds.
+- **Only the current trading day's.** OPRA assigns instrument ids afresh each trading day, so the relay drops its quotes when a provider session starts on a new New York day, and a contract has none until it quotes that day. A reconnect on the same day keeps them. Within a day, a definition that gives a contract a new id, or an id a new contract, retires what the old pairing held. Before this (until 2026-11-09), a contract could keep its previous day's id beside today's, and `/quotes` served whichever came last, often the previous close.
 - A quote changes only when its book does, so a quiet contract's can be old and still current. `last_record` (null before any) says whether the feed itself is live; alpaca-data uses quotes only while it's within 120 seconds.
 
 ### `GET /stats`

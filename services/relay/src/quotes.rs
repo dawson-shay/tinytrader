@@ -7,10 +7,12 @@
 //! `GET /quotes?symbols=SPY261016C00775000,...` answers for those contracts;
 //! `?underlying=SPY` for every contract of that root, optionally only those
 //! expiring `from` / `to` (YYYY-MM-DD). The answer is
-//! `{"quotes": {OCC: {bid, ask, bid_size, ask_size, ts}}, "as_of", "last_record"}`: symbols
+//! `{"quotes": {OCC: {bid, ask, bid_size, ask_size, ts, age}}, "as_of", "last_record"}`: symbols
 //! in compact OCC form (the provider's padding removed), prices in dollars
 //! (`null` when a side is empty), `ts` the provider's receive time in Unix
-//! seconds. A quote changes only when its book does, so a quiet contract's
+//! seconds, `age` how many seconds old it is. Quotes are only the current
+//! trading day's: instrument ids are reassigned daily, so a new day's session
+//! drops the last day's. A quote changes only when its book does, so a quiet contract's
 //! can be old and still current: `last_record` (Unix seconds, null before
 //! any) says whether the feed itself is live.
 //!
@@ -143,6 +145,41 @@ impl Quotes {
     pub fn len(&self) -> usize {
         self.lock().len()
     }
+
+    /// Forgets these ids' quotes: they now name other contracts, or another id
+    /// holds their contract.
+    pub fn forget(&self, ids: &[u32]) {
+        let mut by_id = self.lock();
+        for id in ids {
+            by_id.remove(id);
+        }
+    }
+
+    /// Forgets every quote (a new trading day's ids).
+    pub fn clear(&self) {
+        self.lock().clear();
+    }
+
+    /// Of the quotes whose ids `defined` accepts, how many are older than
+    /// `older_ns` at `now_ns`, and how many there are.
+    pub fn stale(
+        &self,
+        defined: impl Fn(u32) -> bool,
+        now_ns: u64,
+        older_ns: u64,
+    ) -> (usize, usize) {
+        let by_id = self.lock();
+        let mut out = (0, 0);
+        for (id, q) in by_id.iter() {
+            if defined(*id) {
+                out.1 += 1;
+                if now_ns.saturating_sub(q.ts) > older_ns {
+                    out.0 += 1;
+                }
+            }
+        }
+        out
+    }
 }
 
 /// OPRA's padded `SPY   261016C00775000` as `SPY261016C00775000`.
@@ -227,11 +264,13 @@ async fn serve(State(hub): State<Arc<Hub>>, Query(ask): Query<Ask>) -> (StatusCo
         );
     };
     let found = hub.quotes_matching(keep);
+    let now = crate::protocol::now_ns();
     let mut quotes = Map::new();
     for (s, q) in found {
         quotes.insert(
             s,
-            json!({ "bid": q.bid, "ask": q.ask, "bid_size": q.bid_size, "ask_size": q.ask_size, "ts": q.ts as f64 / 1e9 }),
+            json!({ "bid": q.bid, "ask": q.ask, "bid_size": q.bid_size, "ask_size": q.ask_size,
+                    "ts": q.ts as f64 / 1e9, "age": now.saturating_sub(q.ts) as f64 / 1e9 }),
         );
     }
     (
