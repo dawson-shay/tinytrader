@@ -293,8 +293,18 @@ fn queue(a: &App, ask: Ask, from: &str) -> Result<Run, String> {
         Some(o) => return Err(format!("origin {o:?}: manual or scheduled")),
     };
     let created = unix_seconds();
+    // The millisecond it was asked for, made unique: two runs queued in the same
+    // millisecond (an automation, a test) must not share an id.
+    let id = {
+        let runs = lock(&a.runs);
+        let mut ms = (created * 1000.0) as u64;
+        while runs.iter().any(|r| r.id == format!("r{ms}")) {
+            ms += 1;
+        }
+        format!("r{ms}")
+    };
     let run = Run {
-        id: format!("r{}", (created * 1000.0) as u64),
+        id,
         feed: ask.feed,
         symbols,
         start: ask.start,
@@ -1642,6 +1652,20 @@ mod tests {
             ..ask(&["SPY"], DAY, DAY)
         };
         assert!(queue(&a, bad, "request").unwrap_err().contains("origin"));
+    }
+
+    /// Runs queued in the same millisecond get their own ids.
+    #[tokio::test]
+    async fn runs_queued_at_once_have_their_own_ids() {
+        let (f, s) = (
+            FakeAlpaca::start(SMALL, SMALL).await,
+            FakeStore::start().await,
+        );
+        let a = app_for(&f, &s, "ids", &[]);
+        let ids: HashSet<String> = (0..50)
+            .map(|_| queue(&a, ask(&["SPY"], DAY, DAY), "request").unwrap().id)
+            .collect();
+        assert_eq!(ids.len(), 50);
     }
 
     /// While live capture runs, no day of a scheduled run starts; the run
