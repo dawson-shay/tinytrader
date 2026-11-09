@@ -12,7 +12,8 @@
 //!   header's publisher is the exchange that executed it, and it carries the
 //!   consolidated book as it stood before the trade.
 //! - Exchanges are Alpaca's one-letter codes, each a publisher id
-//!   `40100 + (letter - 'A')`; an unknown code is refused, not guessed.
+//!   `40100 + (letter - 'A')`; `?` (a venue the SIP doesn't name) is
+//!   [`UNKNOWN_EXCHANGE`]; any other code is refused, not guessed.
 //! - Prices, timestamps, the round-lot rule for quote sizes, `F_LAST` and the
 //!   order of a day (a trade before a quote with the same time) are as for IEX.
 
@@ -35,14 +36,19 @@ pub const DATASET: &str = "ALPACA.SIP";
 pub const PUBLISHER: u16 = 40002;
 /// Publisher ids of the exchanges start here: `A` is 40100, `Z` 40125.
 pub const EXCHANGE_BASE: u16 = 40100;
+/// Publisher id for Alpaca's `?`: a venue the SIP itself doesn't name (seen
+/// on some 2021 trades). Kept as "unknown venue", not guessed as an exchange
+/// and not a reason to refuse the day.
+pub const UNKNOWN_EXCHANGE: u16 = 40099;
 
 /// An exchange's publisher id from Alpaca's one-letter code.
 ///
 /// # Errors
-/// Anything but one capital letter.
+/// Anything but one capital letter or `?` ([`UNKNOWN_EXCHANGE`]).
 pub fn exchange(code: &str) -> Result<u16, String> {
     match code.as_bytes() {
         [c @ b'A'..=b'Z'] => Ok(EXCHANGE_BASE + u16::from(c - b'A')),
+        [b'?'] => Ok(UNKNOWN_EXCHANGE),
         _ => Err(format!("unknown exchange code {code:?}")),
     }
 }
@@ -455,6 +461,7 @@ mod tests {
     fn exchanges_map_to_fixed_publishers() {
         assert_eq!(exchange("A"), Ok(40100));
         assert_eq!(exchange("V"), Ok(40121));
+        assert_eq!(exchange("?"), Ok(UNKNOWN_EXCHANGE));
         assert!(exchange("").is_err() && exchange("NY").is_err() && exchange("a").is_err());
     }
 
