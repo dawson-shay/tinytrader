@@ -21,12 +21,20 @@
 //!   short calls than long) is refused outright. Shares are bought with cash. It
 //!   approximates a broker's options buying power for defined-risk spreads, and
 //!   does not model margin on naked positions. Working orders count as if filled:
-//!   their legs in the positions, their debits as paid. A short option covered by a
-//!   long of the same root, type and strike that expires later (a calendar) is paired
-//!   with it and the pair needs nothing beyond its debit, as the gateway's
-//!   `--allow-calendars` sizes it: each long covers at most its own quantity, and a
-//!   European root is never paired. The requirement is the lower of the two ways,
-//!   paired and by expiry alone, so pairing never raises it.
+//!   their legs in the positions, their debits as paid.
+//! - **Calendars paired** (`buying_power = "defined_risk_calendars"`): as
+//!   `defined_risk`, and a short option covered by a long of the same root, type and
+//!   strike that expires later (a calendar) is paired with it, so the pair needs
+//!   nothing beyond its debit, as the gateway's `--allow-calendars` sizes it. Each
+//!   long covers at most its own quantity, and a European root is never paired. The
+//!   requirement is the lower of the two ways, paired and by expiry alone, so
+//!   pairing never raises it.
+//!   - It needs `liquidate_same_day_shorts_at`: a paired short in a physically
+//!     settled root is bought back on its last day, before it can be assigned into
+//!     shares the debit didn't pay for. A short the rule can't buy back (no fresh
+//!     ask) still settles at the close, and early assignment isn't modelled (as
+//!     for every short).
+//!   - `defined_risk` keeps sizing by expiry alone, unchanged under this model.
 use super::{CENT, SimBroker};
 use crate::intent::Intent;
 use crate::safety::{et_day, et_ns, hhmm};
@@ -45,6 +53,8 @@ pub(crate) struct VenueRules {
     pub(crate) no_same_day_opening_after: Option<i64>,
     pub(crate) liquidate_at: Option<i64>,
     pub(crate) defined_risk: bool,
+    /// `defined_risk_calendars`: calendars paired (with `defined_risk`).
+    pub(crate) calendars: bool,
 }
 
 impl VenueRules {
@@ -231,6 +241,9 @@ impl SimBroker {
             *all.entry(s).or_default() += q;
         }
         let by_expiry = requirement(&all);
+        if !self.s.venue.calendars {
+            return by_expiry;
+        }
         match (by_expiry, requirement(&paired(all))) {
             (Ok(a), Ok(b)) => Ok(a.min(b)),
             (Ok(r), Err(_)) | (Err(_), Ok(r)) => Ok(r),
@@ -325,10 +338,10 @@ impl SimBroker {
             .opt_s("liquidate_same_day_shorts_at", t(r.liquidate_at).as_deref())
             .s(
                 "buying_power",
-                if r.defined_risk {
-                    "defined_risk"
-                } else {
-                    "cash"
+                match (r.defined_risk, r.calendars) {
+                    (true, true) => "defined_risk_calendars",
+                    (true, false) => "defined_risk",
+                    _ => "cash",
                 },
             )
             .done()
