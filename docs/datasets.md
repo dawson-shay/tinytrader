@@ -31,4 +31,5 @@ listed with their extensions once they are defined.
 These days come from Alpaca's history, filed one file per symbol, schema and
 day ([0014](decisions/0014-history-feeds.md)). Publisher ids: `40001` IEX,
 `40002` the SIP itself (a quote's header), and `40100 + (letter − 'A')` for
-each exchange by Alpaca's one-letter code (`V`, IEX, is 40121).
+each exchange by Alpaca's one-letter code (`V`, IEX, is 40121); `40099` a venue
+the SIP doesn't name (Alpaca's `?`, on some 2021–22 trades and quotes).
