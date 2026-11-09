@@ -210,6 +210,43 @@ impl Ledger {
     }
 }
 
+/// Whether an earlier filing of a batch, by its records in `migrations/` on
+/// these roots, never completed: its event ledger is there (it began), and no
+/// root has its summary or a `complete` step. A batch with no ledger at all
+/// (its provenance from before ledgers, or put there by hand) isn't taken as
+/// interrupted.
+fn interrupted_earlier(roots: &[&Path], batch: &str) -> Result<bool, String> {
+    let ledger_name = format!("-incorporate-{batch}.events.jsonl");
+    let summary_name = format!("-incorporate-{batch}.json");
+    let summary_again = format!("-incorporate-{batch}-");
+    let (mut began, mut completed) = (false, false);
+    for root in roots {
+        let Ok(entries) = fs::read_dir(root.join("migrations")) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(&ledger_name) {
+                began = true;
+                let text =
+                    fs::read_to_string(e.path()).map_err(|e| format!("migration ledger: {e}"))?;
+                completed |= text
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .any(|v| v["step"] == "complete");
+            } else if name.ends_with(&summary_name)
+                || name.rsplit_once(&summary_again).is_some_and(|(_, rest)| {
+                    rest.strip_suffix(".json")
+                        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+            {
+                completed = true;
+            }
+        }
+    }
+    Ok(began && !completed)
+}
+
 /// `YYYY-MM-DD` of a Databento file name such as
 /// `opra-pillar-20251001.cmbp-1.dbn.zst`, if it is a daily DBN file of `schema`.
 pub(crate) fn databento_day(name: &str, schema: &str) -> Option<String> {
@@ -669,6 +706,12 @@ fn file_batch(
     // Its days are filed one by one, each refused alone.
     let by_day = by_day && whole;
     let prov = |root: &Path| root.join("provenance").join(batch);
+    // Provenance an earlier filing of this batch left without completing
+    // (interrupted: an I/O error, a crash) is replaced, set aside and on
+    // record, rather than refusing every later filing over its receipts.
+    // Read before this filing's own ledger is opened.
+    let replace_provenance = interrupted_earlier(&roots, batch)?
+        && roots.iter().any(|r| prov(r).exists());
     let mut ledger = Ledger::open(
         &roots
             .iter()
@@ -719,7 +762,7 @@ fn file_batch(
         let part = holder(name).unwrap_or(first);
         let path = part.inc.join(name);
         if name.ends_with(".json") {
-            if !path.exists() {
+            if !path.exists() && !replace_provenance {
                 // Kept by an earlier, interrupted run?
                 for root in &roots {
                     let kept = prov(root).join(name);
@@ -729,8 +772,11 @@ fn file_batch(
                 }
                 return Err(format!("{name}: missing"));
             }
+            if !path.exists() {
+                return Err(format!("{name}: missing"));
+            }
             let got = hash_file(&path)?;
-            for root in &roots {
+            for root in roots.iter().filter(|_| !replace_provenance) {
                 let kept = prov(root).join(name);
                 if kept.exists() && hash_file(&kept)? != got {
                     return Err(format!(
@@ -868,7 +914,7 @@ fn file_batch(
             }
         }
     }
-    for root in &roots {
+    for root in roots.iter().filter(|_| !replace_provenance) {
         let kept = prov(root).join("manifest.json");
         if kept.exists() && fs::read_to_string(&kept).map_err(|e| e.to_string())? != kept_manifest {
             problems.push(format!(
@@ -883,6 +929,20 @@ fn file_batch(
     }
     for r in &refused {
         ledger.record(json!({ "step": "refused-day", "file": r["file"], "why": r["why"] }))?;
+    }
+    // Every check passed: the interrupted filing's provenance goes aside
+    // (never deleted), so this filing's receipts are the batch's.
+    if replace_provenance {
+        let at = tinytrader_observe::unix_seconds() as u64;
+        for root in roots.iter().filter(|r| prov(r).exists()) {
+            let aside = root
+                .join("provenance")
+                .join(format!("{batch}.interrupted-{at}"));
+            fs::rename(prov(root), &aside)
+                .map_err(|e| format!("{}: {e}", prov(root).display()))?;
+            ledger.record(json!({ "step": "provenance-set-aside", "from": prov(root), "to": aside,
+                                  "why": "an earlier filing of this batch began and never completed" }))?;
+        }
     }
 
     // A partial day superseded on a volume holding none of the batch gets
@@ -1478,6 +1538,58 @@ mod tests {
             })
             .count();
         assert_eq!(summaries, 2, "the first summary is kept, not rewritten");
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// A filing that began and never completed (an I/O error mid-filing) left
+    /// receipts that differ from the refetched batch's: they're set aside, on
+    /// record, and the batch files. One that completed still refuses.
+    #[test]
+    fn replaces_the_provenance_of_an_interrupted_filing() {
+        let root = scratch("interrupted").join("Databento");
+        fs::create_dir_all(root.join("provenance/OPRA-I")).unwrap();
+        fs::write(root.join("provenance/OPRA-I/manifest.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::write(
+            root.join("migrations/2026-10-05-incorporate-OPRA-I.events.jsonl"),
+            "{\"step\":\"begin\",\"batch\":\"OPRA-I\"}\n",
+        )
+        .unwrap();
+        stage(&root, "OPRA-I", &["SPX.OPT"], b"day one");
+        incorporate(&one(&root, "OPRA-I"), &[], "OPRA-I", "2026-10-06").unwrap();
+        assert!(root.join(DAY).exists());
+        assert_ne!(
+            fs::read_to_string(root.join("provenance/OPRA-I/manifest.json")).unwrap(),
+            "{}"
+        );
+        let aside: Vec<PathBuf> = fs::read_dir(root.join("provenance"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.to_string_lossy().contains("OPRA-I.interrupted-"))
+            .collect();
+        assert_eq!(aside.len(), 1, "set aside, not deleted");
+        assert_eq!(fs::read_to_string(aside[0].join("manifest.json")).unwrap(), "{}");
+        let ledger =
+            fs::read_to_string(root.join("migrations/2026-10-06-incorporate-OPRA-I.events.jsonl"))
+                .unwrap();
+        assert!(ledger.contains("provenance-set-aside"), "{ledger}");
+        let _ = fs::remove_dir_all(root.parent().unwrap());
+
+        // Completed earlier (its ledger says so): a different receipt still refuses.
+        let root = scratch("completed").join("Databento");
+        fs::create_dir_all(root.join("provenance/OPRA-J")).unwrap();
+        fs::write(root.join("provenance/OPRA-J/manifest.json"), "{}").unwrap();
+        fs::create_dir_all(root.join("migrations")).unwrap();
+        fs::write(
+            root.join("migrations/2026-10-05-incorporate-OPRA-J.events.jsonl"),
+            "{\"step\":\"begin\"}\n{\"step\":\"complete\"}\n",
+        )
+        .unwrap();
+        stage(&root, "OPRA-J", &["SPX.OPT"], b"day one");
+        let err = incorporate(&one(&root, "OPRA-J"), &[], "OPRA-J", "2026-10-06").unwrap_err();
+        assert!(err.contains("different manifest.json"), "{err}");
+        assert!(!root.join(DAY).exists());
         let _ = fs::remove_dir_all(root.parent().unwrap());
     }
 

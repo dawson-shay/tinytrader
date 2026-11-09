@@ -492,6 +492,15 @@ present`. A problem with the batch itself (its receipts, its manifest)
 refuses the whole batch. Other batches, and `/adopt`, are still filed
 whole or not at all.
 
+A batch whose receipts differ from those already in `provenance/<id>/` is
+refused, with one exception: an earlier filing of the batch that began and
+never completed (its ledger in `migrations/` has no `complete` step, and no
+volume has its summary), interrupted by an I/O error, say. Its receipts are
+then moved aside to `provenance/<id>.interrupted-<time>/`, never deleted,
+the move is recorded in the new filing's ledger (`provenance-set-aside`),
+and the batch is filed with its own receipts. Days that the interrupted
+filing placed are checked as usual.
+
 The swap is a merge's: the new file is staged on the partial day's volume
 (copied there, and checked, if the batch arrived on another), the entry it
 will have recorded in `manifest.d/<day>.pending.json`, the partial day
