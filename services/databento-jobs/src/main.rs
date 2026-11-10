@@ -460,7 +460,7 @@ struct Jobs {
     caching: Mutex<HashMap<String, Transfer>>,
     /// The cache worker's queue, the one bounded structure of cache requests.
     /// Started on first use.
-    cache_queue: std::sync::OnceLock<tokio::sync::mpsc::Sender<CacheAsk>>,
+    cache_queue: std::sync::OnceLock<CacheQueues>,
     /// Free space the cache keeps on its volume: at least this many bytes, and
     /// at least this percentage of the volume.
     cache_min_free: u64,
@@ -472,6 +472,9 @@ struct Jobs {
     follow: Mutex<HashSet<String>>,
     /// Jobs whose download is queued or running: never a second.
     in_flight: Mutex<HashSet<String>>,
+    /// Followed jobs bought by hand (decision 0033): downloaded as soon as
+    /// they're done, capture or not. Read from the ledger's `origin`.
+    manual: Mutex<HashSet<String>>,
     /// Failed downloads or filings of each job: how many, and when it may
     /// be tried again.
     tries: Mutex<HashMap<String, (u32, Instant)>>,
@@ -544,6 +547,7 @@ impl Jobs {
             cache_floor_for_tests: AtomicU64::new(0),
             follow: Mutex::default(),
             in_flight: Mutex::default(),
+            manual: Mutex::default(),
             tries: Mutex::default(),
             submits: Mutex::default(),
             store_wait: Duration::from_secs(600),
@@ -764,6 +768,8 @@ async fn main() {
     resume_caching(&jobs);
     let every = Duration::from_secs(args.refresh.max(10));
     let mut calendar = (tinytrader_schedule::Calendar::default(), None::<Instant>);
+    // When the jobs bought by hand were last checked while capture was live.
+    let mut manual_checked: Option<Instant> = None;
     loop {
         if let Some(url) = &args.calendar
             && calendar
@@ -777,9 +783,14 @@ async fn main() {
             calendar = (c, Some(Instant::now()));
         }
         // Background work (decision 0011): off the network while capture is live.
+        // What was bought by hand still downloads once it's done (decision 0033).
         if let Some(who) = live_capture(&jobs).await {
             jobs.paused_until.store(1, Ordering::Relaxed);
             observer.set_state(State::Idle, &format!("yielding: {who} is live"));
+            if manual_checked.is_none_or(|at: Instant| at.elapsed() >= MANUAL_CHECK) {
+                start_manual_downloads(&jobs).await;
+                manual_checked = Some(Instant::now());
+            }
             tokio::time::sleep(Duration::from_secs(15)).await;
             continue;
         }
@@ -859,6 +870,7 @@ fn reconcile(jobs: &Shared, out: &[BatchJob], complete: bool, started: f64) {
         }
     }
     lock(&jobs.follow).extend(l.submitted());
+    lock(&jobs.manual).extend(l.submitted_by_hand());
 }
 
 /// The first line of an API error, without an HTML error page.
@@ -1020,7 +1032,8 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
         .map(|j| j.id.clone())
         .collect();
     for id in ready {
-        start_download(jobs, id);
+        let manual = lock(&jobs.manual).contains(&id);
+        start_download(jobs, id, manual);
     }
     Ok(Refreshed {
         jobs: out.len(),
@@ -2062,6 +2075,19 @@ fn write_step(
     cost_usd: f64,
     note: Option<String>,
 ) -> Result<(), String> {
+    write_step_origin(jobs, request, state, job, cost_usd, note, None)
+}
+
+/// [`write_step`], saying who asked for the submission (decision 0033).
+fn write_step_origin(
+    jobs: &Jobs,
+    request: &str,
+    state: &str,
+    job: Option<String>,
+    cost_usd: f64,
+    note: Option<String>,
+    origin: Option<&str>,
+) -> Result<(), String> {
     lock(&jobs.ledger)
         .as_mut()
         .ok_or_else(|| NO_LEDGER.to_owned())?
@@ -2072,6 +2098,7 @@ fn write_step(
             job,
             cost_usd: Some(cost_usd),
             note,
+            origin: origin.map(str::to_owned),
             ..ledger::Entry::default()
         })
 }
@@ -2087,6 +2114,10 @@ struct Submit {
     /// Who approved a paid purchase (the console's login).
     #[serde(default)]
     approved_by: Option<String>,
+    /// `manual` (the default) or `scheduled` (decision 0033): a job bought by
+    /// hand is downloaded as soon as it's done, capture or not.
+    #[serde(default)]
+    origin: Option<String>,
 }
 
 /// The job IDs `again` names; a blanket `true` is refused.
@@ -2133,6 +2164,10 @@ async fn submit(
 }
 
 async fn submit_quote(jobs: Shared, s: Submit, approval: Option<Reply>) -> Reply {
+    // Checked here; send_quote reads it (decision 0033).
+    if let Err(r) = manual_origin(s.origin.as_deref()) {
+        return r;
+    }
     let again = match s
         .again
         .as_ref()
@@ -2206,6 +2241,8 @@ async fn send_quote(
     again: Option<HashSet<String>>,
     approval: Option<Reply>,
 ) -> Reply {
+    // Checked by submit_quote: anything but "scheduled" is by hand.
+    let manual = s.origin.as_deref() != Some("scheduled");
     if quote.request.price_only {
         return refused(
             StatusCode::CONFLICT,
@@ -2338,7 +2375,15 @@ async fn send_quote(
             Ok(job) => ("submitted", Some(job.id.clone()), None),
             Err(e) => ("uncertain", None, Some(brief(e))),
         };
-        if let Err(e) = write_step(jobs, &request, state, job, p.cost_usd, note) {
+        if let Err(e) = write_step_origin(
+            jobs,
+            &request,
+            state,
+            job,
+            p.cost_usd,
+            note,
+            Some(if manual { "manual" } else { "scheduled" }),
+        ) {
             // Unwritten, the "sending" step still blocks what it overlaps.
             eprintln!("databento-jobs: cannot write the ledger: {e}");
         }
@@ -2350,6 +2395,9 @@ async fn send_quote(
         match result {
             Ok(job) => {
                 lock(&jobs.follow).insert(job.id.clone());
+                if manual {
+                    lock(&jobs.manual).insert(job.id.clone());
+                }
                 jobs.events.push(
                     format!(
                         "submitted {} ({} {} {what}, {} to {}, ${:.2})",
@@ -2529,7 +2577,15 @@ async fn resolve(AxState(jobs): AxState<Shared>, Json(r): Json<Resolve>) -> Repl
     reply_ok(json!({ "request": e.request, "state": state, "job": r.job }))
 }
 
-async fn download(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) -> Reply {
+async fn download(
+    AxState(jobs): AxState<Shared>,
+    UrlPath(job): UrlPath<String>,
+    Query(q): Query<OriginQuery>,
+) -> Reply {
+    let manual = match manual_origin(q.origin.as_deref()) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
     let details = jobs.db.job(&job).await;
     match details {
         Ok(j) if j.state != JobState::Done => {
@@ -2551,8 +2607,62 @@ async fn download(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>)
     if busy {
         return refused(StatusCode::CONFLICT, "already downloading");
     }
-    start_download(&jobs, job.clone());
-    (StatusCode::ACCEPTED, Json(json!({ "job": job })))
+    start_download(&jobs, job.clone(), manual);
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({ "job": job, "origin": if manual { "manual" } else { "scheduled" } })),
+    )
+}
+
+/// Whether work was asked for by hand (decision 0033): `manual` (the default)
+/// runs at once and skips the capture waits; `scheduled` yields. Anything else
+/// is refused.
+fn manual_origin(origin: Option<&str>) -> Result<bool, Reply> {
+    match origin {
+        None | Some("manual") => Ok(true),
+        Some("scheduled") => Ok(false),
+        Some(o) => Err(refused(
+            StatusCode::BAD_REQUEST,
+            format!("origin {o:?}: manual or scheduled"),
+        )),
+    }
+}
+
+#[derive(Deserialize, Default)]
+struct OriginQuery {
+    origin: Option<String>,
+}
+
+/// How often, while capture is live, the jobs bought by hand are checked for
+/// being done.
+const MANUAL_CHECK: Duration = Duration::from_secs(if cfg!(test) { 0 } else { 60 });
+
+/// While capture is live (the refresh paused), a job bought by hand is still
+/// downloaded as soon as it's done (decision 0033). An expired one is
+/// forgotten here; a filed, failing or in-flight one is left alone.
+async fn start_manual_downloads(jobs: &Shared) {
+    let ids: Vec<String> = lock(&jobs.manual).iter().cloned().collect();
+    for id in ids {
+        let skip = lock(&jobs.in_flight).contains(&id)
+            || lock(&jobs.transfers)
+                .get(&id)
+                .is_some_and(|t| t.state == "filed")
+            || lock(&jobs.tries)
+                .get(&id)
+                .is_some_and(|(n, at)| *n >= MAX_TRIES || Instant::now() < *at);
+        if skip {
+            continue;
+        }
+        match jobs.db.job(&id).await {
+            Ok(j) if j.state == JobState::Expired => {
+                lock(&jobs.manual).remove(&id);
+            }
+            Ok(j) if j.state == JobState::Done && unfileable(&j).is_none() => {
+                start_download(jobs, id, true);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// How many cache requests may wait at once; past that, `503`.
@@ -2571,7 +2681,15 @@ const REQUESTED: &str = "REQUESTED";
 /// capture is live it waits, and a request made then is queued and runs when
 /// capture ends. A request survives a restart (its `REQUESTED` marker), and a
 /// network error or Databento's 429 or 5xx is tried again later, not failed.
-async fn cache(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) -> Reply {
+async fn cache(
+    AxState(jobs): AxState<Shared>,
+    UrlPath(job): UrlPath<String>,
+    Query(q): Query<OriginQuery>,
+) -> Reply {
+    let manual = match manual_origin(q.origin.as_deref()) {
+        Ok(m) => m,
+        Err(r) => return r,
+    };
     let Some(root) = jobs.cache_dir.clone() else {
         return refused(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2598,7 +2716,9 @@ async fn cache(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) ->
     if let Err(e) = std::fs::create_dir_all(&dir).and_then(|()| {
         std::fs::write(
             &marker,
-            json!({ "job": job, "requested_at": tinytrader_observe::unix_seconds() }).to_string(),
+            json!({ "job": job, "requested_at": tinytrader_observe::unix_seconds(),
+                    "origin": if manual { "manual" } else { "scheduled" } })
+            .to_string(),
         )
     }) {
         return refused(
@@ -2607,9 +2727,11 @@ async fn cache(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) ->
         );
     }
     if cache_sender(&jobs)
+        .of(manual)
         .try_send(CacheAsk {
             job: job.clone(),
             due: None,
+            manual,
         })
         .is_err()
     {
@@ -2629,7 +2751,8 @@ async fn cache(AxState(jobs): AxState<Shared>, UrlPath(job): UrlPath<String>) ->
     );
     (
         StatusCode::ACCEPTED,
-        Json(json!({ "job": job, "folder": dir, "state": "queued" })),
+        Json(json!({ "job": job, "folder": dir, "state": "queued",
+                     "origin": if manual { "manual" } else { "scheduled" } })),
     )
 }
 
@@ -2679,14 +2802,36 @@ async fn cache_list(AxState(jobs): AxState<Shared>) -> Reply {
 struct CacheAsk {
     job: String,
     due: Option<Instant>,
+    /// Asked for by hand: taken first, and never waits for capture (0033).
+    manual: bool,
 }
 
-/// The cache worker's queue, starting the worker on first use.
-fn cache_sender(jobs: &Shared) -> &tokio::sync::mpsc::Sender<CacheAsk> {
+/// The cache worker's two bounded queues (each `CACHE_QUEUE`): requests asked
+/// for by hand, taken first, and scheduled ones.
+#[derive(Clone)]
+struct CacheQueues {
+    manual: tokio::sync::mpsc::Sender<CacheAsk>,
+    scheduled: tokio::sync::mpsc::Sender<CacheAsk>,
+}
+
+impl CacheQueues {
+    fn of(&self, manual: bool) -> &tokio::sync::mpsc::Sender<CacheAsk> {
+        if manual {
+            &self.manual
+        } else {
+            &self.scheduled
+        }
+    }
+}
+
+/// The cache worker's queues, starting the worker on first use.
+fn cache_sender(jobs: &Shared) -> &CacheQueues {
     jobs.cache_queue.get_or_init(|| {
-        let (tx, rx) = tokio::sync::mpsc::channel(CACHE_QUEUE);
-        tokio::spawn(cache_worker(Arc::clone(jobs), tx.clone(), rx));
-        tx
+        let (manual, rm) = tokio::sync::mpsc::channel(CACHE_QUEUE);
+        let (scheduled, rs) = tokio::sync::mpsc::channel(CACHE_QUEUE);
+        let q = CacheQueues { manual, scheduled };
+        tokio::spawn(cache_worker(Arc::clone(jobs), q.clone(), rm, rs));
+        q
     })
 }
 
@@ -2701,7 +2846,7 @@ fn resume_caching(jobs: &Shared) {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return;
     };
-    let mut asked: Vec<(f64, String)> = Vec::new();
+    let mut asked: Vec<(f64, String, bool)> = Vec::new();
     for e in entries.flatten() {
         let dir = e.path();
         let Some(job) = dir.file_name().and_then(|n| n.to_str()).map(str::to_owned) else {
@@ -2714,16 +2859,15 @@ fn resume_caching(jobs: &Shared) {
             let _ = std::fs::remove_file(dir.join(REQUESTED));
             continue;
         }
-        let at = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["requested_at"].as_f64())
-            .unwrap_or(0.0);
-        asked.push((at, job));
+        let v = serde_json::from_str::<Value>(&text).unwrap_or(Value::Null);
+        let at = v["requested_at"].as_f64().unwrap_or(0.0);
+        // Markers from before origins were all asked for by hand.
+        asked.push((at, job, v["origin"] != "scheduled"));
     }
     asked.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     {
         let mut c = lock(&jobs.caching);
-        for (at, job) in &asked {
+        for (at, job, _) in &asked {
             c.insert(
                 job.clone(),
                 Transfer {
@@ -2734,10 +2878,15 @@ fn resume_caching(jobs: &Shared) {
             );
         }
     }
-    let tx = cache_sender(jobs).clone();
+    let q = cache_sender(jobs).clone();
     tokio::spawn(async move {
-        for (_, job) in asked {
-            if tx.send(CacheAsk { job, due: None }).await.is_err() {
+        for (_, job, manual) in asked {
+            let ask = CacheAsk {
+                job,
+                due: None,
+                manual,
+            };
+            if q.of(manual).send(ask).await.is_err() {
                 return;
             }
         }
@@ -2750,26 +2899,34 @@ fn resume_caching(jobs: &Shared) {
 /// rest.
 async fn cache_worker(
     jobs: Shared,
-    tx: tokio::sync::mpsc::Sender<CacheAsk>,
-    mut rx: tokio::sync::mpsc::Receiver<CacheAsk>,
+    q: CacheQueues,
+    mut rm: tokio::sync::mpsc::Receiver<CacheAsk>,
+    mut rs: tokio::sync::mpsc::Receiver<CacheAsk>,
 ) {
-    // Each waiting job's next backoff: only jobs in the queue, so bounded by it.
+    // Each waiting job's next backoff: only jobs in the queues, so bounded by them.
     let mut backoff: HashMap<String, Duration> = HashMap::new();
     // Requests passed over in a row because they weren't due yet.
     let mut passed = 0usize;
-    while let Some(ask) = rx.recv().await {
+    loop {
+        // Asked for by hand first (decision 0033).
+        let ask = tokio::select! {
+            biased;
+            Some(a) = rm.recv() => a,
+            Some(a) = rs.recv() => a,
+            else => return,
+        };
         if let Some(due) = ask.due
             && due > Instant::now()
         {
             passed += 1;
-            // Everything in the queue is waiting: rest a moment before looking
-            // again, rather than spin.
-            if passed > rx.len() {
+            // Everything queued is waiting: rest a moment before looking again,
+            // rather than spin.
+            if passed > rm.len() + rs.len() {
                 let rest = due.saturating_duration_since(Instant::now());
                 tokio::time::sleep(rest.min(Duration::from_secs(1))).await;
                 passed = 0;
             }
-            match tx.try_send(ask) {
+            match q.of(ask.manual).try_send(ask) {
                 Ok(()) => continue,
                 // The queue filled meanwhile: this one waits its time and runs.
                 Err(e) => {
@@ -2777,29 +2934,30 @@ async fn cache_worker(
                     if let Some(due) = ask.due {
                         tokio::time::sleep_until(due.into()).await;
                     }
-                    run_cache_turn(&jobs, &tx, &mut backoff, ask.job).await;
+                    run_cache_turn(&jobs, &q, &mut backoff, ask.job, ask.manual).await;
                 }
             }
             continue;
         }
         passed = 0;
-        run_cache_turn(&jobs, &tx, &mut backoff, ask.job).await;
+        run_cache_turn(&jobs, &q, &mut backoff, ask.job, ask.manual).await;
     }
 }
 
 /// One turn of a cache request: done, failed, or back in the queue for later.
 async fn run_cache_turn(
     jobs: &Jobs,
-    tx: &tokio::sync::mpsc::Sender<CacheAsk>,
+    q: &CacheQueues,
     backoff: &mut HashMap<String, Duration>,
     mut job: String,
+    manual: bool,
 ) {
     let Some(dir) = jobs.cache_dir.as_ref().map(|r| r.join(&job)) else {
         return;
     };
     loop {
         set_cache(jobs, &job, |t| t.state = "starting".into());
-        let (state, wait) = match fetch_to_cache(jobs, &job, &dir).await {
+        let (state, wait) = match fetch_to_cache(jobs, &job, &dir, manual).await {
             Ok(n) => {
                 backoff.remove(&job);
                 let _ = std::fs::remove_file(dir.join(REQUESTED));
@@ -2827,6 +2985,10 @@ async fn run_cache_turn(
                 eprintln!("databento-jobs: cache {job}: {e}; trying again in {wait:?}");
                 (format!("retrying: {e}"), wait)
             }
+            Err(CacheError::Capture(why)) => (
+                why,
+                Duration::from_millis(if cfg!(test) { 20 } else { 15_000 }),
+            ),
             Err(CacheError::Disk(e)) => (
                 format!("waiting for disk: {e}"),
                 Duration::from_millis(if cfg!(test) { 20 } else { 60_000 }),
@@ -2836,8 +2998,9 @@ async fn run_cache_turn(
         let ask = CacheAsk {
             job,
             due: Some(Instant::now() + wait),
+            manual,
         };
-        match tx.try_send(ask) {
+        match q.of(manual).try_send(ask) {
             Ok(()) => return,
             // No room behind the others (the worker is its own queue's only
             // reader, so it can't wait for room): it waits here instead, and
@@ -2854,6 +3017,8 @@ async fn run_cache_turn(
 /// Databento's 429 or 5xx, a file cut short), too little disk for it yet, or
 /// one that won't change.
 enum CacheError {
+    /// A scheduled request while capture is live: back to the queue, waiting.
+    Capture(String),
     Transient(String),
     Disk(String),
     Permanent(String),
@@ -2948,6 +3113,7 @@ async fn fetch_to_cache(
     jobs: &Jobs,
     job: &str,
     dir: &std::path::Path,
+    manual: bool,
 ) -> Result<usize, CacheError> {
     use CacheError::{Permanent, Transient};
     use std::os::unix::fs::PermissionsExt as _;
@@ -2985,17 +3151,19 @@ async fn fetch_to_cache(
         let whole = std::fs::metadata(&path).is_ok_and(|m| m.len() == f.size)
             && sha256_file(&path).is_ok_and(|h| h == want);
         if !whole {
-            loop {
+            // A scheduled request yields to capture by going back to the queue
+            // (so the worker takes what was asked for by hand meanwhile); one
+            // asked for by hand doesn't wait (decision 0033).
+            if !manual {
                 let why = match live_capture(jobs).await {
                     Some(who) => Some(format!("waiting: {who} is live")),
                     None => capture_soon(jobs, f.size).map(|at| {
                         format!("waiting: capture starts at {at}, before this file could finish")
                     }),
                 };
-                let Some(why) = why else { break };
-                set_cache(jobs, job, |t| t.state = why.clone());
-                tokio::time::sleep(Duration::from_millis(if cfg!(test) { 20 } else { 15_000 }))
-                    .await;
+                if let Some(why) = why {
+                    return Err(CacheError::Capture(why));
+                }
             }
             disk_room(jobs, dir, f.size)?;
             set_cache(jobs, job, |t| t.state = "downloading".into());
@@ -3015,7 +3183,7 @@ async fn fetch_to_cache(
                     }
                     Err(Transient(e)) => return Err(Transient(format!("{}: {e}", f.filename))),
                     Err(Permanent(e)) => return Err(Permanent(format!("{}: {e}", f.filename))),
-                    Err(CacheError::Disk(e)) => return Err(CacheError::Disk(e)),
+                    Err(e @ (CacheError::Disk(_) | CacheError::Capture(_))) => return Err(e),
                 }
             }
             fetched += 1;
@@ -3147,8 +3315,10 @@ fn set(jobs: &Jobs, job: &str, f: impl FnOnce(&mut Transfer)) {
     f(lock(&jobs.transfers).entry(job.to_owned()).or_default());
 }
 
-/// Download and file a job, unless one for it is queued or running.
-fn start_download(jobs: &Shared, job: String) {
+/// Download and file a job, unless one for it is queued or running. `manual`
+/// (asked for by hand, or bought by hand: decision 0033) doesn't wait for
+/// capture.
+fn start_download(jobs: &Shared, job: String, manual: bool) {
     if !lock(&jobs.in_flight).insert(job.clone()) {
         return;
     }
@@ -3161,12 +3331,12 @@ fn start_download(jobs: &Shared, job: String) {
     let jobs = jobs.clone();
     tokio::spawn(async move {
         let turn = jobs.downloads.acquire().await.ok();
-        // Downloads wait while capture is live.
-        while jobs.paused_until.load(Ordering::Relaxed) != 0 {
+        // Scheduled downloads wait while capture is live.
+        while !manual && jobs.paused_until.load(Ordering::Relaxed) != 0 {
             set(&jobs, &job, |t| t.state = "waiting: capture is live".into());
             tokio::time::sleep(Duration::from_secs(15)).await;
         }
-        let result = fetch_and_file(&jobs, &job, turn).await;
+        let result = fetch_and_file(&jobs, &job, turn, manual).await;
         lock(&jobs.reserved).remove(&job);
         match result {
             Ok(n) => {
@@ -3229,6 +3399,7 @@ async fn fetch_and_file(
     jobs: &Jobs,
     job: &str,
     turn: Option<tokio::sync::SemaphorePermit<'_>>,
+    manual: bool,
 ) -> Result<usize, String> {
     if filed(jobs, job).await {
         return Ok(0);
@@ -3338,18 +3509,23 @@ async fn fetch_and_file(
     for f in &files {
         set(jobs, job, |t| t.file = f.filename.clone());
         if have.get(&f.filename) != Some(&f.size) {
-            // Each file starts only while no capture is live, and only if the
-            // capture hours don't begin before it could finish.
-            loop {
-                let why = match live_capture(jobs).await {
-                    Some(who) => Some(format!("waiting: {who} is live")),
-                    None => capture_soon(jobs, f.size).map(|at| {
-                        format!("waiting: capture starts at {at}, before this file could finish")
-                    }),
-                };
-                let Some(why) = why else { break };
-                set(jobs, job, |t| t.state = why.clone());
-                tokio::time::sleep(Duration::from_secs(15)).await;
+            // Each file of a scheduled download starts only while no capture
+            // is live, and only if the capture hours don't begin before it
+            // could finish. One asked for by hand doesn't wait (decision 0033).
+            if !manual {
+                loop {
+                    let why = match live_capture(jobs).await {
+                        Some(who) => Some(format!("waiting: {who} is live")),
+                        None => capture_soon(jobs, f.size).map(|at| {
+                            format!(
+                                "waiting: capture starts at {at}, before this file could finish"
+                            )
+                        }),
+                    };
+                    let Some(why) = why else { break };
+                    set(jobs, job, |t| t.state = why.clone());
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                }
             }
             set(jobs, job, |t| t.state = "downloading".into());
             let url = f

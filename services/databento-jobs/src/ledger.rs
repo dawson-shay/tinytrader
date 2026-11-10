@@ -48,6 +48,10 @@ pub struct Entry {
     /// The quote it was approved from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quote: Option<String>,
+    /// Who asked for a submission (decision 0033): `manual` or `scheduled`.
+    /// Entries from before it have none, and count as scheduled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 /// What identifies a request across a submission and Databento's job list:
@@ -228,6 +232,16 @@ impl Ledger {
     #[must_use]
     pub fn submitted(&self) -> HashSet<String> {
         self.entries.iter().filter_map(|e| e.job.clone()).collect()
+    }
+
+    /// The jobs submitted by hand (decision 0033).
+    #[must_use]
+    pub fn submitted_by_hand(&self) -> HashSet<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.origin.as_deref() == Some("manual"))
+            .filter_map(|e| e.job.clone())
+            .collect()
     }
 }
 
