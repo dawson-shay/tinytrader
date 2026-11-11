@@ -1758,6 +1758,27 @@ mod tests {
         );
     }
 
+    /// The nightly top-off plans the last ten days. Friday's (at 20:40 New York,
+    /// 01:40 UTC Saturday) can't plan Saturday, which isn't complete; Monday's
+    /// window still holds Friday's session, so it plans Saturday then, as not
+    /// held. Nothing is left behind between top-offs.
+    #[test]
+    fn the_next_top_off_plans_a_tail_the_last_one_couldnt() {
+        let cal = sess(&[
+            ("2026-01-08", "16:00"),
+            ("2026-01-09", "16:00"),
+            ("2026-01-12", "16:00"),
+            ("2026-01-13", "16:00"),
+        ]);
+        // Friday 2026-01-09's top-off: the last complete UTC day is Thursday.
+        let friday = days_to_fetch(&cal, "2025-12-30", "2026-01-08", "2026-01-08");
+        assert!(!friday.contains(&"2026-01-10".to_owned()), "{friday:?}");
+        // Monday 2026-01-12's: complete through Monday (20:40 New York is
+        // 01:40 UTC Tuesday), and the window starts on 2 January.
+        let monday = days_to_fetch(&cal, "2026-01-02", "2026-01-12", "2026-01-12");
+        assert!(monday.contains(&"2026-01-10".to_owned()), "{monday:?}");
+    }
+
     /// A run over a winter week files the Saturday UTC day that holds Friday's
     /// last after-hours hour, beside the five sessions.
     #[tokio::test]
