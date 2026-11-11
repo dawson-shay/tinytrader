@@ -334,7 +334,9 @@ fn queue(a: &App, ask: Ask, from: &str) -> Result<Run, String> {
 }
 
 /// Sessions between two days, inclusive, from Alpaca's calendar.
-async fn sessions(a: &App, start: &str, through: &str) -> Result<Vec<String>, String> {
+/// The market's sessions from `start` through `through`: each date and its
+/// close (`HH:MM` New York).
+async fn sessions(a: &App, start: &str, through: &str) -> Result<Vec<(String, String)>, String> {
     let body = a
         .alpaca
         .get(
@@ -349,8 +351,55 @@ async fn sessions(a: &App, start: &str, through: &str) -> Result<Vec<String>, St
     let v: Vec<Value> =
         serde_json::from_slice(&body).map_err(|e| format!("market calendar: {e}"))?;
     Ok(v.iter()
-        .filter_map(|d| d["date"].as_str().map(str::to_owned))
+        .filter_map(|d| {
+            Some((
+                d["date"].as_str()?.to_owned(),
+                d["close"].as_str().unwrap_or("16:00").to_owned(),
+            ))
+        })
         .collect())
+}
+
+/// The date after `day` (`YYYY-MM-DD`).
+fn date_after(day: &str) -> Option<String> {
+    let d = time::Date::parse(day, time::macros::format_description!("[year]-[month]-[day]")).ok()?;
+    Some(d.next_day()?.to_string())
+}
+
+/// The UTC days to fetch for these sessions. A day is a UTC day (as Databento's
+/// files are), so a session whose extended hours (until four hours after its
+/// close) run past midnight UTC spills into the next UTC date: under EST, a
+/// full day's 19:00–20:00 New York is 00:00–01:00 UTC the next day. When that
+/// next date is a session itself, it is fetched anyway; when it isn't (after a
+/// Friday, before a holiday), it is fetched too, as a day of its own, or that
+/// hour would never be. `sessions` must reach the day after `through`, so
+/// whether that day is a session is known.
+fn days_to_fetch(sessions: &[(String, String)], start: &str, through: &str, last: &str) -> Vec<String> {
+    let is_session: HashSet<&str> = sessions.iter().map(|(d, _)| d.as_str()).collect();
+    let mut days: Vec<String> = Vec::new();
+    for (day, close) in sessions.iter().filter(|(d, _)| d.as_str() >= start && d.as_str() <= through) {
+        days.push(day.clone());
+        let Some(next) = date_after(day) else { continue };
+        if is_session.contains(next.as_str()) || next.as_str() > last {
+            continue;
+        }
+        let (Some(end_hm), Ok(y), Ok(m), Ok(d)) = (
+            close.split_once(':').and_then(|(h, m)| Some(h.parse::<i64>().ok()? * 60 + m.parse::<i64>().ok()? + 4 * 60)),
+            day[..4].parse::<i64>(),
+            day[5..7].parse::<i64>(),
+            day[8..10].parse::<i64>(),
+        ) else {
+            continue;
+        };
+        let ends = tinytrader_schedule::ny_to_unix(y, m, d, end_hm / 60, end_hm % 60);
+        let midnight = fetch::day_ns(&next).map_or(i64::MAX, |n| (n / 1_000_000_000) as i64);
+        if ends > midnight {
+            days.push(next);
+        }
+    }
+    days.sort();
+    days.dedup();
+    days
 }
 
 /// Batches the store holds for Alpaca.
@@ -455,11 +504,16 @@ async fn plan_of(
     symbols: &[String],
     newest_first: bool,
 ) -> Result<(Vec<String>, Vec<(String, String)>), String> {
-    let through = run_through.to_owned().min(last_complete_day());
+    let last = last_complete_day();
+    let through = run_through.to_owned().min(last.clone());
     let days = if run_start > through.as_str() {
         Vec::new()
     } else {
-        sessions(a, run_start, &through).await?
+        // One day past `through`, to know whether the day after the last session
+        // is a session (see `days_to_fetch`).
+        let after = date_after(&through).unwrap_or_else(|| through.clone());
+        let s = sessions(a, run_start, &after).await?;
+        days_to_fetch(&s, run_start, &through, &last)
     };
     let mut plan: Vec<(String, String)> = Vec::new();
     for d in &days {
@@ -1652,6 +1706,83 @@ mod tests {
             ..ask(&["SPY"], DAY, DAY)
         };
         assert!(queue(&a, bad, "request").unwrap_err().contains("origin"));
+    }
+
+    fn sess(days: &[(&str, &str)]) -> Vec<(String, String)> {
+        days.iter().map(|(d, c)| ((*d).to_owned(), (*c).to_owned())).collect()
+    }
+
+    /// A winter Friday's 19:00–20:00 New York is 00:00–01:00 UTC on Saturday:
+    /// that UTC date is fetched too, as a day of its own (P0, 2026-11-10). Before
+    /// a holiday likewise. Not in summer (20:00 EDT is midnight UTC), nor after an
+    /// early close (its extended hours end at 17:00), nor past the last complete
+    /// UTC day.
+    #[test]
+    fn a_session_spilling_past_midnight_utc_fetches_the_next_date() {
+        let week = sess(&[
+            ("2026-01-05", "16:00"),
+            ("2026-01-06", "16:00"),
+            ("2026-01-07", "16:00"),
+            ("2026-01-08", "16:00"),
+            ("2026-01-09", "16:00"),
+            ("2026-01-12", "16:00"),
+        ]);
+        assert_eq!(
+            days_to_fetch(&week, "2026-01-05", "2026-01-09", "2026-01-12"),
+            ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09", "2026-01-10"]
+        );
+        // Not past the last complete UTC day.
+        assert_eq!(
+            days_to_fetch(&week, "2026-01-09", "2026-01-09", "2026-01-09"),
+            ["2026-01-09"]
+        );
+        // A full day before New Year's Day: its tail is 1 January.
+        assert_eq!(
+            days_to_fetch(
+                &sess(&[("2026-12-31", "16:00"), ("2027-01-04", "16:00")]),
+                "2026-12-31",
+                "2026-12-31",
+                "2027-01-04"
+            ),
+            ["2026-12-31", "2027-01-01"]
+        );
+        // Summer: 20:00 EDT is 00:00 UTC, nothing spills.
+        assert_eq!(
+            days_to_fetch(&sess(&[("2026-07-10", "16:00")]), "2026-07-10", "2026-07-10", "2026-07-13"),
+            ["2026-07-10"]
+        );
+        // An early close (13:00): extended hours end at 17:00 EST, 22:00 UTC.
+        assert_eq!(
+            days_to_fetch(&sess(&[("2026-11-27", "13:00")]), "2026-11-27", "2026-11-27", "2026-11-30"),
+            ["2026-11-27"]
+        );
+    }
+
+    /// A run over a winter week files the Saturday UTC day that holds Friday's
+    /// last after-hours hour, beside the five sessions.
+    #[tokio::test]
+    async fn a_winter_week_files_fridays_last_hour() {
+        let (f, s) = (
+            FakeAlpaca::start(SMALL, SMALL).await,
+            FakeStore::start().await,
+        );
+        f.sessions(&[
+            "2026-01-05",
+            "2026-01-06",
+            "2026-01-07",
+            "2026-01-08",
+            "2026-01-09",
+            "2026-01-12",
+        ]);
+        let a = app_for(&f, &s, "winter-week", &[]);
+        let id = queue(&a, ask(&["SPY"], "2026-01-05", "2026-01-09"), "request")
+            .unwrap()
+            .id;
+        work(&a, &id).await;
+        let r = run_of(&a, &id);
+        assert_eq!(r.planned, 6, "{r:?}");
+        assert_eq!(r.days["SPY 2026-01-10"].state, "committed", "{r:?}");
+        assert!(!r.days.contains_key("SPY 2026-01-12"), "not past the run");
     }
 
     /// Runs queued in the same millisecond get their own ids.
