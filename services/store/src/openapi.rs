@@ -44,6 +44,20 @@ struct Root {
     ignored: Option<Vec<Value>>,
     /// For a volume that isn't there: what it held when last read in full.
     held: Option<Value>,
+    /// For a volume in the content-addressed format (decision 0035): its
+    /// format, its id, and how many names, pending objects and conflicts
+    /// its index holds.
+    cas: Option<Cas>,
+}
+
+/// A content-addressed volume's index, in brief.
+#[derive(JsonSchema)]
+struct Cas {
+    format: String,
+    volume: String,
+    names: u64,
+    pending: u64,
+    conflicts: Vec<String>,
 }
 
 #[derive(JsonSchema)]

@@ -220,11 +220,18 @@ pub fn apply(
                         dataset: d,
                         dir,
                         days: filed,
+                        cas,
                         ..
                     } = place
                     else {
                         continue;
                     };
+                    // A content-addressed volume's days take conditions once
+                    // filing goes through its index (0035 step 3); until
+                    // then nothing is written beside them.
+                    if *cas {
+                        continue;
+                    }
                     if crate::partial::ours(p.as_deref(), provider)
                         && d.eq_ignore_ascii_case(dataset)
                         && filed.iter().any(|(f, _, file)| f == day && *file)
