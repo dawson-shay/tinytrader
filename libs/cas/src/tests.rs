@@ -286,3 +286,159 @@ fn one_writer_at_a_time_and_no_check_while_it_writes() {
     let _r = v.lock_reader().unwrap();
     assert!(v.lock_writer().is_err(), "no writing while checked");
 }
+
+/// Review C3: a missing object isn't hidden by another of the same hash with
+/// another extension (every empty file has one hash).
+#[test]
+fn a_missing_object_is_found_whatever_else_shares_its_hash() {
+    let d = scratch("c3");
+    let v = Volume::init(&d, "vol-a").unwrap();
+    let a = v.put(&b""[..], "json", None).unwrap();
+    let b = v.put(&b""[..], "bin", None).unwrap();
+    let mut log = v.log().unwrap();
+    for (name, o, ext) in [("a.json", &a, "json"), ("b", &b, "bin")] {
+        log.append(&Event::Bind {
+            name: name.into(),
+            version: 1,
+            sha256: o.sha256.clone(),
+            size: 0,
+            ext: ext.into(),
+            kind: "other".into(),
+            source: "t".into(),
+            previous: None,
+            writer: "t".into(),
+            at: 1,
+        })
+        .unwrap();
+    }
+    assert!(v.verify(true).unwrap().sound());
+    let mut p = fs::metadata(&b.path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    p.set_readonly(false);
+    fs::set_permissions(&b.path, p).unwrap();
+    fs::remove_file(&b.path).unwrap();
+    let r = v.verify(true).unwrap();
+    assert!(!r.sound());
+    assert!(r.missing[0].starts_with("b: "), "{r:?}");
+}
+
+/// Review H3: a line cut short before the last is damage unless the next
+/// writer noted it (a crash's remnant); either way it's listed.
+#[test]
+fn a_torn_line_mid_log_is_reported_with_its_offset() {
+    let d = scratch("h3");
+    let v = Volume::init(&d, "vol-a").unwrap();
+    let one = v.put(&b"a"[..], "dbn.zst", None).unwrap();
+    v.log()
+        .unwrap()
+        .append(&bind("one", 1, &one, None))
+        .unwrap();
+    let len = fs::metadata(v.log_path()).unwrap().len();
+    // A crash mid-append, then the next writer: noted, tolerated, listed.
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(v.log_path())
+        .unwrap();
+    f.write_all(br#"{"event":"bind","name":"two","vers"#)
+        .unwrap();
+    drop(f);
+    let two = v.put(&b"b"[..], "dbn.zst", None).unwrap();
+    v.log()
+        .unwrap()
+        .append(&bind("three", 1, &two, None))
+        .unwrap();
+    let r = v.verify(true).unwrap();
+    assert!(r.sound(), "{r:?}");
+    assert_eq!(
+        r.torn_lines,
+        [format!(
+            r#"byte {len}: {{"event":"bind","name":"two","vers"#
+        )]
+    );
+    // A line cut short by anything else (written, not a crash): damage.
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(v.log_path())
+        .unwrap();
+    let at = fs::metadata(v.log_path()).unwrap().len();
+    f.write_all(b"{\"event\":\"bind\",\"na\n").unwrap();
+    drop(f);
+    v.log()
+        .unwrap()
+        .append(&bind("four", 1, &two, None))
+        .unwrap();
+    let r = v.verify(true).unwrap();
+    assert!(!r.sound());
+    assert!(r.log_damage[0].starts_with(&format!("byte {at}:")), "{r:?}");
+}
+
+/// Review H4: a snapshot edited (or damaged) is never believed: its checksum
+/// fails, the index replays the log, and verify reports it.
+#[test]
+fn an_edited_snapshot_is_ignored_and_reported() {
+    let d = scratch("h4");
+    let v = Volume::init(&d, "vol-a").unwrap();
+    let a = v.put(&b"day a"[..], "dbn.zst", None).unwrap();
+    let b = v.put(&b"day b"[..], "dbn.zst", None).unwrap();
+    let mut log = v.log().unwrap();
+    log.append(&bind("10-02", 1, &a, None)).unwrap();
+    log.append(&bind("10-03", 1, &b, None)).unwrap();
+    v.snapshot().unwrap();
+    assert!(v.verify(false).unwrap().sound());
+    // Swap the two names' hashes in the snapshot.
+    let path = d.join("cas/index/snapshot.json");
+    let text = fs::read_to_string(&path).unwrap();
+    let swapped = text
+        .replace(&a.sha256, "TMP")
+        .replace(&b.sha256, &a.sha256)
+        .replace("TMP", &b.sha256);
+    fs::write(&path, &swapped).unwrap();
+    assert_eq!(
+        v.index().unwrap().names["10-03"].sha256,
+        b.sha256,
+        "the log, not the snapshot"
+    );
+    let r = v.verify(false).unwrap();
+    assert!(!r.sound() && r.snapshot[0].contains("checksum"), "{r:?}");
+    // Rewritten with a matching checksum but unlike the log: still caught.
+    let doc: serde_json::Value = serde_json::from_str(&swapped).unwrap();
+    let idx: Index = serde_json::from_value(doc["index"].clone()).unwrap();
+    let body = serde_json::to_vec(&idx).unwrap();
+    let forged = json!({ "index": idx, "sha256": sha(&body) });
+    fs::write(&path, forged.to_string()).unwrap();
+    let r = v.verify(false).unwrap();
+    assert!(
+        !r.sound() && r.snapshot[0].contains("doesn't match the log"),
+        "{r:?}"
+    );
+}
+
+/// Review M1 and M4: unbound objects are hashed too; a damaged object held
+/// isn't accepted as a copy of these bytes.
+#[test]
+fn unbound_objects_are_hashed_and_damage_is_never_reused() {
+    let d = scratch("m1");
+    let v = Volume::init(&d, "vol-a").unwrap();
+    let o = v.put(&b"pending bytes"[..], "dbn.zst", None).unwrap();
+    v.log()
+        .unwrap()
+        .append(&Event::Pending {
+            sha256: o.sha256.clone(),
+            ext: "dbn.zst".into(),
+            for_: "t".into(),
+            writer: "t".into(),
+            at: 1,
+        })
+        .unwrap();
+    let mut p = fs::metadata(&o.path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    p.set_readonly(false);
+    fs::set_permissions(&o.path, p).unwrap();
+    fs::write(&o.path, b"pending bytez").unwrap();
+    assert!(
+        !v.verify(true).unwrap().sound(),
+        "the pending object is hashed"
+    );
+    let e = v.put(&b"pending bytes"[..], "dbn.zst", None).unwrap_err();
+    assert!(e.contains("damaged"), "{e}");
+}

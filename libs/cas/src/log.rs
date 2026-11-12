@@ -50,6 +50,15 @@ pub enum Event {
         writer: String,
         at: u64,
     },
+    /// The line at byte `offset` was cut short (a crash mid-append) and
+    /// ended by the next writer: the event it held never completed, so what
+    /// it recorded wasn't reported done.
+    TornNoted {
+        offset: u64,
+        text: String,
+        writer: String,
+        at: u64,
+    },
 }
 
 /// A log open for appending.
@@ -95,6 +104,16 @@ impl Log {
             std::io::Write::write_all(&mut self.file, b"\n")
                 .and_then(|()| self.file.sync_data())
                 .map_err(|e| format!("{}: {e}", self.path.display()))?;
+            // Said, so a check can tell this crash's remnant from damage.
+            let offset = text.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            self.append(&Event::TornNoted {
+                offset: offset as u64,
+                text: String::from_utf8_lossy(&text[offset..]).into_owned(),
+                writer: concat!("tinytrader-cas ", env!("CARGO_PKG_VERSION")).into(),
+                at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_secs()),
+            })?;
         }
         Ok(())
     }
@@ -114,6 +133,10 @@ impl Log {
 #[derive(Debug, Default)]
 pub struct Replay {
     pub events: Vec<Event>,
+    /// Where each event's line ends (the byte after its newline).
+    pub ends: Vec<u64>,
+    /// Lines cut short before the last, with their offsets.
+    pub torn_lines: Vec<(u64, String)>,
     /// The byte length read up to (the end of the last whole line).
     pub end: u64,
     /// A torn last line, if there was one.
@@ -150,11 +173,19 @@ pub fn replay(path: &Path, from: u64) -> Result<Replay, String> {
         let line = &text[at..at + nl];
         let next = at + nl + 1;
         match serde_json::from_slice::<Event>(line) {
-            Ok(e) => r.events.push(e),
-            // A torn line that a later append ended (Log::heal): it isn't
-            // JSON at all, and was cut, not written wrong.
+            Ok(e) => {
+                r.events.push(e);
+                r.ends.push(next as u64);
+            }
+            // A line cut short (not JSON at all, begun and never closed):
+            // kept with its offset for the check to judge, never dropped
+            // unseen.
             Err(_)
-                if serde_json::from_slice::<serde_json::Value>(line).is_err() && is_cut(line) => {}
+                if serde_json::from_slice::<serde_json::Value>(line).is_err() && is_cut(line) =>
+            {
+                r.torn_lines
+                    .push((at as u64, String::from_utf8_lossy(line).into_owned()));
+            }
             Err(e) => {
                 return Err(format!(
                     "{}: byte {at}: not a bindings event ({e}): {}",

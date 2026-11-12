@@ -3,8 +3,16 @@
 //! disk alone, with nothing else running against them. It writes nothing.
 //!
 //! ```text
-//! tt-fsck [--quick] [--json] [--min-copies N] PATH...
+//! tt-fsck [--quick] [--json] [--min-copies N] [--against NAME=PATH]... PATH...
 //! ```
+//!
+//! With `--against NAME=PATH` (a source a volume was migrated from, by the
+//! name it was given to `store migrate-cas`), the source is walked again,
+//! read-only, and every file's path, size and SHA-256 must be bound on some
+//! volume given, or kept there as pending (a conflict for an operator):
+//! the check that gates deleting or reusing a source drive. A source with
+//! no files (not mounted) is refused. Each volume's migration receipts must
+//! end clean, too.
 //!
 //! For each volume (S1, S2): every name's object is there at its size and,
 //! unless `--quick`, its hash; every object is named, pending or an earlier
@@ -23,6 +31,7 @@ use serde_json::{Value, json};
 use tinytrader_cas::{Volume, merge};
 
 struct Args {
+    against: Vec<(String, PathBuf)>,
     quick: bool,
     json: bool,
     min_copies: usize,
@@ -31,6 +40,7 @@ struct Args {
 
 fn args(argv: &[String]) -> Result<Args, String> {
     let mut a = Args {
+        against: Vec::new(),
         quick: false,
         json: false,
         min_copies: 2,
@@ -46,6 +56,14 @@ fn args(argv: &[String]) -> Result<Args, String> {
                     .next()
                     .and_then(|n| n.parse().ok())
                     .ok_or("--min-copies takes a number")?;
+            }
+            "--against" => {
+                let v = it.next().ok_or("--against takes NAME=PATH")?;
+                let (n, p) = v
+                    .split_once('=')
+                    .filter(|(n, p)| !n.is_empty() && !p.is_empty())
+                    .ok_or_else(|| format!("{v}: give a source as NAME=PATH"))?;
+                a.against.push((n.to_owned(), PathBuf::from(p)));
             }
             "-h" | "--help" => return Err(String::new()),
             s if s.starts_with('-') => return Err(format!("unknown option {s}")),
@@ -105,13 +123,104 @@ fn check(a: &Args) -> (Value, i32) {
         for c in &report.conflicts {
             f("S2", &v.id, format!("conflict: {c}"));
         }
+        for l in &report.log_damage {
+            f(
+                "S2",
+                &v.id,
+                format!("log line cut short and never noted (damage): {l}"),
+            );
+        }
+        for s in &report.snapshot {
+            f("S2", &v.id, s.clone());
+        }
+        // Each migration into it must have ended clean (review C2).
+        match v.receipts() {
+            Ok(rs) => {
+                for (src, r) in &rs {
+                    let last = r["runs"].as_array().and_then(|a| a.last());
+                    if last.is_none_or(|l| l["ok"] != true) {
+                        f(
+                            "S6",
+                            &v.id,
+                            format!(
+                                "migration from {src} didn't end clean ({} conflicts, {} damaged, errors {}): see its report",
+                                last.map_or(json!("?"), |l| l["conflicts"].clone()),
+                                last.map_or(json!("?"), |l| l["damaged"].clone()),
+                                last.map_or(json!("?"), |l| l["errors"].clone())
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => f(
+                "S6",
+                &v.id,
+                format!("its migration receipts can't be read: {e}"),
+            ),
+        }
         volumes.push(json!({
             "volume": v.id, "path": p, "names": report.names, "objects": report.objects,
             "unreferenced": report.unreferenced, "pending": index.pending.len(),
-            "torn_last_line": report.torn_last_line, "hashed": !a.quick,
+            "torn_last_line": report.torn_last_line, "torn_lines": report.torn_lines, "hashed": !a.quick,
         }));
         indexes.push((v.id.clone(), index));
         drop(held);
+    }
+    // Each source, walked again and hashed: every file must be held.
+    let mut against = Vec::new();
+    for (src, root) in &a.against {
+        let w = tinytrader_cas::tree::walk(root);
+        if !root.is_dir() || w.files.is_empty() {
+            unreadable.push(format!(
+                "source {src}: {} holds no files; is the drive mounted?",
+                root.display()
+            ));
+            continue;
+        }
+        for e in &w.errors {
+            f("S6", src, format!("source unreadable: {e}"));
+        }
+        let (mut held, mut pending) = (0u64, 0u64);
+        for file in &w.files {
+            let sha = match tinytrader_cas::hash_file(&file.path) {
+                Ok(h) => h,
+                Err(e) => {
+                    f("S6", src, format!("source unreadable: {e}"));
+                    continue;
+                }
+            };
+            let bound = indexes.iter().any(|(_, i)| {
+                i.names
+                    .get(&file.rel)
+                    .is_some_and(|e| e.sha256 == sha && e.size == file.size)
+            });
+            if bound {
+                held += 1;
+            } else if indexes.iter().any(|(_, i)| i.pending.contains_key(&sha)) {
+                pending += 1;
+                f(
+                    "S6",
+                    src,
+                    format!(
+                        "{} ({} bytes, {sha}): kept as pending, not bound: an operator's choice",
+                        file.rel, file.size
+                    ),
+                );
+            } else {
+                f(
+                    "S6",
+                    src,
+                    format!(
+                        "{} ({} bytes, {sha}): not held on any volume given",
+                        file.rel, file.size
+                    ),
+                );
+            }
+        }
+        against.push(json!({
+            "source": src, "path": root, "files": w.files.len(), "bound": held,
+            "pending": pending, "os_files_skipped": w.skipped.len(),
+        }));
     }
     let (merged, conflicts) = merge(&indexes);
     for c in conflicts {
@@ -141,6 +250,7 @@ fn check(a: &Args) -> (Value, i32) {
     };
     let report = json!({
         "contract": tinytrader_cas::FORMAT,
+        "against": against,
         "volumes": volumes,
         "names": merged.len(),
         "under_copies": under,
@@ -160,7 +270,9 @@ fn main() {
             if !e.is_empty() {
                 eprintln!("tt-fsck: {e}");
             }
-            eprintln!("usage: tt-fsck [--quick] [--json] [--min-copies N] PATH...");
+            eprintln!(
+                "usage: tt-fsck [--quick] [--json] [--min-copies N] [--against NAME=PATH]... PATH..."
+            );
             std::process::exit(if e.is_empty() { 0 } else { 2 });
         }
     };
@@ -171,6 +283,18 @@ fn main() {
             serde_json::to_string_pretty(&report).unwrap_or_default()
         );
     } else {
+        if a.quick {
+            println!("QUICK CHECK: sizes only, nothing hashed; not a gate for deleting anything");
+        }
+        for s in report["against"].as_array().into_iter().flatten() {
+            println!(
+                "source {}: {} files, {} bound, {} pending",
+                s["source"].as_str().unwrap_or_default(),
+                s["files"],
+                s["bound"],
+                s["pending"]
+            );
+        }
         for v in report["volumes"].as_array().into_iter().flatten() {
             println!(
                 "volume {}: {} names, {} objects{}",
@@ -243,6 +367,7 @@ mod tests {
 
     fn run(paths: &[&std::path::Path], min: usize) -> (Value, i32) {
         check(&Args {
+            against: Vec::new(),
             quick: false,
             json: true,
             min_copies: min,
@@ -312,6 +437,56 @@ mod tests {
                 .as_str()
                 .unwrap()
                 .starts_with("damaged"),
+            "{r}"
+        );
+    }
+
+    /// Review C2: a source checked against the volumes it went to: every
+    /// file held passes; one changed since, or never copied, doesn't; an
+    /// unmounted (empty) source is refused, never clean.
+    #[test]
+    fn a_source_is_checked_file_by_file() {
+        let d = scratch("against");
+        let (src, a) = (d.join("src"), d.join("a"));
+        std::fs::create_dir_all(src.join("x")).unwrap();
+        std::fs::write(src.join("x/one"), b"1").unwrap();
+        volume(&a, "a", &[("x/one", b"1")]);
+        let against = |root: &std::path::Path| {
+            check(&Args {
+                against: vec![("data".into(), root.to_path_buf())],
+                quick: false,
+                json: true,
+                min_copies: 1,
+                paths: vec![a.clone()],
+            })
+        };
+        let (r, status) = against(&src);
+        assert_eq!(status, 0, "{r}");
+        assert_eq!(r["against"][0]["bound"], 1);
+        std::fs::write(src.join("x/two"), b"2").unwrap();
+        let (r, status) = against(&src);
+        assert_eq!(status, 1);
+        assert!(r["findings"].to_string().contains("x/two (1 bytes"), "{r}");
+        std::fs::write(src.join("x/two"), b"").unwrap();
+        std::fs::remove_file(src.join("x/two")).unwrap();
+        std::fs::write(src.join("x/one"), b"9").unwrap();
+        assert_eq!(against(&src).1, 1, "same size, other bytes");
+        let empty = d.join("mnt-empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(against(&empty).1, 2, "an empty source is refused");
+    }
+
+    /// A migration that didn't end clean leaves the volume unsound.
+    #[test]
+    fn an_unclean_migration_receipt_is_a_finding() {
+        let d = scratch("receipt");
+        let a = d.join("a");
+        let v = volume(&a, "a", &[("one", b"1")]);
+        v.write_receipt("tt03", &json!({ "runs": [{ "ok": false, "conflicts": 1, "damaged": 0, "errors": [] }], "files": {} })).unwrap();
+        let (r, status) = run(&[&a], 1);
+        assert_eq!(status, 1);
+        assert!(
+            r["findings"].to_string().contains("migration from tt03"),
             "{r}"
         );
     }

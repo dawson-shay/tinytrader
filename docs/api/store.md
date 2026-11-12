@@ -667,19 +667,30 @@ store migrate-cas --to /tank/nas-1 --id nas-1 --from data=/mnt/data --from tt03=
   - only the operating system's own files are skipped, and counted. Links
     and special files are listed as errors.
 - **Sources are only read.** Mount them read-only.
-- **Checked against what was recorded:** a file the store recorded a hash
-  for (in its manifest, a filing ledger or a batch receipt, as for `/files`)
-  must match what's read. One that doesn't is listed under `damaged` and
-  isn't bound.
+- **Checked against what was recorded:**
+  - a file the store recorded a hash for (in its manifest, a filing ledger
+    or a batch receipt, as for `/files`) must match what's read;
+  - ledgers are matched from the provider's folder on, so a ledger written
+    under `/Volumes/Data/...` counts when the drive is read at `/mnt/data`;
+  - a file that doesn't match, whose records disagree, or whose size isn't
+    its manifest's is listed under `damaged`. Its bytes are **kept as a
+    pending object** (they may be the only copy), and it isn't bound.
 - **Duplicates and conflicts:**
   - the same name on several sources with one content is one object and
     one binding;
   - different contents are a **conflict**: each content is kept as a
     pending object, none is bound, and the conflict is listed for an
     operator.
-- **Resumable:** a name already bound at the source file's size (and its
-  recorded hash, if any) isn't read again. Run it again after an
-  interruption.
+- **Resumable:**
+  - each source gets a receipt in the destination
+    (`cas/sources/<NAME>.json`), recording every file read (its size,
+    modification time, SHA-256 and outcome) and how each run ended;
+  - a file is skipped on a later run only when that same source path, at
+    the same size and time, was hashed into an object still held;
+  - anything else is read and hashed again. Another source's file of the
+    same name and size with other bytes is a conflict, kept, never skipped.
+- **An empty source is refused** (exit 2): a drive that isn't mounted
+  shows as an empty folder, never as nothing to copy.
 - **The report:** a JSON report goes to standard output, with:
   - counts by kind, and what's to copy;
   - what's already there, and what's bound;

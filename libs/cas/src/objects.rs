@@ -16,11 +16,11 @@ pub struct ObjectRef {
     pub existed: bool,
 }
 
-fn is_hash(s: &str) -> bool {
+pub(crate) fn is_hash(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-fn is_ext(s: &str) -> bool {
+pub(crate) fn is_ext(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('.')
         && !s.ends_with('.')
@@ -63,6 +63,11 @@ pub(crate) fn hash_file(path: &Path) -> Result<String, String> {
     let mut h = Sha256::new();
     std::io::copy(&mut f, &mut h).map_err(|e| format!("{}: {e}", path.display()))?;
     Ok(hex(&h.finalize()))
+}
+
+/// The SHA-256 of `bytes`, as lowercase hex.
+pub(crate) fn hex_of(bytes: &[u8]) -> String {
+    hex(&Sha256::digest(bytes))
 }
 
 fn hex(b: &[u8]) -> String {
@@ -128,12 +133,24 @@ pub(crate) fn put(
     let path = object_path(dir, &sha256, ext);
     if let Ok(m) = fs::metadata(&path) {
         let _ = fs::remove_file(&tmp);
-        if m.len() != size {
+        // Accepted only once its bytes are checked (a size alone isn't the
+        // content), and flushed again, in case it's there from a write a
+        // crash cut short of its folder's flush.
+        let held = if m.len() == size {
+            hash_file(&path)?
+        } else {
+            String::new()
+        };
+        if held != sha256 {
             return Err(format!(
-                "{} is held at {} bytes, but these {size} bytes have its hash",
+                "{} is held, but damaged ({} bytes, SHA-256 {}); these {size} bytes are its content: repair it from a good copy",
                 path.display(),
-                m.len()
+                m.len(),
+                if held.is_empty() { "not read" } else { &held }
             ));
+        }
+        if let Some(parent) = path.parent() {
+            sync_dir(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
         }
         return Ok(ObjectRef {
             sha256,
@@ -171,6 +188,8 @@ pub(crate) fn put(
 /// An object found on disk.
 pub(crate) struct Held {
     pub sha256: String,
+    /// Its extension (what follows `<sha256>.`).
+    pub ext: String,
     pub size: u64,
     pub path: PathBuf,
     /// Its name is a hash, in the folders its hash names.
@@ -192,6 +211,7 @@ pub(crate) fn list(dir: &Path) -> std::io::Result<Vec<Held>> {
         out.push(Held {
             size: fs::symlink_metadata(&path)?.len(),
             sha256: String::new(),
+            ext: String::new(),
             path,
             named_right: false,
         });
@@ -218,12 +238,17 @@ pub(crate) fn list(dir: &Path) -> std::io::Result<Vec<Held>> {
                 }
                 let name = f.file_name().to_string_lossy().into_owned();
                 let sha256 = name.split('.').next().unwrap_or_default().to_owned();
+                let ext = name
+                    .split_once('.')
+                    .map(|(_, e)| e.to_owned())
+                    .unwrap_or_default();
                 let named_right = is_hash(&sha256)
                     && name.len() > 65
                     && a.file_name().to_string_lossy() == sha256[..2]
                     && b.file_name().to_string_lossy() == sha256[2..4];
                 out.push(Held {
                     size: f.metadata()?.len(),
+                    ext,
                     sha256,
                     path,
                     named_right,
