@@ -53,10 +53,9 @@ pub fn list(
     json!({ "files": files, "truncated": truncated })
 }
 
-/// Served files under `dir`, as paths relative to `root`, with sizes. Links
-/// are not followed and hidden entries are skipped.
-/// Links are followed only when `follow` (a content-addressed volume's
-/// view, whose files are links to its objects).
+/// Served files under `dir`, as paths relative to `root`, with sizes.
+/// Hidden entries are skipped. Links are followed only when `follow` (a
+/// content-addressed volume's view, whose files are links to its objects).
 pub fn walk_with(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>, follow: bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
