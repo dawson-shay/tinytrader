@@ -1252,6 +1252,29 @@ mod tests {
         let s = incorporate(&parts, &[], "OPRA-S", "2026-10-06").unwrap();
         assert_eq!(s["files"].as_array().unwrap().len(), 2);
         assert_eq!(fs::read(a.join(DAY)).unwrap(), one_day);
+        // What filing recorded is what a read sends (ingress review (E)):
+        // the ledger's move, checked against the provider's receipt.
+        for (vol, file, sha) in [
+            (d.join("a"), a.join(DAY), &sha1),
+            (
+                d.join("b"),
+                b.join("OPRA.PILLAR/SPX.OPT/cmbp-1/2025-10-02.dbn.zst"),
+                &sha2,
+            ),
+        ] {
+            let len = fs::metadata(&file).unwrap().len();
+            let l = crate::recorded::ledgered(&vol, u64::MAX);
+            let got = l.get(file.strip_prefix(&vol).unwrap()).unwrap();
+            assert_eq!(
+                got.receipt.as_deref(),
+                Some(sha.as_str()),
+                "the receipt was found"
+            );
+            assert_eq!(
+                crate::recorded::of(&vol, &file, len, u64::MAX),
+                crate::recorded::Recorded::Known(sha.clone())
+            );
+        }
         assert_eq!(
             fs::read(b.join("OPRA.PILLAR/SPX.OPT/cmbp-1/2025-10-02.dbn.zst")).unwrap(),
             two_day

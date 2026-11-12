@@ -66,6 +66,7 @@ mod openapi;
 mod partial;
 mod read;
 mod rebuild;
+mod recorded;
 mod state;
 mod volumes;
 
@@ -151,6 +152,10 @@ struct Store {
     /// Rescans asked for (after a filing), and how many of them finished
     /// scans have covered: `/coverage` waits for those asked for.
     requested: AtomicU64,
+    /// Filings so far: what a read's recorded hash is looked up again after.
+    filed: AtomicU64,
+    /// Files whose recorded hashes disagree, reported once each.
+    hash_conflicts: Mutex<std::collections::HashSet<PathBuf>>,
     completed: AtomicU64,
     /// How long `/coverage` waits for a rescan asked for, and for one it
     /// asks for itself (`fresh`).
@@ -740,6 +745,7 @@ impl Store {
     /// filing, an import, a merge, a day's condition), in place: answers
     /// reflect it at once, without scanning every volume again.
     fn refresh(&self, dirs: &[PathBuf]) {
+        self.filed.fetch_add(1, Ordering::SeqCst);
         let volumes = self.volumes();
         let mut redo = lock(&self.refreshed);
         let mut catalog = lock(&self.catalog);
@@ -928,6 +934,8 @@ impl Store {
             index: Mutex::default(),
             refreshed: Mutex::default(),
             requested: AtomicU64::new(0),
+            filed: AtomicU64::new(0),
+            hash_conflicts: Mutex::default(),
             completed: AtomicU64::new(0),
             wait: Duration::from_secs(60),
             fresh_wait: Duration::from_secs(600),
@@ -1918,6 +1926,7 @@ async fn send_file(
         Err(e) => return refused(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
     let found_in = started.elapsed();
+    let vpath = volumes_of(&store, &name);
     let opened = tokio::fs::File::open(&file).await;
     let (f, len) = match opened {
         Ok(f) => match f.metadata().await {
@@ -1927,6 +1936,32 @@ async fn send_file(
             }
         },
         Err(e) => return refused(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    // The hash filing recorded for it, sent so the reader can check what it
+    // got (ingress review (E)); none when nothing recorded it, or when what
+    // recorded it disagrees (reported).
+    let sha256 = match vpath {
+        Some(vp) => {
+            let (f2, generation) = (file.clone(), store.filed.load(Ordering::SeqCst));
+            tokio::task::spawn_blocking(move || recorded::of(&vp, &f2, len, generation))
+                .await
+                .unwrap_or(recorded::Recorded::Unknown)
+        }
+        None => recorded::Recorded::Unknown,
+    };
+    let sha256 = match sha256 {
+        recorded::Recorded::Known(h) => Some(h),
+        recorded::Recorded::Unknown => None,
+        recorded::Recorded::Conflict(why) => {
+            if lock(&store.hash_conflicts).insert(file.clone()) {
+                eprintln!("store: {name}: its recorded hashes disagree ({why}); sent without one");
+                store.events.push(
+                    format!("{name}: its recorded hashes disagree"),
+                    json!({ "file": name, "why": why }).to_string(),
+                );
+            }
+            None
+        }
     };
     // Each download is logged once sent, with how long it took.
     let chunks = futures_util::stream::unfold((f, 0u64), move |(mut f, sent)| {
@@ -1957,7 +1992,7 @@ async fn send_file(
             }
         }
     });
-    (
+    let mut r = (
         [
             (
                 axum::http::header::CONTENT_TYPE,
@@ -1967,7 +2002,28 @@ async fn send_file(
         ],
         Body::from_stream(chunks),
     )
-        .into_response()
+        .into_response();
+    if let Some(h) = sha256
+        && let Ok(v) = axum::http::HeaderValue::from_str(&h)
+    {
+        if let Some(d) = recorded::hex_to_base64(&h)
+            .and_then(|b| axum::http::HeaderValue::from_str(&format!("sha-256={b}")).ok())
+        {
+            r.headers_mut().insert("digest", d);
+        }
+        r.headers_mut().insert("x-content-sha256", v);
+    }
+    r
+}
+
+/// The folder of the volume a `/files` name is on.
+fn volumes_of(store: &Store, name: &str) -> Option<PathBuf> {
+    let volume = name.split('/').next()?;
+    store
+        .volumes()
+        .into_iter()
+        .find(|v| v.name == volume)
+        .map(|v| v.path)
 }
 
 #[derive(Deserialize)]
@@ -2825,6 +2881,125 @@ mod tests {
         // The provider must be given.
         let (code, _) = get(&addr, &COVERAGE.replace("provider=databento&", "")).await;
         assert_eq!(code, 400);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A read sends the hash filing recorded for the file, when every
+    /// source that recorded it agrees; otherwise none, and a disagreement is
+    /// reported once (ingress review (E)).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_read_sends_the_recorded_hash() {
+        let dir = scratch("read-hash");
+        let vol = dir.join("v");
+        let p = vol.join("Databento");
+        let folder = p.join("OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::create_dir_all(p.join("migrations")).unwrap();
+        std::fs::create_dir_all(p.join("provenance/B")).unwrap();
+        let sha = |b: &[u8]| {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(b))
+        };
+        let mut ledger = String::new();
+        let mut receipt = Vec::new();
+        for (day, body) in [("2026-10-01", "agreed"), ("2026-10-03", "disagreed")] {
+            let f = folder.join(format!("{day}.dbn.zst"));
+            std::fs::write(&f, body).unwrap();
+            let from = format!(
+                "{}/.incoming/B/opra-pillar-{}.cbbo-1m.dbn.zst",
+                p.display(),
+                day.replace('-', "")
+            );
+            ledger += &format!(
+                "{}\n",
+                json!({ "step": "moved", "from": from, "to": f, "sha256": sha(body.as_bytes()) })
+            );
+            let r = if body == "agreed" {
+                sha(body.as_bytes())
+            } else {
+                sha(b"something else")
+            };
+            receipt.push(json!({ "filename": format!("opra-pillar-{}.cbbo-1m.dbn.zst", day.replace('-', "")), "hash": format!("sha256:{r}") }));
+        }
+        // A torn last line says nothing.
+        ledger += "{\"step\": \"moved\", \"to";
+        std::fs::write(
+            p.join("migrations/2026-10-06-incorporate-B.events.jsonl"),
+            ledger,
+        )
+        .unwrap();
+        std::fs::write(
+            p.join("provenance/B/manifest.json"),
+            json!({ "files": receipt }).to_string(),
+        )
+        .unwrap();
+        // Nothing recorded it.
+        std::fs::write(folder.join("2026-10-02.dbn.zst"), "unrecorded").unwrap();
+        // Recorded in its manifest only (a partial day), and one whose
+        // manifest records another size.
+        std::fs::write(folder.join("2026-10-04.dbn.zst"), "partial").unwrap();
+        std::fs::write(folder.join("2026-10-05.dbn.zst"), "resized").unwrap();
+        manifest::set_entry(&folder, "2026-10-04", Some(json!({ "file": "2026-10-04.dbn.zst", "size": 7, "sha256": sha(b"partial"), "coverage": {} }))).unwrap();
+        manifest::set_entry(&folder, "2026-10-05", Some(json!({ "file": "2026-10-05.dbn.zst", "size": 99, "sha256": sha(b"resized"), "coverage": {} }))).unwrap();
+        let s = store(&[("v", &vol)], &dir.join("state.json"));
+        scanned(&s).await;
+        let addr = serve_store(s.clone(), WriteToken::open()).await;
+        let head = |day: &'static str| {
+            let addr = addr.clone();
+            async move {
+                let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                let req = format!(
+                    "GET /files/v/Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/{day}.dbn.zst HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+                );
+                c.write_all(req.as_bytes()).await.unwrap();
+                let mut out = String::new();
+                c.read_to_string(&mut out).await.unwrap();
+                let headers = out.split_once("\r\n\r\n").unwrap().0.to_ascii_lowercase();
+                let find = |h: &str| {
+                    headers
+                        .lines()
+                        .find_map(|l| l.strip_prefix(&format!("{h}: ")).map(str::to_owned))
+                };
+                assert!(headers.starts_with("http/1.1 200"), "{headers}");
+                (find("x-content-sha256"), find("digest"))
+            }
+        };
+        let (h, d) = head("2026-10-01").await;
+        assert_eq!(h, Some(sha(b"agreed")));
+        assert_eq!(d.map(|d| d.starts_with("sha-256=")), Some(true));
+        assert_eq!(
+            head("2026-10-02").await,
+            (None, None),
+            "nothing recorded it"
+        );
+        assert_eq!(
+            head("2026-10-04").await.0,
+            Some(sha(b"partial")),
+            "from its manifest"
+        );
+        assert_eq!(
+            head("2026-10-05").await.0,
+            None,
+            "its manifest records another size"
+        );
+        assert_eq!(
+            head("2026-10-03").await.0,
+            None,
+            "ledger and receipt disagree"
+        );
+        head("2026-10-03").await;
+        let events = s.events.since(0, 100).to_string();
+        assert_eq!(
+            events
+                .matches("2026-10-03.dbn.zst: its recorded hashes disagree")
+                .count(),
+            1,
+            "{events}"
+        );
+        assert!(
+            events.contains("2026-10-05.dbn.zst: its recorded hashes disagree"),
+            "{events}"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

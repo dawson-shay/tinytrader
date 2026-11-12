@@ -399,6 +399,26 @@ there but can't be read now, `503`, so a client can ask again:
   found, and the volume hasn't been scanned yet (the store just started, or
   the drive just appeared).
 
+**Its hash, as filed:** `X-Content-SHA256: <hex>` and
+`Digest: sha-256=<base64>` give the SHA-256 the store recorded when it filed
+the file, so a reader checks what it got. The store never hashes on a read.
+The hash comes from every source that recorded it:
+
+- the day's manifest entry (partial days, and complete days that superseded
+  them; there, the size must match the file too);
+- the filing ledgers' `moved` and `swapped` steps
+  (`<provider>/migrations/*.events.jsonl`), which cover every day filed from
+  a batch;
+- the batch's receipt (the provider's own manifest, kept in
+  `<provider>/provenance/<batch>/`), for a day the ledger says came from a
+  batch file.
+
+If the sources disagree, the file is sent **without** a hash, and an event
+(`…: its recorded hashes disagree`) says once which sources said what. A
+file nothing recorded is sent without one too. Every file migrated into the
+content-addressed store (0035) will have one. `tinytrader-producer` checks it
+as it reads, and fails the read on a mismatch.
+
 Each file sent is logged on the store's standard error with its size and
 how long it took: `store: sent newdrive/…/2026-09-01.dbn.zst: 1234 bytes in
 0.012s (found in 0.001s)`.
