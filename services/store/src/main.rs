@@ -2954,17 +2954,26 @@ mod tests {
         let s = store(&[("v", &vol)], &dir.join("state.json"));
         scanned(&s).await;
         let (go, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        let (started_tx, started) = std::sync::mpsc::sync_channel::<()>(1);
         let s2 = s.clone();
         let caller = tokio::spawn(async move {
             s2.file_alone(Vec::new(), move || {
+                let _ = started_tx.send(());
                 let _ = wait.recv();
                 Ok(json!({}))
             })
             .await
         });
-        while !s.filer.busy() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Aborted once the write has started (the turn is granted a moment
+        // before it's handed to the write: an abort then drops it with
+        // nothing written, which is right, but isn't this test).
+        let s3 = s.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = started.recv_timeout(Duration::from_secs(10));
+            drop(s3);
+        })
+        .await
+        .unwrap();
         caller.abort();
         let next = tokio::time::timeout(Duration::from_millis(200), s.filer.turn()).await;
         assert!(next.is_err(), "the next turn waits for the write");

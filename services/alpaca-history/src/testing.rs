@@ -47,6 +47,8 @@ struct Inner {
     faults: HashMap<(String, usize), VecDeque<u16>>,
     /// (lane, page) never answered.
     hang: Option<(String, usize)>,
+    /// Requests for the hung page that arrived (and wait forever).
+    hung: usize,
     log: Vec<Seen>,
     sessions: Vec<String>,
 }
@@ -183,6 +185,11 @@ impl FakeAlpaca {
     pub fn log(&self) -> Vec<Seen> {
         self.inner.lock().unwrap().log.clone()
     }
+    /// Requests for the hung page so far: a client asking for it has
+    /// finished with every page before it.
+    pub fn hung(&self) -> usize {
+        self.inner.lock().unwrap().hung
+    }
     /// Times a page was served (200).
     pub fn served(&self, lane: &str, page: usize) -> usize {
         self.log()
@@ -234,6 +241,9 @@ async fn answer(
             .get_mut(&(lane.clone(), page))
             .and_then(VecDeque::pop_front);
         let hang = i.hang.as_ref() == Some(&(lane.clone(), page));
+        if hang {
+            i.hung += 1;
+        }
         (fault, hang, i.shapes.get(&lane).copied())
     };
     if hang {
