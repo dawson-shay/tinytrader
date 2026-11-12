@@ -178,7 +178,14 @@ This is not a recording of the stream: the relay still keeps nothing of what it 
 
 **The file** is `<RELAY_REPLAY_DIR>/<YYYY-MM-DD>/<dataset>-<roots>-<schema>-<start>.dbn.zst`: the date of `start` in New York, `<roots>` the parents without `.OPT` joined by `_`, `<start>` in Unix seconds, such as `2026-11-02/OPRA.PILLAR-SPY-cbbo-1m-1793629800.dbn.zst`.
 
-- DBN v3: the session's metadata, with the schema, `stype_in`, symbols (the parents) and start set to what was asked for (a live gateway's header leaves them out, and readers such as `DBNStore.to_df()` need them), then every record Databento sent except heartbeats, unchanged (symbol mappings, definitions where the schema carries them, and the `ReplayCompleted` system record, which ends a complete file).
+- DBN v3: the session's metadata, with `stype_in`, symbols (the parents) and start set to what was asked for (a live gateway's header leaves them out), then every record Databento sent except heartbeats, unchanged (symbol mappings, definitions where the schema carries them, and the `ReplayCompleted` system record, which ends a complete file).
+- **The header's schema is unset (mixed)**, as [decision 0022](../decisions/0022-sessions.md) section 4 has it for any stream of more than one kind of record: besides the schema's records, the file holds symbol mappings and system records. The schema asked for is in the file's name and its sidecar. Read it giving the schema, and each record's rtype says what it is:
+
+  ```python
+  df = databento.DBNStore.from_file(path).to_df(schema="cbbo-1m")
+  ```
+
+  `to_df()` without a schema refuses a mixed file rather than misread it. Files written before 2026-11-04 named the schema in their header, so `to_df()` read their mappings and system records as quotes and failed ("DBN file is truncated", then a field that won't decode). `replay-schema-none FILE…` (the relay's tool, `cargo run -p relay --bin replay-schema-none`) writes a corrected copy beside each, `….schema-none.dbn.zst`: the same records, its header mixed. It never writes the original, and refuses a copy that exists.
 - Zstandard, as independent checksummed frames of at most 4 MiB decoded that never split a record, so any zstd or DBN reader reads it and a partial file reads up to its last whole frame. Records go to disk as they arrive.
 - Written as `….dbn.zst.tmp` and renamed when the replay completes. A replay that ends otherwise (Databento closes the session, an error, the timeout) is kept as `….partial.dbn.zst`, the job `failed` with the reason in `error`. A complete replay of the same schema and start replaces the earlier file and removes its partial one.
 - Beside it, `<file>.json`:
