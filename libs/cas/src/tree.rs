@@ -13,6 +13,11 @@ pub struct Found {
     pub size: u64,
     /// Its modification time, in nanoseconds since 1970 (0 if unknown).
     pub mtime_ns: u128,
+    /// Its device, inode and change time (nanoseconds): what a rewrite
+    /// with its modification time put back, or a copy, doesn't keep.
+    pub dev: u64,
+    pub ino: u64,
+    pub ctime_ns: i128,
 }
 
 /// What a walk found.
@@ -22,25 +27,40 @@ pub struct Walk {
     pub files: Vec<Found>,
     /// What couldn't be read, and links and special files (never followed).
     pub errors: Vec<String>,
-    /// The operating system's own files and folders, skipped (listed).
+    /// The operating system's own folders at the root, skipped (each
+    /// listed, never silently).
     pub skipped: Vec<String>,
 }
 
-/// The operating system's own files and folders, never data.
+/// The operating system's own folders at a volume's root, never data: the
+/// only things a walk skips, and only at the root. Anything else, whatever
+/// its name (`.DS_Store`, `._x`, `lost+found`'s recovered files), is copied.
 #[must_use]
 pub fn os_own(name: &str) -> bool {
     matches!(
         name,
-        ".DS_Store"
-            | ".Spotlight-V100"
+        ".Spotlight-V100"
             | ".fseventsd"
             | ".Trashes"
             | ".TemporaryItems"
             | ".DocumentRevisions-V100"
-            | "lost+found"
             | "$RECYCLE.BIN"
             | "System Volume Information"
-    ) || name.starts_with("._")
+    )
+}
+
+/// What the volume at `root` is, so a receipt from one drive isn't
+/// believed for another mounted at the same place: the id in its
+/// `.tinytrader-volume-id` if it has one, else its device.
+#[must_use]
+pub fn identity(root: &Path) -> String {
+    use std::os::unix::fs::MetadataExt as _;
+    if let Ok(id) = std::fs::read_to_string(root.join(".tinytrader-volume-id"))
+        && !id.trim().is_empty()
+    {
+        return format!("id:{}", id.trim());
+    }
+    std::fs::metadata(root).map_or_else(|_| "unknown".into(), |m| format!("dev:{}", m.dev()))
 }
 
 /// Every regular file under `root`, skipping the OS's own and, at the top,
@@ -67,7 +87,7 @@ pub fn walk(root: &Path) -> Walk {
             };
             let name = e.file_name().to_string_lossy().into_owned();
             let path = e.path();
-            if os_own(&name) || (dir == root && name == crate::DIR) {
+            if dir == root && (os_own(&name) || name == crate::DIR) {
                 w.skipped.push(path.display().to_string());
                 continue;
             }
@@ -75,6 +95,11 @@ pub fn walk(root: &Path) -> Walk {
                 Ok(t) if t.is_dir() => stack.push(path),
                 Ok(t) if t.is_file() => match e.metadata() {
                     Ok(m) => w.files.push(Found {
+                        dev: std::os::unix::fs::MetadataExt::dev(&m),
+                        ino: std::os::unix::fs::MetadataExt::ino(&m),
+                        ctime_ns: i128::from(std::os::unix::fs::MetadataExt::ctime(&m))
+                            * 1_000_000_000
+                            + i128::from(std::os::unix::fs::MetadataExt::ctime_nsec(&m)),
                         rel: path
                             .strip_prefix(root)
                             .unwrap_or(&path)

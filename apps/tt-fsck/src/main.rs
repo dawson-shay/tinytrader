@@ -219,7 +219,7 @@ fn check(a: &Args) -> (Value, i32) {
         }
         against.push(json!({
             "source": src, "path": root, "files": w.files.len(), "bound": held,
-            "pending": pending, "os_files_skipped": w.skipped.len(),
+            "pending": pending, "skipped": w.skipped,
         }));
     }
     let (merged, conflicts) = merge(&indexes);
@@ -294,6 +294,13 @@ fn main() {
                 s["bound"],
                 s["pending"]
             );
+            for k in s["skipped"].as_array().into_iter().flatten() {
+                println!(
+                    "source {}: not checked, an OS folder at its root: {}",
+                    s["source"].as_str().unwrap_or_default(),
+                    k.as_str().unwrap_or_default()
+                );
+            }
         }
         for v in report["volumes"].as_array().into_iter().flatten() {
             println!(

@@ -179,7 +179,10 @@ fn verify_finds_what_is_missing_damaged_orphaned_or_misplaced() {
     log.append(&bind("a", 2, &one, Some(&old.sha256))).unwrap();
     log.append(&bind("b", 1, &two, None)).unwrap();
     log.append(&Event::Pending {
-        sha256: sha(b"never written"),
+        sha256: v
+            .put(&b"pending bytes"[..], "dbn.zst", None)
+            .unwrap()
+            .sha256,
         ext: "dbn.zst".into(),
         for_: "batch X".into(),
         writer: "t".into(),
@@ -190,7 +193,7 @@ fn verify_finds_what_is_missing_damaged_orphaned_or_misplaced() {
     assert!(r.sound(), "{r:?}");
     assert_eq!(
         (r.names, r.objects, r.unreferenced),
-        (2, 3, 1),
+        (2, 4, 1),
         "the old version is kept, unreferenced"
     );
     // An object nothing ever named; one damaged in place; one gone.
@@ -355,18 +358,24 @@ fn a_torn_line_mid_log_is_reported_with_its_offset() {
             r#"byte {len}: {{"event":"bind","name":"two","vers"#
         )]
     );
-    // A line cut short by anything else (written, not a crash): damage.
-    let mut f = fs::OpenOptions::new()
-        .append(true)
-        .open(v.log_path())
-        .unwrap();
-    let at = fs::metadata(v.log_path()).unwrap().len();
-    f.write_all(b"{\"event\":\"bind\",\"na\n").unwrap();
-    drop(f);
+    // A line cut short between two events (damage, not a crash: a crash
+    // leaves it last): never noted, reported.
     v.log()
         .unwrap()
         .append(&bind("four", 1, &two, None))
         .unwrap();
+    let text = fs::read(v.log_path()).unwrap();
+    let at = len as usize
+        + 1
+        + text[len as usize..]
+            .iter()
+            .position(|b| *b == b'\n')
+            .unwrap();
+    let mut damaged = text[..at].to_vec();
+    damaged.extend_from_slice(b"{\"event\":\"bind\",\"na\n");
+    damaged.extend_from_slice(&text[at..]);
+    fs::write(v.log_path(), damaged).unwrap();
+    let _ = v.log().unwrap();
     let r = v.verify(true).unwrap();
     assert!(!r.sound());
     assert!(r.log_damage[0].starts_with(&format!("byte {at}:")), "{r:?}");
@@ -441,4 +450,60 @@ fn unbound_objects_are_hashed_and_damage_is_never_reused() {
     );
     let e = v.put(&b"pending bytes"[..], "dbn.zst", None).unwrap_err();
     assert!(e.contains("damaged"), "{e}");
+}
+
+/// Re-review (4): every line is chained; an edited line (a date flipped
+/// inside a bind) fails the replay, so nothing is served or checked clean
+/// from it.
+#[test]
+fn an_edited_log_line_fails_its_checksum() {
+    let d = scratch("chain");
+    let v = Volume::init(&d, "vol-a").unwrap();
+    let a = v.put(&b"the second"[..], "dbn.zst", None).unwrap();
+    let b = v.put(&b"the third"[..], "dbn.zst", None).unwrap();
+    let mut log = v.log().unwrap();
+    log.append(&bind("2026-10-02.dbn.zst", 1, &a, None))
+        .unwrap();
+    log.append(&bind("2026-10-03.dbn.zst", 1, &b, None))
+        .unwrap();
+    assert!(v.verify(true).unwrap().sound());
+    let text = fs::read_to_string(v.log_path()).unwrap();
+    fs::write(v.log_path(), text.replacen("2026-10-02", "2026-10-04", 1)).unwrap();
+    assert!(v.index().unwrap_err().contains("fails its checksum"));
+    assert!(v.verify(true).unwrap_err().contains("fails its checksum"));
+    assert!(v.log().is_err(), "nothing is appended to an edited log");
+    // A line removed breaks the chain after it too.
+    let lines: Vec<&str> = text.lines().collect();
+    fs::write(v.log_path(), format!("{}\n", lines[1])).unwrap();
+    assert!(v.index().is_err());
+}
+
+/// Re-review (3): a pending object (the only copy of a conflict's other
+/// version) must be there.
+#[test]
+fn a_deleted_pending_object_is_missing() {
+    let d = scratch("pending-gone");
+    let v = Volume::init(&d, "vol-a").unwrap();
+    let o = v.put(&b"the other version"[..], "dbn.zst", None).unwrap();
+    v.log()
+        .unwrap()
+        .append(&Event::Pending {
+            sha256: o.sha256.clone(),
+            ext: "dbn.zst".into(),
+            for_: "conflict over x".into(),
+            writer: "t".into(),
+            at: 1,
+        })
+        .unwrap();
+    assert!(v.verify(true).unwrap().sound());
+    let mut p = fs::metadata(&o.path).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    p.set_readonly(false);
+    fs::set_permissions(&o.path, p).unwrap();
+    fs::remove_file(&o.path).unwrap();
+    let r = v.verify(true).unwrap();
+    assert!(
+        !r.sound() && r.missing[0].starts_with("pending object"),
+        "{r:?}"
+    );
 }
