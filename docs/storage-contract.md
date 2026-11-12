@@ -75,6 +75,17 @@ copy. Nothing counts as held without at least one verified copy.
 
 ## Checking
 
+```sh
+tt-fsck [--quick] [--json] [--min-copies N] PATH...
+```
+
+`tt-fsck` checks volumes from the disk alone, with nothing else writing
+them. It holds each volume's `cas/LOCK` shared, so it refuses a volume being
+written, and a writer (`store migrate-cas`) refuses one being checked. It
+writes nothing. Each finding is reported with its rule; `--quick` checks
+sizes and skips hashing. The exit status is `0` when sound, `1` with
+findings, and `2` when a volume can't be read or is being written.
+
 A volume is sound when:
 - every name's object is there, at its size and hash;
 - every object is named, pending, or named by an earlier version

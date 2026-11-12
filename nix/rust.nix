@@ -31,6 +31,7 @@
           ../docs/api/openapi # the committed documents the tests compare with
           ../apps/tui
           ../apps/tt
+          ../apps/tt-fsck
           ../services/ticker
           ../services/databento-jobs
           ../services/store
@@ -77,6 +78,7 @@
       databento-jobs = service "databento-jobs" "Databento batch jobs: price, submit, and download into the store";
       tinytrader-tui = service "tinytrader-tui" "Terminal view of a tinytrader deployment";
       tt = service "tt" "tinytrader from a terminal: purchases through the console (decision 0021)";
+      tt-fsck = service "tt-fsck" "check content-addressed volumes against the storage contract, from the disk alone (decision 0039)";
       store = service "store" "The data store: ingests provider downloads into the standard layout and catalogs the volumes";
       alpaca-news = service "alpaca-news" "Example service serving market news from Alpaca (Benzinga)";
       econ-calendar = service "econ-calendar" "Scheduled US economic releases and FOMC decisions";
@@ -96,6 +98,7 @@
           databento-jobs
           tinytrader-tui
           tt
+          tt-fsck
           store
           alpaca-news
           econ-calendar

@@ -2,6 +2,7 @@
 members = [
     "apps/tui",
     "apps/tt",
+    "apps/tt-fsck",
     "libs/fleet",
     "libs/observe",
     "services/alpaca-news",

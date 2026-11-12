@@ -380,6 +380,60 @@ impl Volume {
     }
 }
 
+/// A hold on a volume (`cas/LOCK`): one writer at a time, and no checker
+/// while it writes. Released when dropped.
+#[derive(Debug)]
+pub struct Lock {
+    _file: Option<fs::File>,
+}
+
+impl Volume {
+    /// Hold the volume for writing: refused while another writer or a
+    /// checker holds it.
+    ///
+    /// # Errors
+    /// If it's held, or the lock can't be made.
+    pub fn lock_writer(&self) -> Result<Lock, String> {
+        let path = self.dir().join("LOCK");
+        let f = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        match f.try_lock() {
+            Ok(()) => Ok(Lock { _file: Some(f) }),
+            Err(fs::TryLockError::WouldBlock) => Err(format!(
+                "volume {} is held by another program (a writer or a check); try when it's done",
+                self.id
+            )),
+            Err(fs::TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// Hold the volume for checking: refused while a writer holds it. A
+    /// volume mounted read-only without a lock file can't be written, so
+    /// it's held as it is.
+    ///
+    /// # Errors
+    /// If a writer holds it.
+    pub fn lock_reader(&self) -> Result<Lock, String> {
+        let path = self.dir().join("LOCK");
+        let Ok(f) = fs::File::open(&path) else {
+            return Ok(Lock { _file: None });
+        };
+        match f.try_lock_shared() {
+            Ok(()) => Ok(Lock { _file: Some(f) }),
+            Err(fs::TryLockError::WouldBlock) => Err(format!(
+                "volume {} is being written; check it when that's done",
+                self.id
+            )),
+            Err(fs::TryLockError::Error(e)) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+}
+
 /// What [`Volume::verify`] found.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Report {
