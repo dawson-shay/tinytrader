@@ -362,7 +362,11 @@ async fn sessions(a: &App, start: &str, through: &str) -> Result<Vec<(String, St
 
 /// The date after `day` (`YYYY-MM-DD`).
 fn date_after(day: &str) -> Option<String> {
-    let d = time::Date::parse(day, time::macros::format_description!("[year]-[month]-[day]")).ok()?;
+    let d = time::Date::parse(
+        day,
+        time::macros::format_description!("[year]-[month]-[day]"),
+    )
+    .ok()?;
     Some(d.next_day()?.to_string())
 }
 
@@ -374,17 +378,29 @@ fn date_after(day: &str) -> Option<String> {
 /// Friday, before a holiday), it is fetched too, as a day of its own, or that
 /// hour would never be. `sessions` must reach the day after `through`, so
 /// whether that day is a session is known.
-fn days_to_fetch(sessions: &[(String, String)], start: &str, through: &str, last: &str) -> Vec<String> {
+fn days_to_fetch(
+    sessions: &[(String, String)],
+    start: &str,
+    through: &str,
+    last: &str,
+) -> Vec<String> {
     let is_session: HashSet<&str> = sessions.iter().map(|(d, _)| d.as_str()).collect();
     let mut days: Vec<String> = Vec::new();
-    for (day, close) in sessions.iter().filter(|(d, _)| d.as_str() >= start && d.as_str() <= through) {
+    for (day, close) in sessions
+        .iter()
+        .filter(|(d, _)| d.as_str() >= start && d.as_str() <= through)
+    {
         days.push(day.clone());
-        let Some(next) = date_after(day) else { continue };
+        let Some(next) = date_after(day) else {
+            continue;
+        };
         if is_session.contains(next.as_str()) || next.as_str() > last {
             continue;
         }
         let (Some(end_hm), Ok(y), Ok(m), Ok(d)) = (
-            close.split_once(':').and_then(|(h, m)| Some(h.parse::<i64>().ok()? * 60 + m.parse::<i64>().ok()? + 4 * 60)),
+            close.split_once(':').and_then(|(h, m)| {
+                Some(h.parse::<i64>().ok()? * 60 + m.parse::<i64>().ok()? + 4 * 60)
+            }),
             day[..4].parse::<i64>(),
             day[5..7].parse::<i64>(),
             day[8..10].parse::<i64>(),
@@ -1709,7 +1725,9 @@ mod tests {
     }
 
     fn sess(days: &[(&str, &str)]) -> Vec<(String, String)> {
-        days.iter().map(|(d, c)| ((*d).to_owned(), (*c).to_owned())).collect()
+        days.iter()
+            .map(|(d, c)| ((*d).to_owned(), (*c).to_owned()))
+            .collect()
     }
 
     /// A winter Friday's 19:00–20:00 New York is 00:00–01:00 UTC on Saturday:
@@ -1729,7 +1747,14 @@ mod tests {
         ]);
         assert_eq!(
             days_to_fetch(&week, "2026-01-05", "2026-01-09", "2026-01-12"),
-            ["2026-01-05", "2026-01-06", "2026-01-07", "2026-01-08", "2026-01-09", "2026-01-10"]
+            [
+                "2026-01-05",
+                "2026-01-06",
+                "2026-01-07",
+                "2026-01-08",
+                "2026-01-09",
+                "2026-01-10"
+            ]
         );
         // Not past the last complete UTC day.
         assert_eq!(
@@ -1748,12 +1773,22 @@ mod tests {
         );
         // Summer: 20:00 EDT is 00:00 UTC, nothing spills.
         assert_eq!(
-            days_to_fetch(&sess(&[("2026-07-10", "16:00")]), "2026-07-10", "2026-07-10", "2026-07-13"),
+            days_to_fetch(
+                &sess(&[("2026-07-10", "16:00")]),
+                "2026-07-10",
+                "2026-07-10",
+                "2026-07-13"
+            ),
             ["2026-07-10"]
         );
         // An early close (13:00): extended hours end at 17:00 EST, 22:00 UTC.
         assert_eq!(
-            days_to_fetch(&sess(&[("2026-11-27", "13:00")]), "2026-11-27", "2026-11-27", "2026-11-30"),
+            days_to_fetch(
+                &sess(&[("2026-11-27", "13:00")]),
+                "2026-11-27",
+                "2026-11-27",
+                "2026-11-30"
+            ),
             ["2026-11-27"]
         );
     }
