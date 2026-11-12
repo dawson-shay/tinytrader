@@ -135,6 +135,11 @@ struct Store {
     limits: Thresholds,
     /// The last scan; null until the first is done.
     catalog: Mutex<Value>,
+    /// What writes are checked against (P0, 2026-11-10): from the last scan,
+    /// kept apart from the catalog so a write never waits on it (a filing
+    /// holds the catalog while it records what it filed). `None` until the
+    /// first scan.
+    gate: std::sync::RwLock<Option<WriteGate>>,
     /// Every volume the store has used, kept in `state_path`.
     remembered: Mutex<state::Remembered>,
     state_path: PathBuf,
@@ -582,6 +587,10 @@ async fn scan(store: &Shared, observer: &Observer) {
         reapply(&volumes, &dir, &mut scanned, &mut index);
     }
     *lock(&store.index) = Arc::new(index);
+    *store
+        .gate
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(WriteGate::of(&scanned));
     *lock(&store.catalog) = json!({
         "generated_at": scanned_at,
         "thresholds": { "warning": store.limits.warning, "critical": store.limits.critical, "floor": store.limits.floor },
@@ -914,6 +923,7 @@ impl Store {
             discover,
             limits,
             catalog: Mutex::new(Value::Null),
+            gate: std::sync::RwLock::new(None),
             index: Mutex::default(),
             refreshed: Mutex::default(),
             requested: AtomicU64::new(0),
@@ -1027,12 +1037,203 @@ struct Expect {
     sha256: Option<String>,
 }
 
+/// Why the store takes no data now, if it doesn't: before its first scan, or
+/// while a volume is erroring (present, but not read in full: a drive
+/// dropping out). A filing then could be checked against a copy it can't see
+/// and land beside it, two different files of one day (decision 0002). Every
+/// upload, filing, import and adoption waits, answered `503` (P0, 2026-11-10).
+/// A volume that is away (not mounted) blocks only what it held: see
+/// [`away_conflict`].
+/// The last scan, as writes are checked against it.
+struct WriteGate {
+    /// Volumes present but not read in full.
+    erroring: Vec<String>,
+    /// Volumes away, with what each is remembered to hold.
+    away: Vec<(String, Value)>,
+}
+
+impl WriteGate {
+    fn of(roots: &[Value]) -> Self {
+        let name = |r: &Value| r["name"].as_str().unwrap_or_default().to_owned();
+        Self {
+            erroring: roots
+                .iter()
+                .filter(|r| {
+                    r["present"] == true && r["errors"].as_array().is_some_and(|e| !e.is_empty())
+                })
+                .map(name)
+                .collect(),
+            away: roots
+                .iter()
+                .filter(|r| r["present"] != true)
+                .map(|r| (name(r), r["held"].clone()))
+                .collect(),
+        }
+    }
+}
+
+fn writes_refused(store: &Store) -> Option<String> {
+    let g = store
+        .gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(g) = g.as_ref() else {
+        return Some("the store hasn't finished its first scan; try again shortly".into());
+    };
+    let erroring = &g.erroring;
+    (!erroring.is_empty()).then(|| {
+        format!(
+            "volume {} can't be read in full: nothing is filed until it can, so no day is filed beside a copy the store can't see; try again later",
+            erroring.join(", ")
+        )
+    })
+}
+
+/// The UTC date before `day` (`YYYY-MM-DD`).
+fn day_before(day: &str) -> Option<String> {
+    let days = i64::try_from(ingest::day_ns(day)? / 86_400_000_000_000).ok()? - 1;
+    // Days since 1970-01-01 to a civil date (Howard Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    Some(format!("{y:04}-{m:02}-{d:02}"))
+}
+
+/// What a filing would add: a provider's dataset, its symbols (none: any), its
+/// schema, and the days from its first to its last.
+struct Scope {
+    provider: String,
+    dataset: String,
+    symbols: Vec<String>,
+    schema: String,
+    first: String,
+    last: String,
+}
+
+impl Scope {
+    /// From a batch's `metadata.json` query; Databento's `end` is exclusive.
+    fn of_batch(provider: &str, dir: &Path) -> Option<Self> {
+        let m: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("metadata.json")).ok()?).ok()?;
+        let q = &m["query"];
+        let day = |v: &Value| {
+            v.as_str()
+                .filter(|s| s.len() >= 10)
+                .map(|s| s[..10].to_owned())
+        };
+        let first = day(&q["start"])?;
+        let end = q["end"].as_str()?;
+        let mut last = day(&q["end"])?;
+        // An end at midnight (or a bare date) is the day before, inclusive.
+        if end.len() == 10 || end[10..].trim_start_matches('T').starts_with("00:00:00") {
+            last = day_before(&last).unwrap_or(last);
+        }
+        Some(Self {
+            provider: provider.to_owned(),
+            dataset: q["dataset"].as_str()?.to_owned(),
+            symbols: q["symbols"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|s| *s != "ALL_SYMBOLS")
+                .map(str::to_owned)
+                .collect(),
+            schema: q["schema"].as_str()?.to_owned(),
+            first,
+            last: last.max(day(&q["start"])?),
+        })
+    }
+
+    /// From an import's `import.json` and the days its files are named for.
+    fn of_import(provider: &str, dirs: &[PathBuf]) -> Option<Self> {
+        let dir = dirs.iter().find(|d| d.join(partial::IMPORT).is_file())?;
+        let m: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join(partial::IMPORT)).ok()?).ok()?;
+        let mut days: Vec<String> = dirs
+            .iter()
+            .flat_map(|d| std::fs::read_dir(d).into_iter().flatten().flatten())
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.strip_suffix(".dbn.zst")
+                    .or_else(|| n.strip_suffix(".dbn"))
+                    .map(str::to_owned)
+            })
+            .filter(|d| d.len() == 10)
+            .collect();
+        days.sort();
+        Some(Self {
+            provider: provider.to_owned(),
+            dataset: m["dataset"].as_str()?.to_owned(),
+            symbols: m["symbol"]
+                .as_str()
+                .map(|s| vec![s.to_owned()])
+                .unwrap_or_default(),
+            schema: m["schema"].as_str()?.to_owned(),
+            first: days.first()?.clone(),
+            last: days.last()?.clone(),
+        })
+    }
+}
+
+/// Whether a filing of `scope` could add a day that a volume now away is
+/// remembered to hold: then it waits (`503`) for that volume, as a second,
+/// different copy could be made beside the one the store can't see. The held
+/// figures keep each schema's first and last day, so a filing overlapping that
+/// span waits; a volume away holding nothing of it blocks nothing (P0,
+/// 2026-11-10).
+fn away_conflict(store: &Store, scope: &Scope) -> Option<String> {
+    let g = store
+        .gate
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for (name, held) in g.iter().flat_map(|g| g.away.iter()) {
+        for (key, schemas) in held.as_object().into_iter().flatten() {
+            let mut k = key.splitn(3, '/');
+            let (Some(provider), Some(dataset), symbol) = (k.next(), k.next(), k.next()) else {
+                continue;
+            };
+            let same_symbol = scope.symbols.is_empty()
+                || symbol.is_none_or(|s| s == "-")
+                || scope.symbols.iter().any(|x| Some(x.as_str()) == symbol);
+            if !provider.eq_ignore_ascii_case(&scope.provider)
+                || !dataset.eq_ignore_ascii_case(&scope.dataset)
+                || !same_symbol
+            {
+                continue;
+            }
+            let Some(h) = schemas.get(&scope.schema) else {
+                continue;
+            };
+            let (Some(first), Some(last)) = (h["first"].as_str(), h["last"].as_str()) else {
+                continue;
+            };
+            if scope.first.as_str() <= last && first <= scope.last.as_str() {
+                return Some(format!(
+                    "volume {name} is away and is remembered to hold {key} {} from {first} to {last}, which this filing ({} to {}) overlaps: it waits for {name}, so no day is filed beside a copy the store can't see; bring {name} back, or retire it if it's gone for good",
+                    scope.schema, scope.first, scope.last
+                ));
+            }
+        }
+    }
+    None
+}
+
 async fn upload(
     AxState(store): AxState<Shared>,
     UrlPath((provider, batch, file)): UrlPath<(String, String, String)>,
     Query(expect): Query<Expect>,
     body: Body,
 ) -> Reply {
+    if let Some(why) = writes_refused(&store) {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, why);
+    }
     let Some(pdir) = ingest::provider_dir(&provider) else {
         return refused(
             StatusCode::NOT_FOUND,
@@ -1119,6 +1320,9 @@ async fn incorporate(
     UrlPath((provider, batch)): UrlPath<(String, String)>,
     Query(q): Query<IncorporateQuery>,
 ) -> Reply {
+    if let Some(why) = writes_refused(&store) {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, why);
+    }
     if q.parent.as_deref().is_some_and(|p| !ingest::safe(p)) {
         return refused(StatusCode::BAD_REQUEST, "unsafe parent symbol");
     }
@@ -1134,6 +1338,12 @@ async fn incorporate(
     let parts = store.parts(pdir, &batch);
     if parts.is_empty() {
         return refused(StatusCode::NOT_FOUND, format!("no incoming batch {batch}"));
+    }
+    let scope = parts
+        .iter()
+        .find_map(|p| Scope::of_batch(&provider, &p.inc));
+    if let Some(why) = scope.as_ref().and_then(|s| away_conflict(&store, s)) {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, why);
     }
     // The same provider on every other volume, read-only ones included, is
     // checked for the same days.
@@ -1207,6 +1417,9 @@ async fn import(
     AxState(store): AxState<Shared>,
     UrlPath((provider, id)): UrlPath<(String, String)>,
 ) -> Reply {
+    if let Some(why) = writes_refused(&store) {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, why);
+    }
     let Some(pdir) = ingest::provider_dir(&provider) else {
         return refused(
             StatusCode::NOT_FOUND,
@@ -1219,6 +1432,10 @@ async fn import(
     let parts = store.parts(pdir, &id);
     if parts.is_empty() {
         return refused(StatusCode::NOT_FOUND, format!("no incoming import {id}"));
+    }
+    let dirs: Vec<PathBuf> = parts.iter().map(|p| p.inc.clone()).collect();
+    if let Some(why) = Scope::of_import(&provider, &dirs).and_then(|s| away_conflict(&store, &s)) {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, why);
     }
     let elsewhere: Vec<PathBuf> = store
         .volumes()
@@ -1466,6 +1683,9 @@ async fn adopt(
     UrlPath(provider): UrlPath<String>,
     Json(req): Json<AdoptRequest>,
 ) -> Reply {
+    if let Some(why) = writes_refused(&store) {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, why);
+    }
     let Some(pdir) = ingest::provider_dir(&provider) else {
         return refused(
             StatusCode::NOT_FOUND,
@@ -1495,6 +1715,9 @@ async fn adopt(
             StatusCode::FORBIDDEN,
             format!("{} is read-only", volume.name),
         );
+    }
+    if let Some(why) = Scope::of_batch(&provider, &dir).and_then(|s| away_conflict(&store, &s)) {
+        return refused(StatusCode::SERVICE_UNAVAILABLE, why);
     }
     if !dir.join("manifest.json").is_file() || !dir.join("metadata.json").is_file() {
         return refused(
@@ -2675,6 +2898,110 @@ mod tests {
             json!([]),
             "and stays so"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_day_before() {
+        for (d, want) in [
+            ("2022-09-08", "2022-09-07"),
+            ("2026-01-01", "2025-12-31"),
+            ("2024-03-01", "2024-02-29"),
+            ("2023-03-01", "2023-02-28"),
+            ("2000-03-01", "2000-02-29"),
+        ] {
+            assert_eq!(day_before(d).as_deref(), Some(want), "{d}");
+        }
+    }
+
+    /// A batch in `vol`'s incoming, as far as its `metadata.json` says.
+    fn incoming_batch(vol: &Path, provider_dir: &str, batch: &str, query: &Value) {
+        let d = vol.join(provider_dir).join(".incoming").join(batch);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            d.join("metadata.json"),
+            json!({ "query": query }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A volume away (here `data`, gone for good but not retired) blocks only
+    /// filings of days it is remembered to hold; everything else is filed. A
+    /// volume that can't be read in full blocks every write (P0, 2026-11-10).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_away_volume_blocks_only_what_it_held_an_erroring_one_everything() {
+        let dir = scratch("refuse-away");
+        let (data, b) = (dir.join("data"), dir.join("b"));
+        let day = data.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("2022-09-07.dbn.zst"), b"x").unwrap();
+        std::fs::create_dir_all(b.join("Databento")).unwrap();
+        let s = store(&[("data", &data), ("b", &b)], &dir.join("state.json"));
+        scanned(&s).await;
+        let addr = serve_plain(&s).await;
+        std::fs::rename(&data, dir.join("data-away")).unwrap();
+        scanned(&s).await;
+        assert_eq!(lock(&s.catalog)["missing_volumes"], json!(["data"]));
+        // A day data held: waits.
+        incoming_batch(
+            &b,
+            "Databento",
+            "OPRA-OLD",
+            &json!({ "dataset": "OPRA.PILLAR", "schema": "cbbo-1m",
+            "symbols": ["SPY.OPT"], "stype_in": "parent", "start": "2022-09-07", "end": "2022-09-08" }),
+        );
+        let (code, why) = call(&addr, "POST", "/incorporate/databento/OPRA-OLD", None, "").await;
+        assert_eq!(code, 503, "{why}");
+        assert!(why.contains("away") && why.contains("2022-09-07"), "{why}");
+        // A day next to it, another symbol, a SIP day: not blocked by data.
+        for (batch, pdir, provider, q) in [
+            (
+                "OPRA-NEXT",
+                "Databento",
+                "databento",
+                json!({ "dataset": "OPRA.PILLAR", "schema": "cbbo-1m",
+                "symbols": ["SPY.OPT"], "start": "2022-09-08", "end": "2022-09-09" }),
+            ),
+            (
+                "OPRA-QQQ",
+                "Databento",
+                "databento",
+                json!({ "dataset": "OPRA.PILLAR", "schema": "cbbo-1m",
+                "symbols": ["QQQ.OPT"], "start": "2022-09-07", "end": "2022-09-08" }),
+            ),
+            (
+                "ALPACA-SIP-SPY-20260105",
+                "Alpaca",
+                "alpaca",
+                json!({ "dataset": "ALPACA.SIP", "schema": "cmbp-1",
+                "symbols": ["SPY"], "start": "2026-01-05T00:00:00Z", "end": "2026-01-05T23:59:59.999999999Z" }),
+            ),
+        ] {
+            incoming_batch(&b, pdir, batch, &q);
+            let (code, why) = call(
+                &addr,
+                "POST",
+                &format!("/incorporate/{provider}/{batch}"),
+                None,
+                "",
+            )
+            .await;
+            assert_ne!(code, 503, "{batch}: {why}");
+        }
+        assert_eq!(
+            call(&addr, "PUT", UPLOAD, None, "hi").await.0,
+            200,
+            "uploads go on"
+        );
+        // b can't be read in full (a manifest it can't open): every write waits.
+        let bad = b.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(bad.join("2026-10-01.dbn.zst"), b"x").unwrap();
+        std::fs::write(bad.join("manifest.json"), b"{").unwrap();
+        scanned(&s).await;
+        let (code, why) = call(&addr, "PUT", UPLOAD, None, "hi").await;
+        assert_eq!(code, 503, "{why}");
+        assert!(why.contains("can't be read in full"), "{why}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
