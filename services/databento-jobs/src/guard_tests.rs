@@ -273,8 +273,9 @@ struct StoreState {
     conditions_posted: Vec<(Option<String>, Value)>,
     /// What `/health` says, as a capture service would.
     health: &'static str,
-    /// `/batches/databento`'s batches.
+    /// `/batches/databento`'s batches, and the volumes it couldn't read.
     batches: Value,
+    missing_volumes: Value,
     /// Answers 503 to this many `/catalog` reads first (a rescan).
     catalog_503s: u32,
     /// And to this many `/incoming` reads; then this.
@@ -338,6 +339,7 @@ fn ready_store() -> StoreState {
         conditions_posted: Vec::new(),
         health: "idle",
         batches: json!({}),
+        missing_volumes: json!([]),
         catalog_503s: 0,
         incoming_503s: 0,
         incoming: json!({ "batches": [] }),
@@ -399,7 +401,8 @@ async fn serve_store(state: StoreHandle) -> String {
         .route(
             "/batches/databento",
             get(|AxState(s): AxState<StoreHandle>| async move {
-                Json(json!({ "provider": "databento", "batches": lock(&s).batches.clone() }))
+                let s = lock(&s);
+                Json(json!({ "provider": "databento", "batches": s.batches.clone(), "missing_volumes": s.missing_volumes.clone() }))
             }),
         )
         .route(
@@ -1965,6 +1968,46 @@ async fn a_job_is_downloaded_once_however_often_refreshed() {
     settled(&r).await;
     let s = lock(&r.store);
     assert_eq!((s.incorporated.len(), s.uploaded.len()), (1, 2));
+}
+
+/// Ingress review P0 5: while the store can't say in full what it holds (a
+/// volume it couldn't read, an older store that doesn't say, or no answer),
+/// a done job isn't downloaded again, nor told of as unfiled; once it can,
+/// the job is downloaded once.
+#[tokio::test]
+async fn nothing_is_downloaded_while_the_store_cant_say_what_it_holds() {
+    let r = rig("fail-closed").await;
+    contract_job(&r, "OPRA-C1");
+    for (missing, why) in [
+        (json!(["tt03"]), "tt03 couldn't be read"),
+        (Value::Null, "doesn't say whether it read every volume"),
+    ] {
+        lock(&r.store).missing_volumes = missing;
+        refresh(&r.jobs).await.unwrap();
+        settled(&r).await;
+        let s = lock(&r.store);
+        assert_eq!((s.uploaded.len(), s.incorporated.len()), (0, 0), "{why}");
+        drop(s);
+        let listed = lock(&r.jobs.listed).clone();
+        assert_eq!(listed["store_reachable"], false);
+        assert!(
+            listed["store_unknown"]
+                .as_str()
+                .is_some_and(|u| u.contains(why)),
+            "{listed}"
+        );
+    }
+    // Asked for by hand meanwhile: refused for the same reason, not fetched.
+    let e = fetch_and_file(&r.jobs, "OPRA-C1", None, true)
+        .await
+        .unwrap_err();
+    assert!(e.contains("not downloaded, since"), "{e}");
+    assert!(lock(&r.store).uploaded.is_empty());
+    lock(&r.store).missing_volumes = json!([]);
+    refresh(&r.jobs).await.unwrap();
+    settled(&r).await;
+    assert_eq!(lock(&r.store).incorporated.len(), 1);
+    assert_eq!(lock(&r.jobs.listed)["store_unknown"], Value::Null);
 }
 
 /// Decision 0033: a job bought by hand is downloaded and filed as soon as it's

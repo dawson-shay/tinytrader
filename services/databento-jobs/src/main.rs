@@ -911,18 +911,11 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
     });
     // What the store already holds, first: only jobs not on disk need
     // their file lists (for the size a download would take).
-    let held: Value = match jobs
-        .http
-        .get(format!("{}/batches/databento", jobs.store))
-        .send()
-        .await
-    {
-        Ok(r) => r
-            .json::<Value>()
-            .await
-            .map(|v| v["batches"].clone())
-            .unwrap_or(Value::Null),
-        Err(_) => Value::Null,
+    // When it can't say in full, nothing is taken as not held (ingress
+    // review P0 5): no download starts, and no job is told of as unfiled.
+    let (held, unknown) = match holdings(jobs).await {
+        Ok(b) => (b, None),
+        Err(why) => (Value::Null, Some(why)),
     };
     let (mut out, mut expired) = (Vec::new(), Vec::new());
     // A finished job's details never change; others are read again each
@@ -977,7 +970,7 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
         .iter()
         .map(|j| row(j, &held, delivered.get(&j.id).copied()))
         .collect();
-    *lock(&jobs.listed) = json!({ "jobs": rows, "store_reachable": !held.is_null(), "updated_at": tinytrader_observe::unix_seconds() });
+    *lock(&jobs.listed) = json!({ "jobs": rows, "store_reachable": unknown.is_none(), "store_unknown": unknown, "updated_at": tinytrader_observe::unix_seconds() });
 
     // Submissions whose outcome was unknown: match each to the job it
     // created.
@@ -1001,6 +994,7 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
         let how = &held[&j.id];
         let left = j.ts_expiration.map(|e| e - time::OffsetDateTime::now_utc());
         if j.state == JobState::Done
+            && unknown.is_none()
             && (how.is_null() || how["how"] == "incoming")
             && left.is_some_and(|l| l < time::Duration::days(7))
             && lock(&jobs.expiring).insert(j.id.clone())
@@ -1018,6 +1012,7 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
     // time, and a failed one again only after a wait, a few times.
     let ready: Vec<String> = out
         .iter()
+        .filter(|_| unknown.is_none())
         .filter(|j| {
             let how = &held[&j.id];
             j.state == JobState::Done
@@ -3407,21 +3402,52 @@ fn start_download(jobs: &Shared, job: String, manual: bool) {
     });
 }
 
-/// Whether the store has already filed this batch.
-async fn filed(jobs: &Jobs, job: &str) -> bool {
+/// The batches the store holds, by id, when it can say in full: `/batches`
+/// answered, and no volume was missing from what it read. Otherwise why
+/// not, so nothing is taken as not held when it may be on a volume that
+/// couldn't be seen (ingress review P0 5).
+async fn holdings(jobs: &Jobs) -> Result<Value, String> {
     let r = jobs
         .http
         .get(format!("{}/batches/databento", jobs.store))
         .timeout(Duration::from_secs(120))
         .send()
-        .await;
-    match r {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .is_ok_and(|v| v["batches"][job]["how"] == "filed"),
-        _ => false,
+        .await
+        .map_err(|e| format!("the store didn't answer: {e}"))?;
+    let status = r.status();
+    let v: Value = r
+        .json()
+        .await
+        .map_err(|e| format!("the store's answer ({status}) isn't JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "the store answered {status}: {}",
+            v["error"].as_str().unwrap_or_default()
+        ));
     }
+    let Some(missing) = v["missing_volumes"].as_array() else {
+        return Err(
+            "the store doesn't say whether it read every volume (it's older than this service)"
+                .into(),
+        );
+    };
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().filter_map(Value::as_str).collect();
+        return Err(format!(
+            "volumes {} couldn't be read: what they hold can't be told",
+            names.join(", ")
+        ));
+    }
+    if !v["batches"].is_object() {
+        return Err("the store's answer has no batches".into());
+    }
+    Ok(v["batches"].clone())
+}
+
+/// Whether the store has already filed this batch; an error when it can't
+/// say (never "not filed").
+async fn filed(jobs: &Jobs, job: &str) -> Result<bool, String> {
+    Ok(holdings(jobs).await?[job]["how"] == "filed")
 }
 
 /// Stream every file of a done job into the store, then, its download's
@@ -3433,7 +3459,10 @@ async fn fetch_and_file(
     turn: Option<tokio::sync::SemaphorePermit<'_>>,
     manual: bool,
 ) -> Result<usize, String> {
-    if filed(jobs, job).await {
+    if filed(jobs, job)
+        .await
+        .map_err(|e| format!("not downloaded, since {e}"))?
+    {
         return Ok(0);
     }
     let files = jobs
@@ -3614,7 +3643,10 @@ async fn fetch_and_file(
     });
     // A job bought as a list of one option parent's contracts is filed as
     // partial days of that parent (decision 0018).
-    if filed(jobs, job).await {
+    if filed(jobs, job)
+        .await
+        .map_err(|e| format!("not filed, since {e}"))?
+    {
         return Ok(0);
     }
     let parent = lock(&jobs.details).get(job).and_then(contract_parent);
