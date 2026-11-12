@@ -1892,7 +1892,7 @@ async fn adopt(
             "the folder must be at the top of a volume, or one level down",
         );
     };
-    if !writes_to(&volume) {
+    if !writes_to(volume) {
         return refused(
             StatusCode::FORBIDDEN,
             format!(
