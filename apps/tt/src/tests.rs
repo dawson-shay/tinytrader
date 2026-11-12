@@ -532,3 +532,40 @@ async fn following_a_job_that_isnt_listed_fails_after_a_grace() {
     );
     assert!(f.lock().unwrap().listed > 2);
 }
+
+/// `tt store ls`: the store's `/files`, as a table or JSON; a refusal is
+/// exit 1.
+#[tokio::test]
+async fn store_ls_lists_the_store_s_files() {
+    let app = axum::Router::new().route(
+        "/files",
+        get(|q: axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+            if q.get("pattern").map(String::as_str) == Some("none") {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": "the store is still scanning" })));
+            }
+            (StatusCode::OK, Json(json!({ "files": [{ "name": "a/Databento/x/2026-10-02.dbn.zst", "volume": "a", "path": "Databento/x/2026-10-02.dbn.zst", "bytes": 42 }], "truncated": false })))
+        }),
+    );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let ls = |pattern: &str| StoreCommand::Ls {
+        pattern: pattern.into(),
+        limit: None,
+    };
+    let mut out = Vec::new();
+    assert_eq!(store(&base, &ls("*"), Format::Table, &mut out).await, 0);
+    let text = String::from_utf8(out).unwrap();
+    assert!(
+        text.contains("a/Databento/x/2026-10-02.dbn.zst  42"),
+        "{text}"
+    );
+    let mut out = Vec::new();
+    assert_eq!(store(&base, &ls("*"), Format::Json, &mut out).await, 0);
+    let v: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["files"][0]["bytes"], 42);
+    assert_eq!(
+        store(&base, &ls("none"), Format::Json, &mut Vec::new()).await,
+        1
+    );
+}

@@ -226,6 +226,7 @@ fn volumes_merge_by_name_highest_version_conflicts_reported() {
         version,
         sha256: sha.into(),
         size: 1,
+        ext: "dbn.zst".into(),
         kind: "day".into(),
         source: "t".into(),
         previous: None,

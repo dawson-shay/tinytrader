@@ -59,6 +59,24 @@ enum Command {
         method: String,
         path: String,
     },
+    /// The store's reads, from the store at `TT_STORE` (default
+    /// http://localhost:9120), not the console.
+    Store {
+        #[command(subcommand)]
+        command: StoreCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum StoreCommand {
+    /// The files the store serves, by name (`<volume>/<path>`), matching a
+    /// pattern (`*` any run of characters, slashes included; `?` one).
+    Ls {
+        #[arg(default_value = "*")]
+        pattern: String,
+        #[arg(long)]
+        limit: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -403,6 +421,70 @@ fn yes(term: &mut dyn Term, prompt: &str) -> bool {
 
 fn cells(c: &[&str]) -> Vec<String> {
     c.iter().map(|s| (*s).to_owned()).collect()
+}
+
+/// The store's address: `TT_STORE`, by default this machine's.
+fn store_base() -> String {
+    std::env::var("TT_STORE").unwrap_or_else(|_| "http://localhost:9120".into())
+}
+
+/// `tt store …`: a read of the store's own API at `TT_STORE`. Exit 0, or 1
+/// when the store can't answer (with why on stderr).
+async fn store(base: &str, command: &StoreCommand, f: Format, out: &mut dyn Write) -> u8 {
+    let base = base.trim_end_matches('/');
+    let StoreCommand::Ls { pattern, limit } = command;
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(10))
+        .user_agent("tinytrader-tt")
+        .build();
+    let Ok(http) = http else {
+        eprintln!("tt: no HTTP client");
+        return 1;
+    };
+    let mut q = vec![("pattern", pattern.clone())];
+    if let Some(l) = limit {
+        q.push(("limit", l.to_string()));
+    }
+    let r = http
+        .get(format!("{base}/files"))
+        .query(&q)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await;
+    let r = match r {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("tt: the store at {base}: {}", e.without_url());
+            return 1;
+        }
+    };
+    let code = r.status().as_u16();
+    let v: Value = r.json().await.unwrap_or(Value::Null);
+    if code != 200 {
+        eprintln!(
+            "tt: the store answered {code}: {}",
+            v["error"].as_str().unwrap_or("no reason given")
+        );
+        return 1;
+    }
+    let rows: Vec<Vec<String>> = std::iter::once(cells(&["NAME", "BYTES"]))
+        .chain(v["files"].as_array().into_iter().flatten().map(|f| {
+            vec![
+                f["name"].as_str().unwrap_or_default().to_owned(),
+                f["bytes"]
+                    .as_u64()
+                    .map_or_else(String::new, |b| b.to_string()),
+            ]
+        }))
+        .collect();
+    emit(out, f, &v, &rows);
+    if v["truncated"] == true {
+        eprintln!(
+            "tt: only the first {} listed; give --limit or a narrower pattern",
+            rows.len() - 1
+        );
+    }
+    0
 }
 
 /// The answer on stdout: the JSON, or the rows as a table.
@@ -796,6 +878,7 @@ async fn run(cli: Cli, c: &Console, term: &mut dyn Term, out: &mut dyn Write) ->
             Ok(0)
         }
         Command::Jobs { follow, ids } => jobs(c, term, out, f, follow, ids).await,
+        Command::Store { command } => Ok(store(&store_base(), &command, f, out).await),
         Command::Api { method, path } => {
             if method == "POST" && buys(&path) {
                 return Err(Fail(
@@ -858,6 +941,16 @@ async fn main() -> std::process::ExitCode {
             return 2.into();
         }
     };
+    if let Command::Store { command } = &cli.command {
+        let f = cli.format.unwrap_or(if std::io::stdout().is_terminal() {
+            Format::Table
+        } else {
+            Format::Json
+        });
+        return store(&store_base(), command, f, &mut std::io::stdout())
+            .await
+            .into();
+    }
     let base = std::env::var("TT_CONSOLE").unwrap_or_default();
     if !base.starts_with("http://") && !base.starts_with("https://") {
         eprintln!(
