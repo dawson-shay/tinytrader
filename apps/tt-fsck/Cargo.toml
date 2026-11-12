@@ -1,0 +1,14 @@
+[package]
+name = "tt-fsck"
+description = "Check volumes in the content-addressed format against the storage contract (decision 0039), from the disk alone"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde_json.workspace = true
+tinytrader-cas.workspace = true

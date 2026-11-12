@@ -3580,6 +3580,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "tt-fsck"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "tinytrader-cas",
+]
+
+[[package]]
 name = "tungstenite"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

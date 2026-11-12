@@ -267,3 +267,22 @@ fn volumes_merge_by_name_highest_version_conflicts_reported() {
     );
     assert_eq!(conflicts.len(), 1, "{conflicts:?}");
 }
+
+#[test]
+fn one_writer_at_a_time_and_no_check_while_it_writes() {
+    let d = scratch("lock");
+    let v = Volume::init(&d, "vol-a").unwrap();
+    let r = v.lock_reader().unwrap();
+    assert!(v.lock_reader().is_ok(), "checks share");
+    drop(r);
+    let w = v.lock_writer().unwrap();
+    assert!(
+        v.lock_writer()
+            .unwrap_err()
+            .contains("held by another program")
+    );
+    assert!(v.lock_reader().unwrap_err().contains("being written"));
+    drop(w);
+    let _r = v.lock_reader().unwrap();
+    assert!(v.lock_writer().is_err(), "no writing while checked");
+}

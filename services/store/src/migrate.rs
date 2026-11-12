@@ -185,6 +185,11 @@ pub fn run(
         None if plan => None,
         None => return Err("give the destination (--to PATH --id VOLUME_ID)".into()),
     };
+    // One writer at a time, and no check meanwhile (0039).
+    let _held = match (&vol, plan) {
+        (Some(v), false) => Some(v.lock_writer()?),
+        _ => None,
+    };
     let index = match &vol {
         Some(v) => v.index()?,
         None => tinytrader_cas::Index::default(),
