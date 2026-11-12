@@ -1177,3 +1177,54 @@ fn resolve_lookups_keep_their_spacing_after_a_jump() {
     assert_eq!(res[0]["outcome"], "absent_after", "{seen:?}");
     gw.stop().unwrap();
 }
+
+/// The next line from an in-process client that `pred` accepts.
+fn local_until(c: &order_gateway::LocalClient, pred: impl Fn(&Value) -> bool) -> Value {
+    loop {
+        let line = c.line(WAIT).unwrap().expect("a line in time");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        if pred(&v) {
+            return v;
+        }
+    }
+}
+
+/// An in-process client (decision 0029) takes a TCP connection's path: the same
+/// authentication, welcome, admission and answers; a line too long closes it, as
+/// on TCP; and the clock counts its order messages like a socket's.
+#[test]
+fn an_in_process_client_takes_the_tcp_path() {
+    let (gw, feed, clock) = gateway("fed-local", "{}");
+    assert!(
+        gw.connect_local("reactor", "not the token", false)
+            .err()
+            .unwrap()
+            .contains("unauthorized")
+    );
+    let c = gw.connect_local("reactor", TOKEN, false).unwrap();
+    assert_eq!(local_until(&c, |_| true)["type"], "welcome");
+    mappings(&feed);
+    bbo(&feed, 9, T0, 58_011, 58_012);
+    assert_eq!(clock.advance("reactor", 0, T0, WAIT).unwrap().market_ts, T0);
+    c.send(
+        "submit",
+        &format!(
+            r#"{{"request_id":"r1","intent":{}}}"#,
+            stock("wse-l1", "buy", 1, "580.12")
+        ),
+    )
+    .unwrap();
+    let r = local_until(&c, |v| v["type"] == "response" && v["request_id"] == "r1");
+    assert_eq!(r["outcome"], "accepted", "{r}");
+    // The clock waits for this client's one order message, as for a socket's.
+    let a = clock.advance("reactor", 1, T0 + S, WAIT).unwrap();
+    assert_eq!(a.handled, 1);
+    // A line over the limit closes the connection, as on TCP.
+    let long = format!(r#"{{"type":"heartbeat","pad":"{}"}}"#, "x".repeat(70_000));
+    assert!(c.send_raw(long.as_bytes()).is_err());
+    let last = local_until(&c, |v| v["type"] == "error");
+    assert_eq!(last["code"], "line_too_long");
+    assert!(c.send("submit", r#"{"request_id":"r2"}"#).is_err());
+    drop(c);
+    gw.stop().unwrap();
+}

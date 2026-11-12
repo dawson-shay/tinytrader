@@ -549,3 +549,64 @@ fn the_fixtures_match_their_golden_records() {
         "golden records re-recorded; unset SESSION_GOLDEN_WRITE and run again"
     );
 }
+
+/// A run's outcome and `run.json`, against the golden record's (what doesn't
+/// depend on the transport: everything but the control messages received).
+fn assert_matches_golden(name: &str, o: &session::Outcome, dir: &Path) {
+    let golden: Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/golden/{name}.json")),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut rec: Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("run.json")).unwrap()).unwrap();
+    normalised(&mut rec);
+    assert_eq!(
+        (o.audit.as_str(), o.status, o.steps, o.records),
+        (
+            golden["audit"].as_str().unwrap(),
+            golden["status"].as_str().unwrap(),
+            golden["steps"].as_u64().unwrap(),
+            golden["records"].as_u64().unwrap()
+        ),
+        "{o:?}"
+    );
+    assert_eq!(rec, golden["run"]);
+}
+
+/// The example toy, written once as an actor, run in process (0029's `inproc`):
+/// the same run as the socket toy recorded from main, to the audit hash.
+#[test]
+fn the_toy_in_process_matches_the_socket_golden() {
+    let base = root("inproc");
+    let j = base.join("job");
+    std::fs::create_dir_all(&j).unwrap();
+    job(&j, 0);
+    let dir = base.join("run");
+    let s = Session::start(&config(&j, 30), &dir, [127, 0, 0, 1].into()).unwrap();
+    let o = s
+        .run_inproc(Box::new(session::example::Toy::default()))
+        .unwrap();
+    assert_matches_golden("toy", &o, &dir);
+}
+
+/// The same actor over the sockets, through `run_socket`: the same run again.
+#[test]
+fn the_toy_actor_over_the_sockets_matches_the_golden() {
+    let base = root("actor-socket");
+    let j = base.join("job");
+    std::fs::create_dir_all(&j).unwrap();
+    job(&j, 0);
+    let dir = base.join("run");
+    let s = Session::start(&config(&j, 30), &dir, [127, 0, 0, 1].into()).unwrap();
+    let control = s.ready().control;
+    let strategy = std::thread::spawn(move || {
+        session::actor::run_socket(session::example::Toy::default(), control, None)
+    });
+    let o = s.run().unwrap();
+    let end = strategy.join().unwrap().unwrap();
+    assert_eq!(end["audit"], o.audit);
+    assert_matches_golden("toy", &o, &dir);
+}
