@@ -136,6 +136,11 @@ pub fn run(
             r.unwrap_or_else(|| json!({ "source": s.name, "runs": [], "files": {} })),
         );
     }
+    // What each source is now (its volume id, or its device).
+    let identities: BTreeMap<String, String> = sources
+        .iter()
+        .map(|s| (s.name.clone(), tinytrader_cas::tree::identity(&s.root)))
+        .collect();
     struct Copy<'a> {
         source: &'a Source,
         found: tinytrader_cas::tree::Found,
@@ -195,10 +200,22 @@ pub fn run(
         // Each copy's content: from its receipt when it's provably the same
         // file read before, else read now.
         let known = |c: &Copy| -> Option<String> {
-            let prev = &receipts[&c.source.name]["files"][&c.found.rel];
+            let r = &receipts[&c.source.name];
+            // A receipt from another drive mounted under this name is never
+            // believed (re-review (2)).
+            if r["identity"].as_str() != Some(identities[&c.source.name].as_str()) {
+                return None;
+            }
+            let prev = &r["files"][&c.found.rel];
             let sha = prev["sha256"].as_str()?;
-            let same = prev["size"].as_u64() == Some(c.found.size)
-                && prev["mtime_ns"].as_str() == Some(c.found.mtime_ns.to_string().as_str());
+            // The same file, unchanged: a rewrite with its time put back, or
+            // a copy, has another inode or change time.
+            let f = &c.found;
+            let same = prev["size"].as_u64() == Some(f.size)
+                && prev["mtime_ns"].as_str() == Some(f.mtime_ns.to_string().as_str())
+                && prev["dev"].as_u64() == Some(f.dev)
+                && prev["ino"].as_u64() == Some(f.ino)
+                && prev["ctime_ns"].as_str() == Some(f.ctime_ns.to_string().as_str());
             let held = vol.as_ref().is_some_and(|v| v.object(sha, &ext).is_some());
             (same && held).then(|| sha.to_owned())
         };
@@ -321,7 +338,8 @@ pub fn run(
             receipts
                 .get_mut(&c.source.name)
                 .expect("each source has a receipt")["files"][&c.found.rel] = json!({
-                "size": c.found.size, "mtime_ns": c.found.mtime_ns.to_string(), "sha256": h,
+                "size": c.found.size, "mtime_ns": c.found.mtime_ns.to_string(),
+                "dev": c.found.dev, "ino": c.found.ino, "ctime_ns": c.found.ctime_ns.to_string(), "sha256": h,
                 "outcome": if *ok { outcome } else { "pending" },
             });
         }
@@ -350,11 +368,13 @@ pub fn run(
                 .get_mut(&s.name)
                 .expect("each source has a receipt");
             r["root"] = json!(s.root);
+            r["identity"] = json!(identities[&s.name]);
             if let Some(runs) = r["runs"].as_array_mut() {
                 runs.push(json!({
                     "at": now(), "writer": WRITER, "ok": ok,
                     "conflicts": conflicts.len(), "damaged": damaged.len(),
                     "errors": errors.iter().filter(|e| e.starts_with(&format!("{}: ", s.name))).collect::<Vec<_>>(),
+                    "skipped": skipped.iter().filter(|e| e.starts_with(&format!("{}: ", s.name))).collect::<Vec<_>>(),
                 }));
             }
             v.write_receipt(&s.name, r)?;
@@ -474,6 +494,10 @@ mod tests {
             b"pending upload",
         );
         put(&a, ".DS_Store", b"junk");
+        // The OS's folder at the root is skipped (listed); an OS-like name
+        // anywhere else is data, copied (re-review (1)).
+        put(&a, ".Trashes/501/x", b"trash");
+        put(&a, "Databento/x/._notes.dbn.zst", b"not apple's");
         put(&b, DAY1, b"day one");
         put(&b, DAY2, b"day 2!!");
         put(&b, "notes.txt", b"other");
@@ -491,15 +515,21 @@ mod tests {
                 p["to_read"]["names"].clone(),
                 p["on_several_sources"].clone()
             ),
-            (json!(5), json!(5), json!(2))
+            (json!(7), json!(7), json!(2))
         );
-        assert_eq!(p["by_kind"]["day"]["names"], 2);
+        assert_eq!(p["by_kind"]["day"]["names"], 3);
         assert_eq!(p["by_kind"]["incoming"]["names"], 1);
-        assert_eq!(p["os_files_skipped"].as_array().unwrap().len(), 1);
+        assert_eq!(p["os_files_skipped"].as_array().unwrap().len(), 1, "{p}");
+        assert!(
+            p["os_files_skipped"][0]
+                .as_str()
+                .unwrap()
+                .ends_with(".Trashes")
+        );
         // The copy: DAY1 once, DAY2's two contents kept and unbound.
         let (r, ok) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
         assert!(!ok, "a conflict isn't ok: {r}");
-        assert_eq!(r["bound"], 4, "{r}");
+        assert_eq!(r["bound"], 6, "{r}");
         assert_eq!(r["conflicts"].as_array().unwrap().len(), 1);
         assert_eq!(r["conflicts"][0]["name"], DAY2);
         let v = Volume::open(&dest).unwrap();
@@ -518,7 +548,7 @@ mod tests {
         let (again, _) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
         assert_eq!(
             (again["bound"].clone(), again["already_there"].clone()),
-            (json!(0), json!(4)),
+            (json!(0), json!(6)),
             "{again}"
         );
         assert_eq!(again["bytes_written"], 0);
@@ -563,6 +593,50 @@ mod tests {
                 again["bytes_written"].clone()
             ),
             (json!(1), json!(0))
+        );
+    }
+
+    /// Re-review (2): a rewrite at the same size with its modification time
+    /// put back, or a copy mounted under the same name, isn't skipped from
+    /// the receipt: it's read, and other bytes are a conflict.
+    #[test]
+    fn a_rewrite_with_its_time_restored_is_read_again() {
+        let d = scratch("mtime");
+        let (a, dest) = (d.join("data"), d.join("nas"));
+        put(&a, DAY1, b"day one");
+        let data = [source(&format!("data={}", a.display())).unwrap()];
+        assert!(
+            run(&data, Some((&dest, "nas-1")), false, &mut |_| {})
+                .unwrap()
+                .1
+        );
+        let when = fs::metadata(a.join(DAY1)).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let tmp = a.join("rewrite.tmp");
+        fs::write(&tmp, b"day 1!!").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        fs::rename(&tmp, a.join(DAY1)).unwrap();
+        let (r, ok) = run(&data, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert!(!ok, "{r}");
+        assert_eq!(r["conflicts"][0]["name"], DAY1, "{r}");
+        // A copy of the original, under the same source name: read (another
+        // inode), the same bytes, so already there.
+        let clone = d.join("clone");
+        put(&clone, DAY1, b"day one");
+        let again = [source(&format!("data={}", clone.display())).unwrap()];
+        let (r, _) = run(&again, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert_eq!(
+            (
+                r["already_there"].clone(),
+                r["conflicts"].as_array().unwrap().len()
+            ),
+            (json!(1), 0),
+            "{r}"
         );
     }
 

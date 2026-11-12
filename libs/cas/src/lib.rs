@@ -78,6 +78,9 @@ pub struct Index {
     pub conflicts: Vec<String>,
     /// How many bytes of the log this covers.
     pub log_len: u64,
+    /// The log's chain value at `log_len`.
+    #[serde(default)]
+    pub chain: String,
 }
 
 impl Index {
@@ -293,11 +296,13 @@ impl Volume {
             }
             _ => (Index::default(), 0),
         };
-        let replay = log::replay(&self.log_path(), from)?;
+        let start = index.chain.clone();
+        let replay = log::replay(&self.log_path(), from, &start)?;
         for e in &replay.events {
             index.apply(e);
         }
         index.log_len = replay.end;
+        index.chain = replay.chain;
         Ok(index)
     }
 
@@ -327,12 +332,13 @@ impl Volume {
     /// # Errors
     /// If the log can't be read or the snapshot written.
     pub fn snapshot(&self) -> Result<Index, String> {
-        let replay = log::replay(&self.log_path(), 0)?;
+        let replay = log::replay(&self.log_path(), 0, "")?;
         let mut index = Index::default();
         for e in &replay.events {
             index.apply(e);
         }
         index.log_len = replay.end;
+        index.chain = replay.chain;
         let body = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
         let doc = json!({ "index": &index, "sha256": objects::hex_of(&body) });
         let bytes = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
@@ -348,7 +354,7 @@ impl Volume {
     /// # Errors
     /// If the log can't be read.
     pub fn verify(&self, hash: bool) -> Result<Report, String> {
-        let replay = log::replay(&self.log_path(), 0)?;
+        let replay = log::replay(&self.log_path(), 0, "")?;
         let mut index = Index::default();
         for e in &replay.events {
             index.apply(e);
@@ -388,7 +394,17 @@ impl Volume {
                         prefix.apply(e);
                     }
                 }
-                if snap.names != prefix.names || snap.pending != prefix.pending {
+                let mut chain = String::new();
+                for (e, end) in replay.events.iter().zip(&replay.ends) {
+                    if *end <= snap.log_len {
+                        chain = log::chain_of(&chain, e);
+                    }
+                }
+                if snap.names != prefix.names
+                    || snap.pending != prefix.pending
+                    || snap.conflicts != prefix.conflicts
+                    || snap.chain != chain
+                {
                     r.snapshot.push(format!(
                         "snapshot: doesn't match the log's first {} bytes ({} names there, {} in the snapshot)",
                         snap.log_len,
@@ -431,6 +447,23 @@ impl Volume {
                 Some(_) => {}
             }
         }
+        // A pending object is the only copy of what it holds (a conflict's
+        // other version): it must be there too.
+        for e in &replay.events {
+            if let Event::Pending {
+                sha256, ext, for_, ..
+            } = e
+                && index.pending.contains_key(sha256)
+                && !by_key.contains_key(&(sha256.as_str(), ext.as_str()))
+                && !index.names.values().any(|n| n.sha256 == *sha256)
+            {
+                r.missing.push(format!(
+                    "pending object {sha256}.{ext} ({for_}) isn't there"
+                ));
+            }
+        }
+        r.missing.sort();
+        r.missing.dedup();
         let current: std::collections::HashSet<(&str, &str)> = index
             .names
             .values()
