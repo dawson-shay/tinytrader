@@ -1891,15 +1891,26 @@ mod stream_tests {
             let client = f.client();
             let mut b = Box::pin(build(&client, Feed::Sip, "SPY", DAY, &dir));
             let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            // The trades lane (three pages) runs beside it: done too, then a
-            // moment more for it to keep its spool.
-            let mut settled = None;
+            // The trades lane (three pages) runs beside it: interrupted only
+            // once its spool says it's done, however slow the machine.
+            let trades_done = || {
+                std::fs::read_dir(dir.join("lanes"))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|d| {
+                        std::fs::read(d.path().join("trades").join("state.json"))
+                            .ok()
+                            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+                            .is_some_and(|v| v["done"] == true)
+                    })
+            };
             loop {
-                assert!(std::time::Instant::now() < deadline, "never asked for page 2");
-                if settled.is_none() && f.hung() > 0 && f.served("trades", 2) == 1 {
-                    settled = Some(std::time::Instant::now() + Duration::from_millis(200));
-                }
-                if settled.is_some_and(|t| std::time::Instant::now() >= t) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "never asked for page 2"
+                );
+                if f.hung() > 0 && trades_done() {
                     break;
                 }
                 tokio::select! {

@@ -831,7 +831,15 @@ fn prepare(f: &Filing, of: usize, days: &mut BTreeMap<PathBuf, Day>) -> Result<M
         let mut held_source = Value::Null;
         for r in &everywhere {
             let p = r.join(&rel);
-            if p.exists() {
+            // An error (a volume dropping out) refuses the import, never reads
+            // as "not held" (P0, 2026-11-10).
+            let there = p.try_exists().map_err(|e| {
+                format!(
+                    "{}: {e}; not imported, since it can't be told whether this day is held there",
+                    p.display()
+                )
+            })?;
+            if there {
                 let entry = settle(&r.join(&level), &day)?;
                 held_source = entry.as_ref().map_or(Value::Null, |e| e["source"].clone());
                 held = Some((p, entry.filter(is_partial)));
