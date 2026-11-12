@@ -911,18 +911,11 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
     });
     // What the store already holds, first: only jobs not on disk need
     // their file lists (for the size a download would take).
-    let held: Value = match jobs
-        .http
-        .get(format!("{}/batches/databento", jobs.store))
-        .send()
-        .await
-    {
-        Ok(r) => r
-            .json::<Value>()
-            .await
-            .map(|v| v["batches"].clone())
-            .unwrap_or(Value::Null),
-        Err(_) => Value::Null,
+    // When it can't say in full, nothing is taken as not held (ingress
+    // review P0 5): no download starts, and no job is told of as unfiled.
+    let (held, unknown) = match holdings(jobs).await {
+        Ok(b) => (b, None),
+        Err(why) => (Value::Null, Some(why)),
     };
     let (mut out, mut expired) = (Vec::new(), Vec::new());
     // A finished job's details never change; others are read again each
@@ -977,7 +970,7 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
         .iter()
         .map(|j| row(j, &held, delivered.get(&j.id).copied()))
         .collect();
-    *lock(&jobs.listed) = json!({ "jobs": rows, "store_reachable": !held.is_null(), "updated_at": tinytrader_observe::unix_seconds() });
+    *lock(&jobs.listed) = json!({ "jobs": rows, "store_reachable": unknown.is_none(), "store_unknown": unknown, "updated_at": tinytrader_observe::unix_seconds() });
 
     // Submissions whose outcome was unknown: match each to the job it
     // created.
@@ -1001,6 +994,7 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
         let how = &held[&j.id];
         let left = j.ts_expiration.map(|e| e - time::OffsetDateTime::now_utc());
         if j.state == JobState::Done
+            && unknown.is_none()
             && (how.is_null() || how["how"] == "incoming")
             && left.is_some_and(|l| l < time::Duration::days(7))
             && lock(&jobs.expiring).insert(j.id.clone())
@@ -1018,6 +1012,7 @@ async fn refresh(jobs: &Shared) -> Result<Refreshed, String> {
     // time, and a failed one again only after a wait, a few times.
     let ready: Vec<String> = out
         .iter()
+        .filter(|_| unknown.is_none())
         .filter(|j| {
             let how = &held[&j.id];
             j.state == JobState::Done
@@ -3148,6 +3143,14 @@ async fn fetch_to_cache(
         set_cache(jobs, job, |t| t.file = f.filename.clone());
         let path = dir.join(&f.filename);
         let want = f.hash.trim_start_matches("sha256:").to_ascii_lowercase();
+        // Nothing is cached that can't be checked (ingress review (F)): a file
+        // Databento lists without a SHA-256, or with one that isn't one.
+        if want.len() != 64 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Permanent(format!(
+                "{}: Databento lists no usable SHA-256 for it ({:?}); not cached unchecked",
+                f.filename, f.hash
+            )));
+        }
         let whole = std::fs::metadata(&path).is_ok_and(|m| m.len() == f.size)
             && sha256_file(&path).is_ok_and(|h| h == want);
         if !whole {
@@ -3197,12 +3200,11 @@ async fn fetch_to_cache(
             "files": files.iter().map(|f| json!({ "filename": f.filename, "size": f.size, "hash": f.hash })).collect::<Vec<_>>(),
         });
         let path = dir.join("manifest.json");
-        std::fs::write(
+        write_whole(
             &path,
-            serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+            &serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
         )
         .map_err(|e| Permanent(format!("{}: {e}", path.display())))?;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     }
     let done = json!({
         "job_id": job,
@@ -3210,13 +3212,32 @@ async fn fetch_to_cache(
         "bytes": total,
         "finished_at": tinytrader_observe::unix_seconds(),
     });
-    std::fs::write(
+    write_whole(
         &complete,
-        serde_json::to_vec_pretty(&done).unwrap_or_default(),
+        &serde_json::to_vec_pretty(&done).unwrap_or_default(),
     )
     .map_err(|e| Permanent(format!("{}: {e}", complete.display())))?;
-    let _ = std::fs::set_permissions(&complete, std::fs::Permissions::from_mode(0o644));
     Ok(fetched)
+}
+
+/// Write `path` whole: beside it, flushed, readable by everyone, renamed
+/// over it, and its folder flushed, so a crash leaves the old file or the
+/// new one, never part of one.
+fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let tmp = dir.join(format!(".{name}.new"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// One file into `path`: written to `<path>.part`, checked for its size
@@ -3283,7 +3304,7 @@ async fn copy_to_file(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if got != size || (!sha256.is_empty() && hash != sha256) {
+    if got != size || hash != sha256 {
         let _ = std::fs::remove_file(&part);
         let m =
             format!("got {got} bytes with SHA-256 {hash}; Databento lists {size} bytes, {sha256}");
@@ -3295,7 +3316,13 @@ async fn copy_to_file(
         });
     }
     let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o644));
-    std::fs::rename(&part, path).map_err(|e| Permanent(format!("{}: {e}", path.display())))
+    std::fs::rename(&part, path).map_err(|e| Permanent(format!("{}: {e}", path.display())))?;
+    // The rename is kept only once its folder is flushed.
+    path.parent()
+        .map_or(Ok(()), |d| {
+            std::fs::File::open(d).and_then(|d| d.sync_all())
+        })
+        .map_err(|e| Permanent(format!("{}: {e}", path.display())))
 }
 
 /// The SHA-256 of a file, as lowercase hex.
@@ -3375,21 +3402,52 @@ fn start_download(jobs: &Shared, job: String, manual: bool) {
     });
 }
 
-/// Whether the store has already filed this batch.
-async fn filed(jobs: &Jobs, job: &str) -> bool {
+/// The batches the store holds, by id, when it can say in full: `/batches`
+/// answered, and no volume was missing from what it read. Otherwise why
+/// not, so nothing is taken as not held when it may be on a volume that
+/// couldn't be seen (ingress review P0 5).
+async fn holdings(jobs: &Jobs) -> Result<Value, String> {
     let r = jobs
         .http
         .get(format!("{}/batches/databento", jobs.store))
         .timeout(Duration::from_secs(120))
         .send()
-        .await;
-    match r {
-        Ok(r) if r.status().is_success() => r
-            .json::<Value>()
-            .await
-            .is_ok_and(|v| v["batches"][job]["how"] == "filed"),
-        _ => false,
+        .await
+        .map_err(|e| format!("the store didn't answer: {e}"))?;
+    let status = r.status();
+    let v: Value = r
+        .json()
+        .await
+        .map_err(|e| format!("the store's answer ({status}) isn't JSON: {e}"))?;
+    if !status.is_success() {
+        return Err(format!(
+            "the store answered {status}: {}",
+            v["error"].as_str().unwrap_or_default()
+        ));
     }
+    let Some(missing) = v["missing_volumes"].as_array() else {
+        return Err(
+            "the store doesn't say whether it read every volume (it's older than this service)"
+                .into(),
+        );
+    };
+    if !missing.is_empty() {
+        let names: Vec<&str> = missing.iter().filter_map(Value::as_str).collect();
+        return Err(format!(
+            "volumes {} couldn't be read: what they hold can't be told",
+            names.join(", ")
+        ));
+    }
+    if !v["batches"].is_object() {
+        return Err("the store's answer has no batches".into());
+    }
+    Ok(v["batches"].clone())
+}
+
+/// Whether the store has already filed this batch; an error when it can't
+/// say (never "not filed").
+async fn filed(jobs: &Jobs, job: &str) -> Result<bool, String> {
+    Ok(holdings(jobs).await?[job]["how"] == "filed")
 }
 
 /// Stream every file of a done job into the store, then, its download's
@@ -3401,7 +3459,10 @@ async fn fetch_and_file(
     turn: Option<tokio::sync::SemaphorePermit<'_>>,
     manual: bool,
 ) -> Result<usize, String> {
-    if filed(jobs, job).await {
+    if filed(jobs, job)
+        .await
+        .map_err(|e| format!("not downloaded, since {e}"))?
+    {
         return Ok(0);
     }
     let files = jobs
@@ -3582,7 +3643,10 @@ async fn fetch_and_file(
     });
     // A job bought as a list of one option parent's contracts is filed as
     // partial days of that parent (decision 0018).
-    if filed(jobs, job).await {
+    if filed(jobs, job)
+        .await
+        .map_err(|e| format!("not filed, since {e}"))?
+    {
         return Ok(0);
     }
     let parent = lock(&jobs.details).get(job).and_then(contract_parent);
