@@ -171,6 +171,12 @@ bought again), so they say what the store holds or say they can't
   cleanly); or when it held datasets when last read in full and now holds
   none ([accept it as empty](#post-volumesnameaccept-empty) if it really
   is).
+- So is a volume where any file or folder can't be looked at for a reason
+  other than its absence (an I/O error, a link loop), and one that went away
+  or became another device during the scan (checked again when the scan
+  ends). A scan with any error never changes what the volume is remembered to
+  hold, so a drive dropping out mid-scan shows as missing, never as holding
+  less.
 - Each error names the path it is about, and how to
   [ignore](#post-volumesnameignore) that path if it should be.
 
