@@ -635,3 +635,47 @@ folders it would have written again too. A scan that was running meanwhile reads
 again before it answers. A change of what is ignored asks for a full rescan;
 until it is done `/coverage` waits (at most 60 seconds, then `503`). With `fresh=1` it waits for a scan started after the
 request ([above](#what-the-store-holds)).
+
+## Migrating to the content-addressed format: `store migrate-cas`
+
+A one-off tool (decision 0035 section 9), run by an operator with the
+service stopped or against volumes it doesn't write. It reads today's volumes
+(files at their names) and writes one volume in the content-addressed format
+([the storage contract](../storage-contract.md)).
+
+```sh
+store migrate-cas --plan --from data=/mnt/data --from tt03=/mnt/tt03            # writes nothing
+store migrate-cas --to /tank/nas-1 --id nas-1 --from data=/mnt/data --from tt03=/mnt/tt03
+```
+
+- **Everything is copied:**
+  - every regular file on each source becomes an object, bound under its
+    path within the volume;
+  - that includes day files, receipts, ledgers, manifests, uploads not yet
+    filed, superseded days and anything else;
+  - only the operating system's own files are skipped, and counted. Links
+    and special files are listed as errors.
+- **Sources are only read.** Mount them read-only.
+- **Checked against what was recorded:** a file the store recorded a hash
+  for (in its manifest, a filing ledger or a batch receipt, as for `/files`)
+  must match what's read. One that doesn't is listed under `damaged` and
+  isn't bound.
+- **Duplicates and conflicts:**
+  - the same name on several sources with one content is one object and
+    one binding;
+  - different contents are a **conflict**: each content is kept as a
+    pending object, none is bound, and the conflict is listed for an
+    operator.
+- **Resumable:** a name already bound at the source file's size (and its
+  recorded hash, if any) isn't read again. Run it again after an
+  interruption.
+- **The report:** a JSON report goes to standard output, with:
+  - counts by kind, and what's to copy;
+  - what's already there, and what's bound;
+  - bytes written, names without a recorded hash, conflicts, damage and
+    errors;
+  - after a copy, the destination's `verify`.
+
+  Progress goes to standard error. The exit status is `0` when everything
+  was copied and bound, `1` with conflicts, damage or errors, and `2` on bad
+  arguments or an unwritable destination.
