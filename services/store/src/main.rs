@@ -61,6 +61,7 @@ type MidScan = Box<dyn Fn(&Path) + Send>;
 static MID_SCAN: std::sync::Mutex<Option<MidScan>> = std::sync::Mutex::new(None);
 mod ingest;
 mod manifest;
+mod migrate;
 #[cfg(test)]
 mod openapi;
 mod partial;
@@ -243,6 +244,11 @@ fn refused(code: StatusCode, why: impl Into<String>) -> Reply {
 
 #[tokio::main]
 async fn main() {
+    // `store migrate-cas …` (decision 0035): a one-off tool, not the service.
+    let argv: Vec<String> = std::env::args().collect();
+    if argv.get(1).map(String::as_str) == Some("migrate-cas") {
+        std::process::exit(tokio::task::block_in_place(|| migrate::main(&argv[2..])));
+    }
     let args = Args::parse();
     // Writes (uploads, filing, adopting, approving drives) need this bearer
     // token when it is configured; reads stay open.
