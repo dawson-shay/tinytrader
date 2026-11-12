@@ -399,6 +399,17 @@ there but can't be read now, `503`, so a client can ask again:
   found, and the volume hasn't been scanned yet (the store just started, or
   the drive just appeared).
 
+**On a content-addressed volume** (one holding `cas/`, decision 0035, as
+`store migrate-cas` writes it), a name is read through the volume's index:
+its object, sent with its hash. If that copy can't be read (its object gone,
+the wrong size, or the volume away), the same object is read from another
+content-addressed volume that's mounted (failover; the store logs which).
+With no copy readable, it's `503` (`no copy of … can be read now`), never
+`404`. These volumes' DBN names are listed by `GET /files` like any other,
+and the catalog's root for each says `cas: {format, volume, names, pending,
+conflicts}`; an index that can't be read is an error of the volume.
+`/coverage` and filing don't use the index yet (0035 step 3).
+
 **Its hash, as filed:** `X-Content-SHA256: <hex>` and
 `Digest: sha-256=<base64>` give the SHA-256 the store recorded when it filed
 the file, so a reader checks what it got. The store never hashes on a read.

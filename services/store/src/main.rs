@@ -130,6 +130,10 @@ struct Args {
     state: Option<PathBuf>,
 }
 
+/// Each content-addressed volume, by the store's name for it, with its index.
+type CasVolumes = BTreeMap<String, CasVolume>;
+type CasVolume = (tinytrader_cas::Volume, Arc<tinytrader_cas::Index>);
+
 struct Store {
     /// The configured volumes, then approved drives as they are found.
     volumes: std::sync::RwLock<Vec<Volume>>,
@@ -155,6 +159,9 @@ struct Store {
     requested: AtomicU64,
     /// Filings so far: what a read's recorded hash is looked up again after.
     filed: AtomicU64,
+    /// Each volume holding the content-addressed format (0035), with its
+    /// index as of the last scan.
+    cas: Mutex<Arc<CasVolumes>>,
     /// Files whose recorded hashes disagree, reported once each.
     hash_conflicts: Mutex<std::collections::HashSet<PathBuf>>,
     completed: AtomicU64,
@@ -500,7 +507,10 @@ async fn scan(store: &Shared, observer: &Observer) {
             .iter()
             .map(|v| {
                 let mine: Vec<&Value> = ignored.iter().filter(|i| i["volume"] == v.name.as_str()).collect();
-                let skip: Vec<PathBuf> = mine.iter().filter_map(|i| i["path"].as_str()).map(PathBuf::from).collect();
+                let mut skip: Vec<PathBuf> = mine.iter().filter_map(|i| i["path"].as_str()).map(PathBuf::from).collect();
+                // The content-addressed format (0035) is read from its index,
+                // not walked as a tree.
+                skip.push(v.path.join(tinytrader_cas::DIR));
                 // The volume as it was when the scan began: a scan that ends with
                 // it gone, or another device there, counts for nothing (P0,
                 // 2026-11-10: a drive dropping out mid-scan read as holding less).
@@ -559,7 +569,10 @@ async fn scan(store: &Shared, observer: &Observer) {
                     errors.push(json!(emptied(v)));
                 }
                 root["writable"] = json!(v.writable);
-                (root, (v.name.clone(), places), (v.name.clone(), served), errors)
+                let cas = (root["present"] == true)
+                    .then(|| cas_of(v, &mut root, &mut served))
+                    .flatten();
+                (root, (v.name.clone(), places), (v.name.clone(), served), errors, cas)
             })
             .collect::<Vec<_>>()
     })
@@ -582,7 +595,18 @@ async fn scan(store: &Shared, observer: &Observer) {
         ..Index::default()
     };
     let mut scanned = Vec::new();
-    for (root, places, served, errors) in found {
+    // A content-addressed volume away keeps its last index, so its names
+    // are still read from other copies (failover).
+    let before = lock(&store.cas).clone();
+    let mut cas = BTreeMap::new();
+    for (root, places, served, errors, c) in found {
+        if let Some(c) = c {
+            cas.insert(places.0.clone(), c);
+        } else if root["present"] != true
+            && let Some(c) = before.get(&places.0)
+        {
+            cas.insert(places.0.clone(), c.clone());
+        }
         scanned.push(root);
         index.volumes.push(places);
         index.files.push(served);
@@ -620,6 +644,7 @@ async fn scan(store: &Shared, observer: &Observer) {
         reapply(&volumes, &dir, &mut scanned, &mut index);
     }
     *lock(&store.index) = Arc::new(index);
+    *lock(&store.cas) = Arc::new(cas);
     *store
         .gate
         .write()
@@ -963,6 +988,7 @@ impl Store {
             requested: AtomicU64::new(0),
             filed: AtomicU64::new(0),
             hash_conflicts: Mutex::default(),
+            cas: Mutex::default(),
             completed: AtomicU64::new(0),
             wait: Duration::from_secs(60),
             fresh_wait: Duration::from_secs(600),
@@ -1969,9 +1995,26 @@ async fn send_file(
     let started = std::time::Instant::now();
     let name = format!("{volume}/{path}");
     let volumes = store.volumes();
+    // A name on a content-addressed volume is read through its index, from
+    // any copy (0035 section 6).
+    let cas_hit = {
+        let (s, vol, p) = (store.clone(), volume.clone(), path.clone());
+        tokio::task::spawn_blocking(move || cas_resolve(&s, &vol, &p))
+            .await
+            .ok()
+            .flatten()
+    };
+    let cas_sha = match cas_hit {
+        Some(Ok((_, ref h))) => Some(h.clone()),
+        Some(Err(why)) => {
+            return refused(StatusCode::SERVICE_UNAVAILABLE, why).into_response();
+        }
+        None => None,
+    };
     // Nothing is served from a volume that isn't mounted (an empty folder
-    // left behind holds nothing of it).
-    if let Some(v) = volumes.iter().find(|v| v.name == volume)
+    // left behind holds nothing of it), but through its index (above).
+    if cas_hit.is_none()
+        && let Some(v) = volumes.iter().find(|v| v.name == volume)
         && volumes::present(v).is_err()
         && let Some(why) = away(&store, v)
     {
@@ -1980,7 +2023,11 @@ async fn send_file(
     // A file not found on a volume found missing, or not yet scanned, may
     // be there: only a scanned volume's absent file is a 404.
     let s = store.clone();
+    let cas_file = cas_hit.and_then(Result::ok).map(|(p, _)| p);
     let found = tokio::task::spawn_blocking(move || {
+        if let Some(p) = cas_file {
+            return Ok(p);
+        }
         read::locate(&volumes, &volume, &path).map_err(|(code, why)| {
             let v = volumes.iter().find(|v| v.name == volume);
             match v.filter(|_| code == 404).and_then(|v| away(&s, v)) {
@@ -2013,14 +2060,15 @@ async fn send_file(
     // The hash filing recorded for it, sent so the reader can check what it
     // got (ingress review (E)); none when nothing recorded it, or when what
     // recorded it disagrees (reported).
-    let sha256 = match vpath {
-        Some(vp) => {
+    let sha256 = match (cas_sha, vpath) {
+        (Some(h), _) => recorded::Recorded::Known(h),
+        (None, Some(vp)) => {
             let (f2, generation) = (file.clone(), store.filed.load(Ordering::SeqCst));
             tokio::task::spawn_blocking(move || recorded::of(&vp, &f2, len, generation))
                 .await
                 .unwrap_or(recorded::Recorded::Unknown)
         }
-        None => recorded::Recorded::Unknown,
+        (None, None) => recorded::Recorded::Unknown,
     };
     let sha256 = match sha256 {
         recorded::Recorded::Known(h) => Some(h),
@@ -2087,6 +2135,84 @@ async fn send_file(
         r.headers_mut().insert("x-content-sha256", v);
     }
     r
+}
+
+/// A volume's content-addressed index (decision 0035), if it holds one: its
+/// DBN names are served, and its summary is in the catalog. An index that
+/// can't be read is an error of the volume.
+fn cas_of(v: &Volume, root: &mut Value, served: &mut Vec<catalog::Served>) -> Option<CasVolume> {
+    if !v.path.join(tinytrader_cas::DIR).join("FORMAT").exists() {
+        return None;
+    }
+    let read = tinytrader_cas::Volume::open(&v.path).and_then(|c| c.index().map(|i| (c, i)));
+    match read {
+        Ok((c, index)) => {
+            served.extend(
+                index
+                    .names
+                    .iter()
+                    .filter(|(n, _)| read::served(n.rsplit('/').next().unwrap_or_default()))
+                    .map(|(n, e)| (n.clone(), e.size)),
+            );
+            root["cas"] = json!({
+                "format": tinytrader_cas::FORMAT, "volume": c.id, "names": index.names.len(),
+                "pending": index.pending.len(), "conflicts": index.conflicts,
+            });
+            Some((c, Arc::new(index)))
+        }
+        Err(e) => {
+            if let Some(errs) = root["errors"].as_array_mut() {
+                errs.push(json!(format!(
+                    "its content-addressed index can't be read: {e}"
+                )));
+            }
+            None
+        }
+    }
+}
+
+/// Where a name on a content-addressed volume can be read now: its object
+/// on that volume, or else (failover, 0035 section 6) the same object on
+/// another content-addressed volume that's mounted. With its hash; or why
+/// none can be read.
+fn cas_resolve(
+    store: &Store,
+    volume: &str,
+    name: &str,
+) -> Option<Result<(PathBuf, String), String>> {
+    let cas = lock(&store.cas).clone();
+    let (_, index) = cas.get(volume)?;
+    let entry = index.names.get(name)?.clone();
+    let volumes = store.volumes();
+    let mounted = |n: &str| {
+        volumes
+            .iter()
+            .any(|v| v.name == n && volumes::present(v).is_ok())
+    };
+    let order =
+        std::iter::once(volume.to_owned()).chain(cas.keys().filter(|k| *k != volume).cloned());
+    for vol in order {
+        let Some((c, _)) = cas.get(&vol) else {
+            continue;
+        };
+        // Any volume's object of that hash is that content, whatever it's
+        // named there.
+        if !mounted(&vol) {
+            continue;
+        }
+        if let Some(p) = c.object(&entry.sha256, &entry.ext)
+            && std::fs::metadata(&p).is_ok_and(|m| m.len() == entry.size)
+        {
+            if vol != volume {
+                eprintln!("store: {volume}/{name}: read from its copy on {vol}");
+            }
+            return Some(Ok((p, entry.sha256)));
+        }
+    }
+    Some(Err(format!(
+        "no copy of {volume}/{name} (SHA-256 {}) can be read now; ask again when its volume is back",
+        entry.sha256
+    )))
 }
 
 /// The folder of the volume a `/files` name is on.
@@ -3148,6 +3274,86 @@ mod tests {
             events.contains("2026-10-05.dbn.zst: its recorded hashes disagree"),
             "{events}"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A content-addressed volume (0035) is read by name through its index,
+    /// with its hash; a copy that can't be read is read from another volume's
+    /// (failover); with none, 503.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_name_on_a_cas_volume_is_read_from_any_copy() {
+        let dir = scratch("cas-reads");
+        let src = dir.join("src");
+        let name = "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2022-09-07.dbn.zst";
+        std::fs::create_dir_all(src.join(name).parent().unwrap()).unwrap();
+        std::fs::write(src.join(name), b"the day").unwrap();
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        for (root, id) in [(&a, "cas-a"), (&b, "cas-b")] {
+            let sources = [migrate::source(&format!("data={}", src.display())).unwrap()];
+            let (r, ok) = migrate::run(&sources, Some((root, id)), false, &mut |_| {}).unwrap();
+            assert!(ok, "{r}");
+        }
+        let s = store(&[("a", &a), ("b", &b)], &dir.join("state.json"));
+        scanned(&s).await;
+        let addr = serve_plain(&s).await;
+        let sha = {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(b"the day"))
+        };
+        let read = |vol: &'static str| {
+            let addr = addr.clone();
+            async move {
+                let mut c = tokio::net::TcpStream::connect(&addr).await.unwrap();
+                let req = format!(
+                    "GET /files/{vol}/{name} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"
+                );
+                c.write_all(req.as_bytes()).await.unwrap();
+                let mut out = String::new();
+                c.read_to_string(&mut out).await.unwrap();
+                let (head, body) = out.split_once("\r\n\r\n").unwrap();
+                let head = head.to_ascii_lowercase();
+                let code: u16 = head.split(' ').nth(1).unwrap().parse().unwrap();
+                let h = head
+                    .lines()
+                    .find_map(|l| l.strip_prefix("x-content-sha256: ").map(str::to_owned));
+                (code, body.to_owned(), h)
+            }
+        };
+        assert_eq!(read("a").await, (200, "the day".into(), Some(sha.clone())));
+        let (code, v) = get(&addr, "/files?pattern=*cbbo-1m*").await;
+        assert_eq!(code, 200);
+        let listed: Vec<&str> = v["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        assert_eq!(listed, [format!("a/{name}"), format!("b/{name}")], "{v}");
+        assert_eq!(lock(&s.catalog)["roots"][0]["cas"]["names"], 1);
+        // a's copy gone: read from b's.
+        let obj = tinytrader_cas::Volume::open(&a)
+            .unwrap()
+            .object(&sha, "dbn.zst")
+            .unwrap();
+        let mut p = std::fs::metadata(&obj).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        p.set_readonly(false);
+        std::fs::set_permissions(&obj, p).unwrap();
+        std::fs::remove_file(&obj).unwrap();
+        assert_eq!(
+            read("a").await,
+            (200, "the day".into(), Some(sha.clone())),
+            "failover"
+        );
+        // a away altogether: still read from b.
+        std::fs::rename(&a, dir.join("a-away")).unwrap();
+        scanned(&s).await;
+        assert_eq!(read("a").await.0, 200, "a away, b holds it");
+        // No copy left: 503, not 404.
+        std::fs::rename(&b, dir.join("b-away")).unwrap();
+        let (code, body, _) = read("a").await;
+        assert_eq!(code, 503, "{body}");
+        assert!(body.contains("no copy of a/"), "{body}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

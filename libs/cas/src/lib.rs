@@ -45,6 +45,9 @@ pub struct Entry {
     pub version: u64,
     pub sha256: String,
     pub size: u64,
+    /// The object's extension, to find it.
+    #[serde(default)]
+    pub ext: String,
     /// What it is: `day`, `range`, `receipt`, …
     pub kind: String,
     /// Where it came from: `batch OPRA-…`, `import …`, `migrated from …`.
@@ -78,6 +81,7 @@ impl Index {
                 version,
                 sha256,
                 size,
+                ext,
                 kind,
                 source,
                 previous,
@@ -109,6 +113,7 @@ impl Index {
                         version: *version,
                         sha256: sha256.clone(),
                         size: *size,
+                        ext: ext.clone(),
                         kind: kind.clone(),
                         source: source.clone(),
                         previous: previous.clone(),

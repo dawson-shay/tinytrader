@@ -18,7 +18,7 @@ const SERVED: [&str; 2] = [".dbn.zst", ".dbn"];
 /// The most files one listing returns, unless asked for fewer.
 pub const MAX_LISTED: usize = 100_000;
 
-fn served(name: &str) -> bool {
+pub(crate) fn served(name: &str) -> bool {
     SERVED.iter().any(|s| name.ends_with(s))
 }
 
