@@ -710,8 +710,8 @@ fn file_batch(
     // (interrupted: an I/O error, a crash) is replaced, set aside and on
     // record, rather than refusing every later filing over its receipts.
     // Read before this filing's own ledger is opened.
-    let replace_provenance = interrupted_earlier(&roots, batch)?
-        && roots.iter().any(|r| prov(r).exists());
+    let replace_provenance =
+        interrupted_earlier(&roots, batch)? && roots.iter().any(|r| prov(r).exists());
     let mut ledger = Ledger::open(
         &roots
             .iter()
@@ -938,8 +938,7 @@ fn file_batch(
             let aside = root
                 .join("provenance")
                 .join(format!("{batch}.interrupted-{at}"));
-            fs::rename(prov(root), &aside)
-                .map_err(|e| format!("{}: {e}", prov(root).display()))?;
+            fs::rename(prov(root), &aside).map_err(|e| format!("{}: {e}", prov(root).display()))?;
             ledger.record(json!({ "step": "provenance-set-aside", "from": prov(root), "to": aside,
                                   "why": "an earlier filing of this batch began and never completed" }))?;
         }
@@ -1243,6 +1242,29 @@ mod tests {
         let s = incorporate(&parts, &[], "OPRA-S", "2026-10-06").unwrap();
         assert_eq!(s["files"].as_array().unwrap().len(), 2);
         assert_eq!(fs::read(a.join(DAY)).unwrap(), one_day);
+        // What filing recorded is what a read sends (ingress review (E)):
+        // the ledger's move, checked against the provider's receipt.
+        for (vol, file, sha) in [
+            (d.join("a"), a.join(DAY), &sha1),
+            (
+                d.join("b"),
+                b.join("OPRA.PILLAR/SPX.OPT/cmbp-1/2025-10-02.dbn.zst"),
+                &sha2,
+            ),
+        ] {
+            let len = fs::metadata(&file).unwrap().len();
+            let l = crate::recorded::ledgered(&vol, u64::MAX);
+            let got = l.get(file.strip_prefix(&vol).unwrap()).unwrap();
+            assert_eq!(
+                got.receipt.as_deref(),
+                Some(sha.as_str()),
+                "the receipt was found"
+            );
+            assert_eq!(
+                crate::recorded::of(&vol, &file, len, u64::MAX),
+                crate::recorded::Recorded::Known(sha.clone())
+            );
+        }
         assert_eq!(
             fs::read(b.join("OPRA.PILLAR/SPX.OPT/cmbp-1/2025-10-02.dbn.zst")).unwrap(),
             two_day
@@ -1569,7 +1591,10 @@ mod tests {
             .filter(|p| p.to_string_lossy().contains("OPRA-I.interrupted-"))
             .collect();
         assert_eq!(aside.len(), 1, "set aside, not deleted");
-        assert_eq!(fs::read_to_string(aside[0].join("manifest.json")).unwrap(), "{}");
+        assert_eq!(
+            fs::read_to_string(aside[0].join("manifest.json")).unwrap(),
+            "{}"
+        );
         let ledger =
             fs::read_to_string(root.join("migrations/2026-10-06-incorporate-OPRA-I.events.jsonl"))
                 .unwrap();
