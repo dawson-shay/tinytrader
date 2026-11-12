@@ -395,6 +395,7 @@ fn router(store: Shared, token: WriteToken) -> Router {
         .route("/adopt/{provider}", post(adopt))
         .route("/volumes/approve", post(approve))
         .route("/volumes/{name}/retire", post(retire))
+        .route("/volumes/{name}/held", post(correct_held))
         .route("/volumes/{name}/accept-empty", post(accept_empty))
         .route("/volumes/{name}/ignore", post(ignore).delete(unignore))
         .route("/conditions/backfill", post(backfill_conditions))
@@ -929,18 +930,53 @@ impl Store {
             k.writable = v.writable;
             k.require_mount = v.require_mount;
         }
+        let mut shrunk = Vec::new();
         for root in roots
             .iter()
             .filter(|x| x["present"] == true && x["errors"].as_array().is_some_and(Vec::is_empty))
         {
-            if let Some(k) = root["name"].as_str().and_then(|n| r.volumes.get_mut(n)) {
-                k.held = state::held(root);
+            if let Some(name) = root["name"].as_str()
+                && let Some(k) = r.volumes.get_mut(name)
+            {
+                // A shrink is kept at its earlier extent, suspect, until an
+                // operator accepts the scan (POST /volumes/{name}/held).
+                let (held, newly) = state::keep_shrunk(&k.held, state::held(root), unix_seconds());
+                k.held = held;
+                shrunk.extend(newly.into_iter().map(|l| (name.to_owned(), l)));
             }
+        }
+        for (name, line) in shrunk {
+            self.events.push(
+                format!("volume {name} holds less than it did; kept as suspect"),
+                line,
+            );
         }
         if *r == before {
             return Ok(());
         }
         state::save(&self.state_path, &r)
+    }
+
+    /// A volume away's `held` corrected now, in the catalog and in what
+    /// writes are checked against, not only from the next scan.
+    fn set_away_held(&self, name: &str, held: Value) {
+        let mut gate = self
+            .gate
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(a) = gate
+            .as_mut()
+            .and_then(|g| g.away.iter_mut().find(|(n, _)| n == name))
+        {
+            a.1 = held.clone();
+        }
+        drop(gate);
+        let mut c = lock(&self.catalog);
+        for root in c["roots"].as_array_mut().into_iter().flatten() {
+            if root["name"] == name && root["present"] != true {
+                root["held"] = held.clone();
+            }
+        }
     }
 
     /// Every writable volume's share of an incoming batch.
@@ -2346,6 +2382,142 @@ async fn rebuild_coverage(AxState(store): AxState<Shared>) -> Reply {
 /// longer counts as missing, and the state file keeps a record of what it
 /// held when last seen, and when it was retired. A volume that is mounted
 /// isn't retired.
+#[derive(serde::Deserialize, Default)]
+struct HeldFix {
+    #[serde(default)]
+    by: Option<String>,
+    /// A listing of a volume away (each path within the volume).
+    #[serde(default)]
+    listing: Option<Vec<state::Listed>>,
+    /// For a mounted volume read in full: take its last scan as what it
+    /// holds, suspect entries included.
+    #[serde(default)]
+    accept_scan: bool,
+}
+
+/// Correct what a volume is remembered to hold: from an operator's listing
+/// while it's away (only ever widening), or by accepting a mounted volume's
+/// scan (clearing what was kept as suspect). Recorded in the state file and
+/// as an event.
+async fn correct_held(
+    AxState(store): AxState<Shared>,
+    UrlPath(name): UrlPath<String>,
+    body: axum::body::Bytes,
+) -> Reply {
+    let req: HeldFix = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => return refused(StatusCode::BAD_REQUEST, e.to_string()),
+    };
+    let Some(by) = req.by.clone().filter(|b| !b.trim().is_empty()) else {
+        return refused(StatusCode::BAD_REQUEST, "say who is correcting it (\"by\")");
+    };
+    let volume = store.volumes().into_iter().find(|v| v.name == name);
+    let Some(volume) = volume else {
+        return refused(StatusCode::NOT_FOUND, format!("no volume {name}"));
+    };
+    let mounted = volumes::present(&volume).is_ok();
+    let record = match (req.listing, req.accept_scan) {
+        (Some(files), false) => {
+            if mounted {
+                return refused(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "{name} is mounted: its scan says what it holds; a listing is only for a volume away"
+                    ),
+                );
+            }
+            let (added, unparsed) = state::held_of_listing(&files);
+            use sha2::Digest as _;
+            let listing_sha256 = format!("{:x}", sha2::Sha256::digest(&body));
+            let mut r = lock(&store.remembered);
+            let Some(k) = r.volumes.get_mut(&name) else {
+                return refused(
+                    StatusCode::NOT_FOUND,
+                    format!("no volume {name} remembered"),
+                );
+            };
+            let before = k.held.clone();
+            k.held = state::widen(&before, &added);
+            let held = k.held.clone();
+            let record = json!({
+                "volume": name, "by": by, "at": unix_seconds(),
+                "files": files.len(), "bytes": files.iter().map(|f| f.size).sum::<u64>(),
+                "hashed": files.iter().filter(|f| f.sha256.is_some()).count(),
+                "listing_sha256": listing_sha256, "added": added,
+                "unparsed": unparsed.len(),
+                "unparsed_sample": unparsed.iter().take(20).collect::<Vec<_>>(),
+            });
+            r.held_listings.push(record.clone());
+            if let Err(e) = state::save(&store.state_path, &r) {
+                r.held_listings.pop();
+                if let Some(k) = r.volumes.get_mut(&name) {
+                    k.held = before;
+                }
+                return refused(StatusCode::INTERNAL_SERVER_ERROR, e);
+            }
+            drop(r);
+            store.set_away_held(&name, held);
+            record
+        }
+        (None, true) => {
+            if !mounted {
+                return refused(
+                    StatusCode::CONFLICT,
+                    format!("{name} isn't mounted; there's no scan to accept"),
+                );
+            }
+            let root = lock(&store.catalog)["roots"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|x| x["name"] == name.as_str())
+                .cloned();
+            let Some(root) = root.filter(|x| {
+                x["present"] == true && x["errors"].as_array().is_some_and(Vec::is_empty)
+            }) else {
+                return refused(
+                    StatusCode::CONFLICT,
+                    format!("{name}'s last scan didn't read it in full; nothing to accept"),
+                );
+            };
+            let mut r = lock(&store.remembered);
+            let Some(k) = r.volumes.get_mut(&name) else {
+                return refused(
+                    StatusCode::NOT_FOUND,
+                    format!("no volume {name} remembered"),
+                );
+            };
+            let now = state::held(&root);
+            let before = std::mem::replace(&mut k.held, now.clone());
+            let record = json!({
+                "volume": name, "by": by, "at": unix_seconds(),
+                "accepted_scan": true, "held_before": before, "held": now,
+            });
+            r.held_listings.push(record.clone());
+            if let Err(e) = state::save(&store.state_path, &r) {
+                r.held_listings.pop();
+                if let Some(k) = r.volumes.get_mut(&name) {
+                    k.held = before;
+                }
+                return refused(StatusCode::INTERNAL_SERVER_ERROR, e);
+            }
+            record
+        }
+        _ => {
+            return refused(
+                StatusCode::BAD_REQUEST,
+                "give either a \"listing\" (a volume away) or \"accept_scan\": true (a mounted one)",
+            );
+        }
+    };
+    store.events.push(
+        format!("corrected what volume {name} holds"),
+        record.to_string(),
+    );
+    store.request_rescan();
+    reply(StatusCode::OK, record)
+}
+
 async fn retire(AxState(store): AxState<Shared>, UrlPath(name): UrlPath<String>) -> Reply {
     let volume = store
         .volumes()
@@ -2889,6 +3061,121 @@ mod tests {
             json!({ "query": query }).to_string(),
         )
         .unwrap();
+    }
+
+    /// What a volume away is remembered to hold is corrected from an
+    /// operator's listing, at once, for what writes are checked against: a
+    /// day it didn't know data held is blocked after, not before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listing_corrects_what_a_volume_away_held() {
+        let dir = scratch("held-listing");
+        let (data, b) = (dir.join("data"), dir.join("b"));
+        let day = data.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("2022-09-07.dbn.zst"), b"x").unwrap();
+        std::fs::create_dir_all(b.join("Databento")).unwrap();
+        let state_path = dir.join("state.json");
+        let s = store(&[("data", &data), ("b", &b)], &state_path);
+        scanned(&s).await;
+        let addr = serve_plain(&s).await;
+        let listing = json!({ "by": "operator", "listing": [
+            { "path": "./Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2023-05-01.dbn.zst", "size": 10 },
+            { "path": "./Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2023-06-30.dbn.zst", "size": 12, "sha256": "ab" },
+            { "path": "./Databento/.incoming/X/opra-pillar-20251112.tcbbo.dbn.zst", "size": 5 },
+        ] })
+        .to_string();
+        let (code, why) = call(&addr, "POST", "/volumes/data/held", None, &listing).await;
+        assert_eq!(code, 409, "a mounted volume's scan is the truth: {why}");
+        std::fs::rename(&data, dir.join("data-away")).unwrap();
+        scanned(&s).await;
+        let q = json!({ "dataset": "OPRA.PILLAR", "schema": "cbbo-1m",
+            "symbols": ["SPY.OPT"], "start": "2023-06-01", "end": "2023-06-02" });
+        incoming_batch(&b, "Databento", "OPRA-2023", &q);
+        let (code, why) = call(
+            &addr,
+            "POST",
+            "/volumes/data/held",
+            None,
+            r#"{"listing": []}"#,
+        )
+        .await;
+        assert_eq!(code, 400, "who corrects it is recorded: {why}");
+        let (code, why) = call(&addr, "POST", "/volumes/data/held", None, &listing).await;
+        assert_eq!(code, 200, "{why}");
+        let rec: Value = serde_json::from_str(&why).unwrap();
+        assert_eq!(
+            (
+                rec["files"].clone(),
+                rec["hashed"].clone(),
+                rec["unparsed"].clone()
+            ),
+            (json!(3), json!(1), json!(1))
+        );
+        let held =
+            lock(&s.remembered).volumes["data"].held["databento/OPRA.PILLAR/SPY.OPT"]["cbbo-1m"]
+                .clone();
+        assert_eq!(
+            (held["first"].clone(), held["last"].clone()),
+            (json!("2022-09-07"), json!("2023-06-30")),
+            "widened, never narrowed"
+        );
+        let kept = state::load(&state_path).unwrap();
+        assert_eq!(kept.held_listings.len(), 1);
+        assert_eq!(kept.held_listings[0]["by"], "operator");
+        let (code, why) = call(&addr, "POST", "/incorporate/databento/OPRA-2023", None, "").await;
+        assert_eq!(code, 503, "{why}");
+        assert!(why.contains("away") && why.contains("2023-06-01"), "{why}");
+        // It holds after the next scan too.
+        scanned(&s).await;
+        let (code, _) = call(&addr, "POST", "/incorporate/databento/OPRA-2023", None, "").await;
+        assert_eq!(code, 503);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A schema that vanishes from a volume read in full is kept at its
+    /// earlier extent, suspect, with an event, until an operator accepts the
+    /// scan.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_a_volume_stops_holding_is_kept_as_suspect() {
+        let dir = scratch("held-suspect");
+        let v = dir.join("v");
+        for schema in ["cbbo-1m", "definition"] {
+            let d = v.join("Databento/OPRA.PILLAR/SPY.OPT").join(schema);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("2022-09-07.dbn.zst"), b"x").unwrap();
+        }
+        let s = store(&[("v", &v)], &dir.join("state.json"));
+        scanned(&s).await;
+        let addr = serve_plain(&s).await;
+        std::fs::remove_dir_all(v.join("Databento/OPRA.PILLAR/SPY.OPT/definition")).unwrap();
+        scanned(&s).await;
+        let def = || {
+            lock(&s.remembered).volumes["v"].held["databento/OPRA.PILLAR/SPY.OPT"]
+                .get("definition")
+                .cloned()
+        };
+        let kept = def().expect("kept");
+        assert_eq!(
+            (kept["suspect"].clone(), kept["last"].clone()),
+            (json!(true), json!("2022-09-07")),
+            "{kept}"
+        );
+        let events = s.events.since(0, 100).to_string();
+        assert!(events.contains("holds less than it did"), "{events}");
+        // Still suspect, one event, on the next scan.
+        scanned(&s).await;
+        assert_eq!(def().unwrap()["suspect"], true);
+        let (code, why) = call(
+            &addr,
+            "POST",
+            "/volumes/v/held",
+            None,
+            r#"{"by":"operator","accept_scan":true}"#,
+        )
+        .await;
+        assert_eq!(code, 200, "{why}");
+        assert_eq!(def(), None, "accepted");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A volume away (here `data`, gone for good but not retired) blocks only

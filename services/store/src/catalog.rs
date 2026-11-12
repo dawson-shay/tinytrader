@@ -1356,7 +1356,7 @@ fn strings(v: &Value) -> Vec<String> {
 }
 
 /// `VENUE.FEED`, e.g. `OPRA.PILLAR`.
-fn is_dataset_name(n: &str) -> bool {
+pub(crate) fn is_dataset_name(n: &str) -> bool {
     n.split_once('.').is_some_and(|(a, b)| {
         let ok = |s: &str| {
             !s.is_empty()

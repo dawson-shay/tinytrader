@@ -27,6 +27,7 @@ Shared conventions are in the [API overview](README.md).
 | `POST /adopt/{provider}` | write | File a download folder already on a volume, where it is. |
 | `POST /volumes/approve` | write | Approve a drive found in the mount directory. |
 | `POST /volumes/{name}/retire` | write | Forget a remembered volume that is away for good ([below](#remembered-volumes)). |
+| `POST /volumes/{name}/held` | write | Correct what a volume is remembered to hold: from a listing while it's away, or by accepting a mounted volume's scan ([below](#post-volumesnameheld)). |
 | `POST /conditions/{provider}` | write | Record days' conditions from the provider's API ([below](#day-conditions)). |
 | `POST /conditions/backfill` | write | Record the conditions in the `condition.json` receipts already kept. |
 | `POST /volumes/{name}/ignore`, `DELETE` | write | Skip, or stop skipping, a path on a volume that can't be read ([below](#post-volumesnameignore)). |
@@ -208,6 +209,33 @@ Approved drives, and volumes in `STORE_VOLUMES` under `/Volumes`, must be
 mount points (on another device than the folder they sit in), and nothing is
 written to one that isn't. Add `:anydir` to a `STORE_VOLUMES` entry
 (`NAME=PATH:anydir`, with or before `:ro`) to take a plain folder.
+
+#### `POST /volumes/{name}/held`
+
+What a volume away is remembered to hold decides which filings wait for it
+(above). When that memory is wrong, an operator corrects it.
+
+- **From a listing, while the volume is away:**
+  `{"by": "...", "listing": [{"path": "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2023-05-01.dbn.zst", "size": 1169420, "sha256": "..."}]}`.
+  - Paths are within the volume, in the store layout. Any other path (the
+    store's own folders, other layouts) is counted in `unparsed`, with a
+    sample of up to 20, and adds nothing.
+  - What it holds is only ever widened. It's checked against at once, before
+    the next scan.
+  - A mounted volume is `409`: its scan says what it holds.
+- **Accepting a scan, for a mounted volume read in full:**
+  `{"by": "...", "accept_scan": true}`. What it holds becomes what the last
+  scan found, including what was kept as suspect (below). Otherwise it's
+  `409`.
+- **Recorded:** each correction is kept in the state file (`held_listings`,
+  with who, when, the listing's sha256 and what it added), and is an event.
+
+**What a volume stops holding is kept, suspect.** A volume read in full
+whose scan finds less of a schema than before (it's gone, or its first..last
+narrowed) keeps the earlier extent, marked `"suspect": true` with
+`suspect_since`, and an event says so once. Days don't leave a volume on
+their own, so a shrink is treated as a scan's mistake until an operator
+accepts the scan.
 
 #### `POST /volumes/{name}/retire`
 
