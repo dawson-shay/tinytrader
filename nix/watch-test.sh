@@ -76,6 +76,10 @@ touch -d "@$(( $(date +%s) - 7300 ))" "$work/stamp"
 WATCH_FRESH="backup:3600:$work/stamp" run; says "backup: last done 2 h ago (limit 1 h)"
 touch "$work/stamp"
 WATCH_FRESH="backup:3600:$work/stamp" run; says "resolved"
+touch -d "@$(( $(date +%s) - 600 ))" "$work/stamp"
+WATCH_FRESH="link:180:$work/stamp" run; WATCH_FRESH="link:180:$work/stamp" run; says "link: last done 10 min ago (limit 3 min)"
+touch "$work/stamp"
+WATCH_FRESH="link:180:$work/stamp" run; says "resolved"
 WATCH_FRESH="backup:3600" run; WATCH_FRESH="backup:3600" run; says "not NAME:SECONDS:PATH"
 run
 
