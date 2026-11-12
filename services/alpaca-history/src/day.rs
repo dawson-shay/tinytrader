@@ -1885,12 +1885,29 @@ mod stream_tests {
         let dir = scratch("restart");
         let f = FakeAlpaca::start(T3, Q3).await;
         f.hang("quotes", 2);
-        let r = tokio::time::timeout(
-            Duration::from_millis(500),
-            build(&f.client(), Feed::Sip, "SPY", DAY, &dir),
-        )
-        .await;
-        assert!(r.is_err(), "interrupted");
+        // Interrupted once it has asked for the hung page (so the pages before
+        // it are spooled), however slow the machine, not after a fixed time.
+        {
+            let client = f.client();
+            let mut b = Box::pin(build(&client, Feed::Sip, "SPY", DAY, &dir));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            // The trades lane (three pages) runs beside it: done too, then a
+            // moment more for it to keep its spool.
+            let mut settled = None;
+            loop {
+                assert!(std::time::Instant::now() < deadline, "never asked for page 2");
+                if settled.is_none() && f.hung() > 0 && f.served("trades", 2) == 1 {
+                    settled = Some(std::time::Instant::now() + Duration::from_millis(200));
+                }
+                if settled.is_some_and(|t| std::time::Instant::now() >= t) {
+                    break;
+                }
+                tokio::select! {
+                    _ = &mut b => panic!("the build finished despite the hung page"),
+                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        }
         assert_eq!((f.served("quotes", 0), f.served("quotes", 1)), (1, 1));
         let g = FakeAlpaca::start(T3, Q3).await;
         let b = build(&g.client(), Feed::Sip, "SPY", DAY, &dir)
