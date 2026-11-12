@@ -2609,6 +2609,51 @@ async fn cache_done(r: &Rig, id: &str) -> (String, Option<String>) {
 const DBN_BYTES_SHA256: &str =
     "sha256:a0352b911ea12767c932c228fc48328dc31e7380cb49d20141d2d79712883079";
 
+/// Ingress review (F): a file Databento lists without a SHA-256 (or with one
+/// that isn't one) is never cached unchecked, and the job isn't marked whole.
+#[tokio::test]
+async fn a_file_listed_without_a_hash_is_not_cached() {
+    let folder = std::env::temp_dir().join(format!(
+        "tinytrader-jobs-cache-nohash-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&folder);
+    let dir = folder.clone();
+    let r = rig_with("cache-nohash", move |j| j.cache_dir = Some(dir)).await;
+    for (id, hash) in [
+        ("OPRA-H1", ""),
+        ("OPRA-H2", "sha256:00"),
+        ("OPRA-H3", "sha256:"),
+    ] {
+        cache_job(&r, id, hash);
+        let (code, Json(v)) = cache(
+            AxState(r.jobs.clone()),
+            UrlPath(id.into()),
+            Query(OriginQuery::default()),
+        )
+        .await;
+        assert_eq!(code, StatusCode::ACCEPTED, "{v}");
+        let (state, error) = cache_done(&r, id).await;
+        assert_eq!(state, "failed", "{id}");
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|e| e.contains("no usable SHA-256")),
+            "{id}: {error:?}"
+        );
+        let held = folder.join(id).join(format!(
+            "opra-pillar-{}.tcbbo.dbn.zst",
+            DAY.replace('-', "")
+        ));
+        assert!(!held.exists(), "{id}: not cached");
+        assert!(
+            !folder.join(id).join("COMPLETE").exists(),
+            "{id}: not whole"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&folder);
+}
+
 #[tokio::test]
 async fn a_done_job_is_cached_whole_and_checked_outside_the_store() {
     let folder = std::env::temp_dir().join(format!("tinytrader-jobs-cache-{}", std::process::id()));
