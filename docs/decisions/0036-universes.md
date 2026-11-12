@@ -7,7 +7,7 @@
   [0037](0037-time-conventions.md) (time),
   [0019](0019-purchase-guards.md) (purchases),
   [0007](0007-storage-pool-and-automations.md) (protection classes)
-- **Built after** 0035's core and 0034.
+- **Built after** 0035's core, 0034 and 0038 (the security master).
 
 ## Context
 
@@ -127,12 +127,18 @@ the planner:
 4. **The Python API.**
 5. **Fill**, through the planner, with paid items as one quote.
 
-## Open questions
+## Settled by the user (2026-11-11)
 
-- **Whether member weights matter to resolution** (only the top N members, by
-  weight). The recommendation is to keep the weights in the table, so a
-  universe can take only the top N later.
-- **Russell 2000 membership is large** (about 2,000 names), and its N-PORT
-  filings are quarterly, so a rebalance's exact date comes from
-  FTSE Russell's calendar. That calendar is reference data with its own
-  `known_at`.
+- **Membership is binary:** weights never limit resolution. They're kept in
+  the table, and a request may pass `min_weight` to filter by them.
+- **Effective dates:**
+  - **Russell 2000:** taken from FTSE Russell's published reconstitution
+    calendar (annual, in June, plus quarterly IPO additions; whether the 2026
+    move to semi-annual reconstitution is real is checked against FTSE
+    Russell's own notice when the table is built), with N-PORT quarter-end
+    holdings as the check.
+  - **S&P 500:** the same pattern, its own change announcements, with N-PORT
+    as the check.
+  - Either calendar is reference data with its own `known_at`.
+- **Members are securities** (0038): a universe resolves to `security_id`s,
+  so a rename (BK → BNY) is a listing change, not a membership change.
