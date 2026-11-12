@@ -34,6 +34,21 @@ Shared conventions are in the [API overview](README.md).
 
 Writes are refused from a web page of another origin.
 
+**No day is filed beside a copy the store can't see** (P0, 2026-11-10):
+
+- **Before its first scan, or while any volume is erroring** (present but
+  not read in full, as when a drive is dropping out), every upload, filing,
+  import and adoption is answered `503` and nothing is done. Retry later.
+- **While a volume is away** (not mounted), a filing, import or adoption
+  whose days fall within what that volume is remembered to hold is answered
+  `503`. That's the same dataset, symbol and schema, between the first and
+  last day remembered. Everything else is filed as usual, and a volume away
+  that held nothing blocks nothing. Bring the volume back, or
+  [retire](#post-volumesnameretire) it if it's gone for good.
+- **During a filing,** a check whether a day is already held that fails
+  (an I/O error rather than "not there") refuses the filing, never reads as
+  "not held".
+
 ## Write token
 
 When the store is given a token (`STORE_WRITE_TOKEN`, or better
