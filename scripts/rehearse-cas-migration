@@ -237,13 +237,15 @@ COV="/coverage?provider=databento&dataset=OPRA.PILLAR&symbol=SPY.OPT&schema=cbbo
 # Days as /coverage gives them, without where they are.
 days_of() { jq -S '[.days[] | del(.volume, .volumes, .path, .paths, .files, .file, .copies)]' "$1"; }
 filed_of() { jq -S '[.batches | to_entries[] | select(.value.how == "filed") | .key] | sort' "$1"; }
+# Every batch and how it's held (filed, incoming, folder), restricted to the ids in $2 if given.
+how_of() { jq -S --argjson ids "${2:-null}" '.batches | to_entries | map(select($ids == null or (.key as $k | $ids | index($k)))) | map({(.key): .value.how}) | add // {}' "$1"; }
 
 step "the source's answers: a store over Data's tree (read-only)"
 start_store "data=$D:ro:anydir"
 curl -s "$URL/batches/databento" >"$W/batches-before.json"
 curl -s "$URL$COV" >"$W/coverage-before.json"
 stop_store
-has "$W/batches-before.json" '.missing_volumes == [] and (.batches | to_entries | map(select(.value.how == "filed")) | length) == 1' "Data's filed batch"
+has "$W/batches-before.json" '.missing_volumes == [] and (.batches | to_entries | map(select(.value.how == "filed")) | length) == 1 and (.batches | length) == 2' "Data's batches: one filed, one waiting"
 has "$W/coverage-before.json" '(.days | length) == 2' "Data's two SPY days"
 
 step "the migrated volume answers the same: /batches lists Data's batches filed, /coverage the same days"
@@ -252,10 +254,46 @@ curl -s "$URL/batches/databento" >"$W/batches-after.json"
 curl -s "$URL$COV" >"$W/coverage-after.json"
 stop_store
 has "$W/batches-after.json" '.missing_volumes == []' "no volume missing after"
-[ "$(filed_of "$W/batches-before.json" | jq -c .)" = "$(filed_of "$W/batches-after.json" | jq -c '[.[] | select(. == "OPRA-20220908-X")]')" ] \
-  || fail "the migrated volume doesn't list Data's filed batches as filed"
+IDS=$(jq -c '.batches | keys' "$W/batches-before.json")
+[ "$(how_of "$W/batches-before.json" | jq -c .)" = "$(how_of "$W/batches-after.json" "$IDS" | jq -c .)" ] \
+  || fail "the migrated volume doesn't hold Data's batches as the tree did (filed and waiting alike)"
 [ "$(days_of "$W/coverage-before.json" | jq -c .)" = "$(days_of "$W/coverage-after.json" | jq -c .)" ] \
   || fail "the migrated volume's /coverage days differ from the tree's"
+
+step "two drives sharing a folder (different manifests), a lowercase provider, a download folder, a waiting upload, an empty receipt folder: the same answers after"
+PA=$W/src/pair-a; PB=$W/src/pair-b
+put "$PA/$DAYS/2026-10-01.dbn.zst" "a degraded day"
+put "$PA/$DAYS/manifest.json" '{"schema":"tinytrader.store-manifest/1","days":{"2026-10-01":{"condition":{"state":"degraded","reason":"x"}}}}'
+put "$PA/OPRA-DL-1/metadata.json" '{"query":{"dataset":"OPRA.PILLAR","schema":"tcbbo","symbols":["SPY.OPT"],"start":"2026-10-01","end":"2026-10-02"}}'
+put "$PA/OPRA-DL-1/manifest.json" '{}'
+put "$PA/OPRA-DL-1/opra-pillar-20261001.tcbbo.dbn.zst" "downloaded"
+LOWER=databento/OPRA.PILLAR/SPY.OPT/cbbo-1m
+put "$PB/$LOWER/2026-10-02.dbn.zst" "a later day"
+put "$PB/$LOWER/manifest.json" '{"schema":"tinytrader.store-manifest/1","days":{"2026-10-02":{"condition":{"state":"missing","reason":"y"}}}}'
+put "$PB/databento/provenance/OPRA-FILED-2/manifest.json" '{}'
+mkdir -p "$PB/databento/provenance/OPRA-EMPTY-4"
+put "$PB/databento/.incoming/OPRA-IN-3/x.dbn.zst" "waiting"
+PCOV="/coverage?provider=databento&dataset=OPRA.PILLAR&symbol=SPY.OPT&schema=cbbo-1m&start=2026-10-01&end=2026-10-02"
+start_store "a=$PA:ro:anydir" "b=$PB:ro:anydir"
+curl -s "$URL/batches/databento" >"$W/pair-batches-before.json"
+curl -s "$URL$PCOV" >"$W/pair-coverage-before.json"
+stop_store
+expect 0 "$W/pair-plan.json" "$STORE_BIN" migrate-cas --plan --to "$W/nas/pair" --id pair --from a="$PA" --from b="$PB"
+has "$W/pair-plan.json" '(.manifests.merged | length) == 1 and (.manifests.day_conflicts | length) == 0' "the plan counts the folder's manifests to merge, no day in conflict"
+expect 0 "$W/pair-migrate-a.json" "$STORE_BIN" migrate-cas --to "$W/nas/pair" --id pair --from a="$PA"
+expect 0 "$W/pair-migrate-b.json" "$STORE_BIN" migrate-cas --to "$W/nas/pair" --id pair --from b="$PB"
+start_store "pair=$W/nas/pair:ro:anydir"
+curl -s "$URL/batches/databento" >"$W/pair-batches-after.json"
+curl -s "$URL$PCOV" >"$W/pair-coverage-after.json"
+stop_store
+has "$W/pair-batches-before.json" '(.batches | length) == 4' "four batches in the trees"
+[ "$(how_of "$W/pair-batches-before.json" | jq -c .)" = "$(how_of "$W/pair-batches-after.json" | jq -c .)" ] \
+  || fail "the batches differ after the migration (filed, waiting, download folder, empty receipt folder)"
+has "$W/pair-coverage-before.json" '(.days | length) == 2' "two days in the trees"
+[ "$(days_of "$W/pair-coverage-before.json" | jq -c .)" = "$(days_of "$W/pair-coverage-after.json" | jq -c .)" ] \
+  || fail "the days differ after the migration (a degraded day on one drive, a missing one on the other)"
+expect 0 "$W/pair-against-b.json" "$FSCK_BIN" --json --min-copies 1 --against b="$PB" "$W/nas/pair"
+has "$W/pair-against-b.json" '.against[0].bound == .against[0].files' "every file of the lowercase drive held, its manifest merged"
 
 step "a second copy: Data migrated to another volume; both checked together, two copies"
 expect 0 "$W/migrate-second.json" "$STORE_BIN" migrate-cas --to "$NAS2" --id second --from data="$D"
