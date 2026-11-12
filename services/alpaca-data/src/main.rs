@@ -6,7 +6,9 @@
 //!   day's change for each (at most 100).
 //! - `/bars?symbol=AAPL&days=5&interval=60`: bars as the relays serve them
 //!   (`&end=<unix seconds>`: the `days` before then, for older history)
-//!   (`[t, o, h, l, c, v]`, `t` in Unix seconds): one-minute (`60`, the
+//!   (`[t, o, h, l, c, v, vw, n]`, `t` in Unix seconds; the first six as
+//!   the relays serve them, then Alpaca's VWAP and trade count, null where
+//!   it gives none): one-minute (`60`, the
 //!   default), 5- and 15-minute, hourly (`3600`) or daily (`86400`), over the
 //!   last `days` trading days.
 //! - `/chain?underlying=AAPL&from=YYYY-MM-DD&to=YYYY-MM-DD`: option contracts
@@ -1007,7 +1009,10 @@ async fn bars(AxState(app): AxState<Arc<App>>, Query(ask): Query<BarAsk>) -> Res
                         let v = a.get(&format!("/v2/stocks/{symbol}/bars"), &q).await?;
                         for b in v["bars"].as_array().into_iter().flatten() {
                             if let Some(t) = b["t"].as_str().and_then(unix) {
-                                out.push(json!([t, b["o"], b["h"], b["l"], b["c"], b["v"]]));
+                                // Alpaca's VWAP and trade count follow the
+                                // relays' six columns, so readers of those
+                                // are unchanged.
+                                out.push(json!([t, b["o"], b["h"], b["l"], b["c"], b["v"], b["vw"], b["n"]]));
                             }
                         }
                         token = v["next_page_token"].as_str().map(str::to_owned);
@@ -1846,6 +1851,68 @@ mod tests {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(1_791_399_840), "2026-10-07T19:04:00Z");
         assert_eq!(unix(&rfc3339(1_709_164_800)), Some(1_709_164_800)); // 29 February 2024
+    }
+
+    /// `/bars` keeps Alpaca's VWAP and trade count after the relays' six
+    /// columns (a research request).
+    #[tokio::test]
+    async fn bars_carry_vwap_and_trade_count() {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let fake = || async {
+            axum::Json(json!({ "bars": [
+                { "t": "2026-10-07T19:04:00Z", "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "v": 100, "vw": 1.25, "n": 7 },
+                { "t": "2026-10-07T19:05:00Z", "o": 1.5, "h": 1.5, "l": 1.5, "c": 1.5, "v": 1 },
+            ], "next_page_token": null }))
+        };
+        tokio::spawn(async move { axum::serve(l, Router::new().fallback(fake)).await });
+        let app = Arc::new(App {
+            http: reqwest::Client::new(),
+            key: String::new(),
+            secret: String::new(),
+            feed: "sip".into(),
+            options_feed: "indicative".into(),
+            history_feed: "sip".into(),
+            observer: Observer::new("alpaca-data", "test"),
+            sent: Mutex::default(),
+            hold: Mutex::default(),
+            data_api: url.clone(),
+            trading_api: url,
+            cache: Mutex::default(),
+            flights: Mutex::default(),
+            screen: Mutex::default(),
+            dir: None,
+            relays: HashMap::new(),
+        });
+        let r = bars(
+            AxState(app),
+            Query(BarAsk {
+                symbol: "AAPL".into(),
+                days: Some(1),
+                interval: Some(60),
+                end: Some(1_791_399_960),
+                adjustment: None,
+            }),
+        )
+        .await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let rows = v["bars"]
+            .as_array()
+            .or_else(|| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            rows.contains(&json!([1_791_399_840, 1.0, 2.0, 0.5, 1.5, 100, 1.25, 7])),
+            "{v}"
+        );
+        assert!(
+            rows.contains(&json!([1_791_399_900, 1.5, 1.5, 1.5, 1.5, 1, null, null])),
+            "{v}"
+        );
     }
 
     #[tokio::test]
