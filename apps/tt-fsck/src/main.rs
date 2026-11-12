@@ -194,7 +194,14 @@ fn check(a: &Args) -> (Value, i32) {
                     .get(&file.rel)
                     .is_some_and(|e| e.sha256 == sha && e.size == file.size)
             });
-            if bound {
+            // A manifest kept as it was, merged by day into the folder's
+            // manifest (store migrate-cas): held.
+            let merged = indexes.iter().any(|(_, i)| {
+                i.pending
+                    .get(&sha)
+                    .is_some_and(|w| w.starts_with(&format!("merged into {} ", file.rel)))
+            });
+            if bound || merged {
                 held += 1;
             } else if indexes.iter().any(|(_, i)| i.pending.contains_key(&sha)) {
                 pending += 1;

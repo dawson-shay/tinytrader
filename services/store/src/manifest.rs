@@ -286,3 +286,91 @@ pub fn settle(dir: &Path, day: &str) -> Result<Option<Value>, String> {
         file.display()
     ))
 }
+
+/// Several copies of one schema folder's manifest index (`manifest.json`),
+/// as `store migrate-cas` finds them on different drives, merged into one:
+/// every day any copy has an entry for. A day whose entries differ is a
+/// conflict, never resolved by choosing: its entry becomes
+/// `{"condition": {"state": "unknown", "reason": …}, "conflicting":
+/// [{"source", "entry"}, …]}`, so its coverage and condition read as unknown
+/// until an operator settles it. A conflicting entry merged again keeps its
+/// versions (not nested). Returns the merged index and the days in conflict.
+#[must_use]
+pub fn merge_indexes(copies: &[(String, Value)]) -> (Value, Vec<String>) {
+    let mut days: BTreeMap<String, Vec<(String, Value)>> = BTreeMap::new();
+    for (source, m) in copies {
+        for (day, e) in m["days"].as_object().into_iter().flatten() {
+            let found = days.entry(day.clone()).or_default();
+            let versions: Vec<(String, Value)> = match e["conflicting"].as_array() {
+                Some(c) => c
+                    .iter()
+                    .map(|x| {
+                        (
+                            x["source"].as_str().unwrap_or(source).to_owned(),
+                            x["entry"].clone(),
+                        )
+                    })
+                    .collect(),
+                None => vec![(source.clone(), e.clone())],
+            };
+            for (s, v) in versions {
+                if !found.iter().any(|(_, f)| *f == v) {
+                    found.push((s, v));
+                }
+            }
+        }
+    }
+    let mut out = serde_json::Map::new();
+    let mut conflicts = Vec::new();
+    for (day, mut versions) in days {
+        if versions.len() == 1 {
+            out.insert(day, versions.remove(0).1);
+            continue;
+        }
+        conflicts.push(day.clone());
+        out.insert(
+            day,
+            json!({
+                "condition": { "state": "unknown", "reason": "its manifest entries differ between copies of this folder (store migrate-cas); an operator settles which holds" },
+                "conflicting": versions.iter().map(|(s, e)| json!({ "source": s, "entry": e })).collect::<Vec<_>>(),
+            }),
+        );
+    }
+    (json!({ "schema": SCHEMA, "days": out }), conflicts)
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    #[test]
+    fn copies_merge_by_day_and_disagreements_are_unknown() {
+        let a = json!({ "schema": SCHEMA, "days": {
+            "2026-10-01": { "condition": { "state": "degraded" } },
+            "2026-10-02": { "sidecar": "manifest.d/2026-10-02.json", "partial": true },
+        } });
+        let b = json!({ "schema": SCHEMA, "days": {
+            "2026-10-02": { "sidecar": "manifest.d/2026-10-02.json", "partial": true },
+            "2026-10-03": { "condition": { "state": "missing" } },
+            "2026-10-01": { "condition": { "state": "missing" } },
+        } });
+        let (m, c) = merge_indexes(&[("data".into(), a.clone()), ("tt03".into(), b.clone())]);
+        assert_eq!(c, ["2026-10-01"]);
+        assert_eq!(m["days"]["2026-10-02"]["partial"], true);
+        assert_eq!(m["days"]["2026-10-03"]["condition"]["state"], "missing");
+        assert_eq!(m["days"]["2026-10-01"]["condition"]["state"], "unknown");
+        assert_eq!(
+            m["days"]["2026-10-01"]["conflicting"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Merged again with a copy: the same, not nested.
+        let (again, c2) = merge_indexes(&[("bound".into(), m.clone()), ("data".into(), a)]);
+        assert_eq!((again, c2), (m, vec!["2026-10-01".to_owned()]));
+        // One copy: itself.
+        let (one, none) = merge_indexes(&[("tt03".into(), b.clone())]);
+        assert_eq!((one["days"].clone(), none.len()), (b["days"].clone(), 0));
+    }
+}
