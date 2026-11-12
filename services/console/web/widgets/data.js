@@ -15,9 +15,9 @@ function tree() {
   const symOf = (id, symbol) => {
     const set = ds.get(id) || ds.set(id, { id, syms: new Map() }).get(id);
     const key = symbol || '';
-    return set.syms.get(key) || set.syms.set(key, { symbol, schemas: {}, paths: [] }).get(key);
+    return set.syms.get(key) || set.syms.set(key, { symbol, schemas: {} }).get(key);
   };
-  const schemaOf = (sym, name) => sym.schemas[name] || (sym.schemas[name] = { bytes: 0, days: {}, where: {}, byDrive: {}, away: [] });
+  const schemaOf = (sym, name) => sym.schemas[name] || (sym.schemas[name] = { bytes: 0, days: {}, where: {}, byDrive: {}, away: [], paths: [] });
   for (const r of roots) for (const [k, schemas] of Object.entries(r.present ? {} : r.held || {})) {
     // `provider/id/symbol`, `-` for none.
     const [, id, ...rest] = k.split('/'), symbol = rest.join('/');
@@ -30,15 +30,17 @@ function tree() {
   }
   for (const r of roots) for (const d of r.datasets || []) {
     const sym = symOf(d.id, d.symbol);
-    for (const src of d.sources || []) {
-      // `store: <path>`, `files in <path>`, or `databento batch <job>`.
-      const path = src.replace(/^(store:|files in)\s*/, '');
+    // `store: <path>` (the store's layout: `<symbol>/<schema>/` under it),
+    // `files in <path>` (files as found, in that folder), or `databento batch <job>`.
+    const srcs = (d.sources || []).map(src => {
+      const store = src.startsWith('store:'), path = src.replace(/^(store:|files in)\s*/, '');
       let rel = path.startsWith(r.path) ? path.slice(r.path.length).replace(/^\//, '') : path;
-      if (d.symbol && !rel.split('/').includes(d.symbol)) rel += '/' + d.symbol;
-      sym.paths.push({ drive: r.name, path: rel });
-    }
+      if (store && d.symbol && !rel.split('/').includes(d.symbol)) rel += '/' + d.symbol;
+      return { drive: r.name, path: rel, store };
+    });
     for (const [name, s] of Object.entries(d.schemas)) {
       const t = schemaOf(sym, name);
+      t.paths.push(...srcs);
       t.bytes += s.bytes; t.byDrive[r.name] = (t.byDrive[r.name] || 0) + s.bytes;
       for (const [day, b] of Object.entries(s.days || {})) { t.days[day] = (t.days[day] || 0) + b; (t.where[day] ||= []).push(r.name); }
     }
@@ -83,7 +85,7 @@ function coverage(name, sym, s, drives) {
     const cls = out ? 'out' : has ? `has l${level(has)}${multi && drives.indexOf(drive) === 1 ? ' d2' : ''}` : (wd === 0 || wd === 6) ? 'weekend' : '';
     cal += `<i class="${cls}" title="${k}${has ? ` · ${bytes(has)} · ${s.where[k].join(', ')}` : cls === '' ? ' · no data' : ''}"></i>`;
   }
-  const paths = sym.paths.map(p => `<div><span class="dv-drive">${esc(p.drive)}</span><span class="mono">${esc(p.path)}/${esc(name)}/</span></div>`).join('');
+  const paths = s.paths.map(p => `<div><span class="dv-drive">${esc(p.drive)}</span><span class="mono">${esc(p.path)}/${p.store ? esc(name) + '/' : ''}</span></div>`).join('');
   return `<section class="panel dv-cov">
     <div class="d-head"><b class="mono">${esc(sym.symbol || '')} ${esc(name)}</b><span class="muted">${bytes(s.bytes)} · ${keys.length} days · ${first} → ${last}</span></div>
     <div class="cal-wrap"><div class="cal" aria-label="Days with data">${cal}</div></div>
