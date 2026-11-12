@@ -12,7 +12,9 @@
 # volumes. Nothing outside it is read or written. The binaries are `store`
 # and `tt-fsck` on PATH, or STORE_BIN and FSCK_BIN. Needs bash, jq, curl and
 # sha256sum (or shasum). Exit 0 when every step behaved as the runbook says;
-# otherwise the first step that didn't, and why.
+# otherwise the first step that didn't, and why. With KEEP_GOING=1 every
+# step runs and every one that didn't behave is listed (to show what an
+# older build gets wrong).
 set -euo pipefail
 
 STORE_BIN=${STORE_BIN:-store}
@@ -34,16 +36,25 @@ trap cleanup EXIT
 
 n=0
 step() { n=$((n + 1)); printf '%2d. %s\n' "$n" "$*"; }
-fail() { echo "FAILED at step $n: $*" >&2; echo "   (outputs in $W)" >&2; exit 1; }
+FAILED=()
+fail() {
+  echo "   FAILED at step $n: $*" >&2
+  if [ "${KEEP_GOING:-}" = 1 ]; then
+    case " ${FAILED[*]-} " in *" $n "*) ;; *) FAILED+=("$n") ;; esac
+    return 0
+  fi
+  echo "   (outputs in $W)" >&2; exit 1
+}
 # expect STATUS OUTFILE CMD...: run it, its stdout to OUTFILE, and check its exit status.
 expect() {
   local want=$1 out=$2; shift 2
   local got=0
   "$@" >"$out" 2>>"$LOG" || got=$?
   [ "$got" = "$want" ] || fail "$* exited $got, not $want (stdout in $out)"
+  return 0
 }
 # has FILE JQ-FILTER WHY: the JSON in FILE satisfies the filter.
-has() { jq -e "$2" "$1" >/dev/null || fail "$3 ($1: $2)"; }
+has() { jq -e "$2" "$1" >/dev/null 2>&1 || fail "$3 ($1: $2)"; }
 
 put() { mkdir -p "$(dirname "$1")"; printf '%s' "$2" >"$1"; }
 
@@ -60,6 +71,12 @@ put "$D/Databento/provenance/OPRA-20220908-X/manifest.json" '{"files":[]}'
 put "$D/Databento/.incoming/OPRA-20251112-Y/opra-pillar-20251112.tcbbo.dbn.zst" "an upload never filed"
 put "$D/Databento/.incoming/OPRA-20251112-Y/REQUESTED" ""
 put "$D/.DS_Store" "finder"
+# OS-like names below the root are data, copied and checked; the OS's own
+# folder at the root is skipped, and listed.
+put "$D/Databento/x/._notes.dbn.zst" "not apple's"
+put "$D/lost+found/#1234" "recovered by fsck"
+put "$D/Databento/y/.Trashes/kept" "a folder named like the OS's"
+put "$D/.Trashes/501/deleted" "the user's trash"
 SEVENTH=$(sha "$D/$DAYS/2022-09-07.dbn.zst")
 mkdir -p "$D/Databento/migrations"
 jq -nc --arg to "/Volumes/Data/$DAYS/2022-09-07.dbn.zst" --arg sha "$SEVENTH" \
@@ -81,10 +98,11 @@ mkdir -p "$W/src/unmounted"
 NAS=$W/nas/tt04
 NAS2=$W/nas/second
 
+DATA_FILES=$(cd "$D" && find . -type f -not -path './.Trashes/*' | wc -l | tr -d ' ')
 step "migrate-cas --plan, all three sources: writes nothing, exit 0"
 expect 0 "$W/plan.json" "$STORE_BIN" migrate-cas --plan --to "$NAS" --id tt04 \
   --from data="$D" --from tt03="$T" --from newdrive="$N"
-has "$W/plan.json" '.names == 10 and .on_several_sources == 2 and (.os_files_skipped | length) == 1' "the plan's counts"
+has "$W/plan.json" ".names == $((DATA_FILES + 3)) and .on_several_sources == 2 and (.os_files_skipped | length) == 1 and (.os_files_skipped[0] | endswith(\".Trashes\"))" "the plan's counts"
 [ ! -e "$NAS" ] || fail "the plan wrote the destination"
 
 step "migrate-cas --plan with the unmounted source: refused, exit 2"
@@ -92,7 +110,7 @@ expect 2 "$W/plan-unmounted.json" "$STORE_BIN" migrate-cas --plan --from unmount
 
 step "migrate Data: exit 0, everything bound, its ledger's hash used from another mount point"
 expect 0 "$W/migrate-data.json" "$STORE_BIN" migrate-cas --to "$NAS" --id tt04 --from data="$D"
-has "$W/migrate-data.json" '.ok and .bound == 7 and (.damaged | length) == 0 and .without_a_recorded_hash == 6' "Data's migration"
+has "$W/migrate-data.json" ".ok and .bound == $DATA_FILES and (.damaged | length) == 0 and .without_a_recorded_hash == $((DATA_FILES - 1))" "Data's migration"
 
 step "migrate tt03: exit 1, the eighth's other version kept as a conflict, not bound"
 expect 1 "$W/migrate-tt03.json" "$STORE_BIN" migrate-cas --to "$NAS" --id tt04 --from tt03="$T"
@@ -107,7 +125,7 @@ expect 2 "$W/migrate-unmounted.json" "$STORE_BIN" migrate-cas --to "$NAS" --id t
 
 step "migrate Data again: resumes, nothing read again or written"
 expect 0 "$W/migrate-data-2.json" "$STORE_BIN" migrate-cas --to "$NAS" --id tt04 --from data="$D"
-has "$W/migrate-data-2.json" '.bound == 0 and .bytes_written == 0 and .already_there == 7' "the resume"
+has "$W/migrate-data-2.json" ".bound == 0 and .bytes_written == 0 and .already_there == $DATA_FILES" "the resume"
 
 step "tt-fsck: exit 1, since tt03's migration didn't end clean"
 expect 1 "$W/fsck.json" "$FSCK_BIN" --json --min-copies 1 "$NAS"
@@ -120,7 +138,7 @@ head -1 "$W/fsck-quick.txt" | grep -q '^QUICK CHECK' || fail "--quick doesn't sa
 
 step "tt-fsck --against Data: every Data file held (only tt03's receipt is a finding)"
 expect 1 "$W/against-data.json" "$FSCK_BIN" --json --min-copies 1 --against data="$D" "$NAS"
-has "$W/against-data.json" '.against[0].files == 7 and .against[0].bound == 7 and ([.findings[] | select(.volume == "data")] | length) == 0' "Data held whole"
+has "$W/against-data.json" ".against[0].files == $DATA_FILES and .against[0].bound == $DATA_FILES and (.against[0].skipped | length) == 1 and ([.findings[] | select(.volume == \"data\")] | length) == 0" "Data held whole, OS-like names included, the root .Trashes listed"
 
 step "tt-fsck --against tt03: its eighth is kept as pending, not bound: an operator's choice"
 expect 1 "$W/against-tt03.json" "$FSCK_BIN" --json --min-copies 1 --against tt03="$T" "$NAS"
@@ -142,6 +160,63 @@ chmod u+w "$OBJ"; printf 'the seventh, as filez' >"$OBJ"
 expect 1 "$W/fsck-damaged.json" "$FSCK_BIN" --json --min-copies 1 "$W/nas/damaged"
 has "$W/fsck-damaged.json" '[.findings[] | select(.rule == "S1" and (.finding | contains("hashes to")))] | length >= 1' "the damage"
 rm -rf "$W/nas/damaged"
+
+step "a cp -p clone of Data under the same name, one file rewritten with its time restored: exit 1, a conflict"
+cp -R "$NAS" "$W/nas/clone-dest"
+cp -Rp "$D" "$W/src/data-clone"
+F="$W/src/data-clone/$DAYS/2022-09-08.dbn.zst"
+cp -p "$F" "$W/f.orig"; printf 'the eighth, version Z' >"$F"; touch -r "$W/f.orig" "$F"
+expect 1 "$W/migrate-clone.json" "$STORE_BIN" migrate-cas --to "$W/nas/clone-dest" --id tt04 --from data="$W/src/data-clone"
+has "$W/migrate-clone.json" '(.conflicts | length) == 1 and (.conflicts[0].name | endswith("2022-09-08.dbn.zst")) and .bound == 0' "the restored-time rewrite"
+rm -rf "$W/nas/clone-dest"
+
+step "a pending object deleted (a conflict's only other copy): tt-fsck exit 1"
+cp -R "$NAS" "$W/nas/pending-gone"
+B=$(jq -r '.conflicts[0].copies[]? | select(.source == "tt03") | .sha256' "$W/migrate-tt03.json" 2>/dev/null || true)
+P=$( [ -n "$B" ] && find "$W/nas/pending-gone/cas/objects" -name "$B.*" | head -1 || true)
+[ -n "$P" ] || fail "tt03's pending object isn't there to delete"
+[ -n "$P" ] && { chmod u+w "$P"; rm -f "$P"; }
+expect 1 "$W/fsck-pending-gone.json" "$FSCK_BIN" --json --min-copies 1 "$W/nas/pending-gone"
+has "$W/fsck-pending-gone.json" '[.findings[] | select(.rule == "S1" and (.finding | contains("pending object")))] | length == 1' "the missing pending object"
+rm -rf "$W/nas/pending-gone"
+
+step "a date flipped inside a bind line: the log fails its checksum, tt-fsck exit 2"
+cp -R "$NAS" "$W/nas/edited"
+L="$W/nas/edited/cas/index/bindings.jsonl"
+chmod u+w "$L"
+awk 'done || !/"event":"bind"/ || !/2022-09-07/ { print; next } { sub(/2022-09-07/, "2022-09-06"); print; done = 1 }' "$L" >"$L.new" && mv "$L.new" "$L"
+expect 2 "$W/fsck-edited.json" "$FSCK_BIN" --json --min-copies 1 "$W/nas/edited"
+has "$W/fsck-edited.json" '[.unreadable[] | select(contains("fails its checksum"))] | length == 1' "the edited line"
+rm -rf "$W/nas/edited"
+
+step "review C3: an empty .bin object gone beside an empty .json one (same hash): tt-fsck exit 1"
+cp -R "$NAS" "$W/nas/empty-gone"
+E=$(find "$W/nas/empty-gone/cas/objects" -name 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855.bin' | head -1)
+[ -n "$E" ] || fail "no empty .bin object (Data's REQUESTED marker) to delete"
+[ -n "$E" ] && { chmod u+w "$E"; rm -f "$E"; }
+expect 1 "$W/fsck-empty-gone.json" "$FSCK_BIN" --json --min-copies 1 "$W/nas/empty-gone"
+has "$W/fsck-empty-gone.json" '[.findings[] | select(.rule == "S1" and (.finding | contains("REQUESTED")))] | length == 1' "the missing empty marker"
+rm -rf "$W/nas/empty-gone"
+
+step "review H2: a day whose size isn't its manifest's: exit 1, kept, not bound"
+M=$W/src/mismatch
+put "$M/$DAYS/2022-09-09.dbn.zst" "short"
+put "$M/$DAYS/manifest.json" '{"schema":"tinytrader.store-manifest/1","days":{"2022-09-09":{"file":"2022-09-09.dbn.zst","size":999}}}'
+expect 1 "$W/migrate-mismatch.json" "$STORE_BIN" migrate-cas --to "$W/nas/mismatch" --id mm --from mismatch="$M"
+has "$W/migrate-mismatch.json" '([.damaged[] | select(contains("2022-09-09") and contains("999"))] | length) == 1 and .bound == 1' "the size mismatch kept, not bound (only the manifest bound)"
+
+step "review H4: an edited snapshot (two names' hashes swapped): tt-fsck exit 1"
+"$FSCK_BIN" --min-copies 1 "$NAS" >/dev/null 2>&1 || true
+cp -R "$NAS" "$W/nas/snap"
+S="$W/nas/snap/cas/index/snapshot.json"
+EIGHTH=$(sha "$D/$DAYS/2022-09-08.dbn.zst")
+if [ -f "$S" ]; then
+  chmod u+w "$S"
+  sed -e "s/$SEVENTH/TMPHASH/g" -e "s/$EIGHTH/$SEVENTH/g" -e "s/TMPHASH/$EIGHTH/g" "$S" >"$S.new" && mv "$S.new" "$S"
+else fail "no snapshot to edit"; fi
+expect 1 "$W/fsck-snap.json" "$FSCK_BIN" --json --min-copies 1 "$W/nas/snap"
+has "$W/fsck-snap.json" '[.findings[] | select(.finding | startswith("snapshot"))] | length == 1' "the edited snapshot"
+rm -rf "$W/nas/snap"
 
 step "a second copy: Data migrated to another volume; both checked together, two copies"
 expect 0 "$W/migrate-second.json" "$STORE_BIN" migrate-cas --to "$NAS2" --id second --from data="$D"
@@ -182,4 +257,8 @@ step "every source is as it was"
 [ "$(sha "$D/$DAYS/2022-09-07.dbn.zst")" = "$SEVENTH" ] || fail "Data was changed"
 [ "$(cat "$T/$DAYS/2022-09-08.dbn.zst")" = "the eighth, version B" ] || fail "tt03 was changed"
 
+if [ "${#FAILED[@]}" -gt 0 ]; then
+  echo "rehearsal FAILED: steps ${FAILED[*]} of $n (outputs and log in $W)"
+  exit 1
+fi
 echo "rehearsal passed: $n steps (outputs and log in $W)"
