@@ -28,6 +28,13 @@ listed with their extensions once they are defined.
 | `ALPACA.SIP`, `ALPACA.IEX` | `conditions` | `tinytrader.trade-conditions/1` (rtype `0xD4`, byte-identical to Hyphae's `hyphae.dbn.equity-conditions@1`): the nth record belongs to the nth trade of the day's main file |
 | `ALPACA.SIP` | `quote-conditions` | `tinytrader.quote-conditions/1` (rtype `0xD5`, 32 bytes; `libs/alpaca/src/quote_conditions.rs` documents the layout): each quote's condition codes and tape, the nth record belonging to the nth quote (action `M`) of the day's main file; flag bit 0 marks a quote whose conditions couldn't be held (no codes kept) |
 
+**A day is a UTC day**, as Databento's are. A SIP or IEX "day" can therefore
+be a date that isn't a session, such as a Saturday or a holiday, holding only
+the previous session's after-hours tail: under EST, a full day's 19:00–20:00
+New York is 00:00–01:00 UTC on the next date. Read a session's whole
+extended day as its own date's file plus the next date's first hour, and don't
+take a Saturday or holiday file for a trading day.
+
 These days come from Alpaca's history, filed one file per symbol, schema and
 day ([0014](decisions/0014-history-feeds.md)). Publisher ids: `40001` IEX,
 `40002` the SIP itself (a quote's header), and `40100 + (letter − 'A')` for

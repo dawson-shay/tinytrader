@@ -52,6 +52,13 @@
 mod catalog;
 mod conditions;
 mod filer;
+
+/// In tests, run between a volume's scan and the check that it is still the
+/// same volume, to make it go away mid-scan.
+#[cfg(test)]
+type MidScan = Box<dyn Fn(&Path) + Send>;
+#[cfg(test)]
+static MID_SCAN: std::sync::Mutex<Option<MidScan>> = std::sync::Mutex::new(None);
 mod ingest;
 mod manifest;
 #[cfg(test)]
@@ -468,8 +475,35 @@ async fn scan(store: &Shared, observer: &Observer) {
             .map(|v| {
                 let mine: Vec<&Value> = ignored.iter().filter(|i| i["volume"] == v.name.as_str()).collect();
                 let skip: Vec<PathBuf> = mine.iter().filter_map(|i| i["path"].as_str()).map(PathBuf::from).collect();
-                let (mut root, mut places, mut served) = match volumes::present(v) {
-                    Ok(()) => catalog::scan_volume(&v.name, &v.path, limits, &skip),
+                // The volume as it was when the scan began: a scan that ends with
+                // it gone, or another device there, counts for nothing (P0,
+                // 2026-11-10: a drive dropping out mid-scan read as holding less).
+                let identity = |p: &Path| {
+                    use std::os::unix::fs::MetadataExt as _;
+                    std::fs::metadata(p).ok().map(|m| (m.dev(), m.ino()))
+                };
+                let began = volumes::present(v).ok().and_then(|()| identity(&v.path));
+                let scanned = match volumes::present(v) {
+                    Ok(()) => {
+                        let r = catalog::scan_volume(&v.name, &v.path, limits, &skip);
+                        #[cfg(test)]
+                        if let Some(f) = lock(&MID_SCAN).as_ref() {
+                            f(&v.path);
+                        }
+                        let ended = volumes::present(v).ok().and_then(|()| identity(&v.path));
+                        if ended.is_some() && ended == began {
+                            Ok(r)
+                        } else {
+                            Err(format!(
+                                "{} went away or changed during the scan; what it held is kept from before",
+                                v.path.display()
+                            ))
+                        }
+                    }
+                    Err(e) => Err(e),
+                };
+                let (mut root, mut places, mut served) = match scanned {
+                    Ok(r) => r,
                     Err(e) => {
                         // What it held when last read in full, so its data
                         // shows as away rather than gone.
@@ -2644,6 +2678,75 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Two days of SPY's cbbo-1m on a volume, scanned; the store and its state
+    /// file.
+    async fn two_days(name: &str) -> (PathBuf, PathBuf, PathBuf, Shared) {
+        let dir = scratch(name);
+        let vol = dir.join("v");
+        let day = vol.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        std::fs::create_dir_all(&day).unwrap();
+        for d in ["2026-10-01", "2026-10-02"] {
+            std::fs::write(day.join(format!("{d}.dbn.zst")), b"x").unwrap();
+        }
+        let state_file = dir.join("state.json");
+        let s = store(&[("v", &vol)], &state_file);
+        scanned(&s).await;
+        (dir, vol, state_file, s)
+    }
+
+    fn days_held(state_file: &Path) -> Value {
+        state::load(state_file).unwrap().volumes["v"].held["databento/OPRA.PILLAR/SPY.OPT"]["cbbo-1m"]["days"].clone()
+    }
+
+    /// A day file the scan can't stat (here a link to itself: ELOOP; a drive
+    /// failing gives EIO) is an error of the volume, not a day it doesn't hold:
+    /// the volume is missing, and what it is remembered to hold isn't shrunk
+    /// (P0, 2026-11-10).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_day_the_scan_cannot_stat_doesnt_shrink_what_it_held() {
+        let (dir, vol, state_file, s) = two_days("flap-stat").await;
+        assert_eq!(days_held(&state_file), 2);
+        let day2 = vol.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2026-10-02.dbn.zst");
+        std::fs::remove_file(&day2).unwrap();
+        std::os::unix::fs::symlink(&day2, &day2).unwrap();
+        scanned(&s).await;
+        let cat = lock(&s.catalog).clone();
+        assert_eq!(cat["missing_volumes"], json!(["v"]), "{cat}");
+        assert_eq!(days_held(&state_file), 2, "not shrunk");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A volume that goes away during a scan (here swapped for an empty folder,
+    /// as a drive dropping out leaves one) counts for nothing: it is reported
+    /// away, with what it held before (P0, 2026-11-10).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_volume_gone_during_the_scan_keeps_what_it_held() {
+        let (dir, vol, state_file, s) = two_days("flap-gone").await;
+        assert_eq!(days_held(&state_file), 2);
+        let (v, aside) = (vol.clone(), dir.join("aside"));
+        // Only this test's volume: other tests scan theirs meanwhile.
+        *lock(&MID_SCAN) = Some(Box::new(move |p: &Path| {
+            if p == v {
+                let _ = std::fs::rename(&v, &aside);
+                let _ = std::fs::create_dir_all(&v);
+            }
+        }));
+        scanned(&s).await;
+        *lock(&MID_SCAN) = None;
+        let cat = lock(&s.catalog).clone();
+        assert_eq!(cat["missing_volumes"], json!(["v"]), "{cat}");
+        let why = cat["roots"][0]["errors"][0]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            why.contains("went away or changed during the scan"),
+            "{why}"
+        );
+        assert_eq!(days_held(&state_file), 2, "not shrunk");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn coverage_answers_from_the_scan_and_waits_for_a_rescan_asked_for() {
         let dir = scratch("index");
@@ -2954,17 +3057,26 @@ mod tests {
         let s = store(&[("v", &vol)], &dir.join("state.json"));
         scanned(&s).await;
         let (go, wait) = std::sync::mpsc::sync_channel::<()>(1);
+        let (started_tx, started) = std::sync::mpsc::sync_channel::<()>(1);
         let s2 = s.clone();
         let caller = tokio::spawn(async move {
             s2.file_alone(Vec::new(), move || {
+                let _ = started_tx.send(());
                 let _ = wait.recv();
                 Ok(json!({}))
             })
             .await
         });
-        while !s.filer.busy() {
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        // Aborted once the write has started (the turn is granted a moment
+        // before it's handed to the write: an abort then drops it with
+        // nothing written, which is right, but isn't this test).
+        let s3 = s.clone();
+        tokio::task::spawn_blocking(move || {
+            let _ = started.recv_timeout(Duration::from_secs(10));
+            drop(s3);
+        })
+        .await
+        .unwrap();
         caller.abort();
         let next = tokio::time::timeout(Duration::from_millis(200), s.filer.turn()).await;
         assert!(next.is_err(), "the next turn waits for the write");
