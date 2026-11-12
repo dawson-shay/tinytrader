@@ -50,12 +50,38 @@ pub enum Event {
         writer: String,
         at: u64,
     },
+    /// The line at byte `offset` was cut short (a crash mid-append) and
+    /// ended by the next writer: the event it held never completed, so what
+    /// it recorded wasn't reported done.
+    TornNoted {
+        offset: u64,
+        text: String,
+        writer: String,
+        at: u64,
+    },
 }
 
 /// A log open for appending.
 pub struct Log {
     file: fs::File,
     path: PathBuf,
+    /// The chain value of the last event (see [`chain_of`]).
+    chain: String,
+}
+
+/// Each line's `chain`: the SHA-256 of the line before's chain, a newline,
+/// and this event's canonical JSON. An edited line, or one inserted or
+/// removed, breaks every chain after it (review: the log is the truth, so
+/// it's checked like the objects).
+#[must_use]
+pub fn chain_of(previous: &str, event: &Event) -> String {
+    use sha2::Digest as _;
+    let canonical = serde_json::to_string(event).unwrap_or_default();
+    let mut h = sha2::Sha256::new();
+    h.update(previous.as_bytes());
+    h.update(b"\n");
+    h.update(canonical.as_bytes());
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 impl Log {
@@ -76,11 +102,34 @@ impl Log {
         if created && let Some(d) = path.parent() {
             crate::objects::sync_dir(d).map_err(|e| format!("{}: {e}", d.display()))?;
         }
+        // The log is read whole first: its chain checked to its end, so an
+        // append never extends a log that's been edited.
+        let before = replay(path, 0, "")?;
         let mut log = Self {
             file,
             path: path.to_path_buf(),
+            chain: before.chain.clone(),
         };
         log.heal()?;
+        // A crash between ending a torn line and noting it leaves it
+        // un-noted, and last in the log: noted now. One with events after
+        // it wasn't left by that crash (damage), and stays un-noted.
+        let noted: std::collections::HashSet<u64> = before
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::TornNoted { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        let last_event_end = before.ends.last().copied().unwrap_or(0);
+        for (offset, text) in before
+            .torn_lines
+            .iter()
+            .filter(|(o, _)| !noted.contains(o) && *o >= last_event_end)
+        {
+            log.note_torn(*offset, text.clone())?;
+        }
         Ok(log)
     }
 
@@ -95,8 +144,25 @@ impl Log {
             std::io::Write::write_all(&mut self.file, b"\n")
                 .and_then(|()| self.file.sync_data())
                 .map_err(|e| format!("{}: {e}", self.path.display()))?;
+            // Said, so a check can tell this crash's remnant from damage.
+            let offset = text.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+            self.note_torn(
+                offset as u64,
+                String::from_utf8_lossy(&text[offset..]).into_owned(),
+            )?;
         }
         Ok(())
+    }
+
+    fn note_torn(&mut self, offset: u64, text: String) -> Result<(), String> {
+        self.append(&Event::TornNoted {
+            offset,
+            text,
+            writer: concat!("tinytrader-cas ", env!("CARGO_PKG_VERSION")).into(),
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_secs()),
+        })
     }
 
     /// Append an event, flushed before this returns.
@@ -104,9 +170,14 @@ impl Log {
     /// # Errors
     /// If it can't be written.
     pub fn append(&mut self, e: &Event) -> Result<(), String> {
-        let line = serde_json::to_string(e).map_err(|e| e.to_string())?;
+        let chain = chain_of(&self.chain, e);
+        let mut v = serde_json::to_value(e).map_err(|e| e.to_string())?;
+        v["chain"] = serde_json::Value::String(chain.clone());
+        let line = serde_json::to_string(&v).map_err(|e| e.to_string())?;
         crate::append_line(&mut self.file, &line)
-            .map_err(|e| format!("{}: {e}", self.path.display()))
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        self.chain = chain;
+        Ok(())
     }
 }
 
@@ -114,8 +185,14 @@ impl Log {
 #[derive(Debug, Default)]
 pub struct Replay {
     pub events: Vec<Event>,
+    /// Where each event's line ends (the byte after its newline).
+    pub ends: Vec<u64>,
+    /// Lines cut short before the last, with their offsets.
+    pub torn_lines: Vec<(u64, String)>,
     /// The byte length read up to (the end of the last whole line).
     pub end: u64,
+    /// The chain value at `end`.
+    pub chain: String,
     /// A torn last line, if there was one.
     pub torn: Option<String>,
 }
@@ -126,7 +203,7 @@ pub struct Replay {
 ///
 /// # Errors
 /// If it can't be read, or a line other than a torn one isn't an event.
-pub fn replay(path: &Path, from: u64) -> Result<Replay, String> {
+pub fn replay(path: &Path, from: u64, chain: &str) -> Result<Replay, String> {
     let mut text = Vec::new();
     match fs::File::open(path) {
         Ok(mut f) => {
@@ -139,6 +216,7 @@ pub fn replay(path: &Path, from: u64) -> Result<Replay, String> {
     let from = usize::try_from(from).unwrap_or(usize::MAX).min(text.len());
     let mut r = Replay {
         end: from as u64,
+        chain: chain.to_owned(),
         ..Replay::default()
     };
     let mut at = from;
@@ -149,13 +227,39 @@ pub fn replay(path: &Path, from: u64) -> Result<Replay, String> {
         };
         let line = &text[at..at + nl];
         let next = at + nl + 1;
-        match serde_json::from_slice::<Event>(line) {
-            Ok(e) => r.events.push(e),
-            // A torn line that a later append ended (Log::heal): it isn't
-            // JSON at all, and was cut, not written wrong.
-            Err(_)
-                if serde_json::from_slice::<serde_json::Value>(line).is_err() && is_cut(line) => {}
-            Err(e) => {
+        let parsed = serde_json::from_slice::<serde_json::Value>(line)
+            .ok()
+            .and_then(|mut v| {
+                let chain = v.as_object_mut()?.remove("chain")?;
+                Some((serde_json::from_value::<Event>(v), chain))
+            });
+        match parsed {
+            Some((Ok(e), serde_json::Value::String(chain))) => {
+                let want = chain_of(&r.chain, &e);
+                if chain != want {
+                    return Err(format!(
+                        "{}: byte {at}: this line fails its checksum (edited, damaged, or a line before it was): {}",
+                        path.display(),
+                        String::from_utf8_lossy(line)
+                    ));
+                }
+                r.chain = chain;
+                r.events.push(e);
+                r.ends.push(next as u64);
+            }
+            // A line cut short (not JSON at all, begun and never closed):
+            // kept with its offset for the check to judge, never dropped
+            // unseen.
+            _ if serde_json::from_slice::<serde_json::Value>(line).is_err() && is_cut(line) => {
+                r.torn_lines
+                    .push((at as u64, String::from_utf8_lossy(line).into_owned()));
+            }
+            other => {
+                let e = match other {
+                    Some((Err(e), _)) => e.to_string(),
+                    Some(_) => "its chain isn't a string".into(),
+                    None => "not a JSON object with a chain".into(),
+                };
                 return Err(format!(
                     "{}: byte {at}: not a bindings event ({e}): {}",
                     path.display(),

@@ -21,9 +21,18 @@
 
 mod log;
 mod objects;
+pub mod tree;
 
 pub use log::{Event, Log, Replay};
 pub use objects::{ObjectRef, object_path};
+
+/// The SHA-256 of a file, as lowercase hex.
+///
+/// # Errors
+/// If it can't be read.
+pub fn hash_file(path: &Path) -> Result<String, String> {
+    objects::hash_file(path)
+}
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -69,6 +78,9 @@ pub struct Index {
     pub conflicts: Vec<String>,
     /// How many bytes of the log this covers.
     pub log_len: u64,
+    /// The log's chain value at `log_len`.
+    #[serde(default)]
+    pub chain: String,
 }
 
 impl Index {
@@ -133,7 +145,7 @@ impl Index {
                     "{name}: retiring {sha256}, which isn't its current version"
                 )),
             },
-            Event::Verified { .. } => {}
+            Event::Verified { .. } | Event::TornNoted { .. } => {}
         }
     }
 }
@@ -253,6 +265,9 @@ impl Volume {
     /// The path of the object with this hash and extension, if held.
     #[must_use]
     pub fn object(&self, sha256: &str, ext: &str) -> Option<PathBuf> {
+        if !objects::is_hash(sha256) || !objects::is_ext(ext) {
+            return None;
+        }
         let p = object_path(&self.dir(), sha256, ext);
         p.is_file().then_some(p)
     }
@@ -272,9 +287,7 @@ impl Volume {
     /// If the log can't be read, or holds a damaged line other than its
     /// last.
     pub fn index(&self) -> Result<Index, String> {
-        let snap: Option<Index> = fs::read_to_string(self.snapshot_path())
-            .ok()
-            .and_then(|t| serde_json::from_str(&t).ok());
+        let snap = self.read_snapshot().ok().flatten();
         let log_len = fs::metadata(self.log_path()).map_or(0, |m| m.len());
         let (mut index, from) = match snap {
             Some(s) if s.log_len <= log_len => {
@@ -283,23 +296,53 @@ impl Volume {
             }
             _ => (Index::default(), 0),
         };
-        let replay = log::replay(&self.log_path(), from)?;
+        let start = index.chain.clone();
+        let replay = log::replay(&self.log_path(), from, &start)?;
         for e in &replay.events {
             index.apply(e);
         }
         index.log_len = replay.end;
+        index.chain = replay.chain;
         Ok(index)
     }
 
-    /// Rewrite the snapshot from the log (it's a cache; this never changes
-    /// what the index says).
+    /// The snapshot, if there is one and its checksum holds: `None` when
+    /// there's none; an error when it's unreadable or its checksum fails (it
+    /// is then ignored by [`Volume::index`], and reported by
+    /// [`Volume::verify`]).
+    fn read_snapshot(&self) -> Result<Option<Index>, String> {
+        let text = match fs::read(self.snapshot_path()) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("snapshot: {e}")),
+        };
+        let v: Value = serde_json::from_slice(&text).map_err(|e| format!("snapshot: {e}"))?;
+        let index: Index =
+            serde_json::from_value(v["index"].clone()).map_err(|e| format!("snapshot: {e}"))?;
+        let body = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
+        if v["sha256"].as_str() != Some(objects::hex_of(&body).as_str()) {
+            return Err("snapshot: its checksum doesn't match its content".into());
+        }
+        Ok(Some(index))
+    }
+
+    /// Rewrite the snapshot from the whole log (it's a cache; this never
+    /// changes what the index says), with its checksum.
     ///
     /// # Errors
     /// If the log can't be read or the snapshot written.
     pub fn snapshot(&self) -> Result<Index, String> {
-        let index = self.index()?;
+        let replay = log::replay(&self.log_path(), 0, "")?;
+        let mut index = Index::default();
+        for e in &replay.events {
+            index.apply(e);
+        }
+        index.log_len = replay.end;
+        index.chain = replay.chain;
         let body = serde_json::to_vec(&index).map_err(|e| e.to_string())?;
-        objects::write_whole(&self.snapshot_path(), &body)
+        let doc = json!({ "index": &index, "sha256": objects::hex_of(&body) });
+        let bytes = serde_json::to_vec(&doc).map_err(|e| e.to_string())?;
+        objects::write_whole(&self.snapshot_path(), &bytes)
             .map_err(|e| format!("{}: {e}", self.snapshot_path().display()))?;
         Ok(index)
     }
@@ -311,68 +354,144 @@ impl Volume {
     /// # Errors
     /// If the log can't be read.
     pub fn verify(&self, hash: bool) -> Result<Report, String> {
-        let replay = log::replay(&self.log_path(), 0)?;
+        let replay = log::replay(&self.log_path(), 0, "")?;
         let mut index = Index::default();
         for e in &replay.events {
             index.apply(e);
         }
         let mut r = Report {
-            torn_last_line: replay.torn,
+            torn_last_line: replay.torn.clone(),
             conflicts: index.conflicts.clone(),
+            hashed: hash,
             ..Report::default()
         };
+        // A line cut short before the last is a crash's remnant only if the
+        // next writer said so (`torn_noted`); otherwise it's damage.
+        let noted: std::collections::HashSet<u64> = replay
+            .events
+            .iter()
+            .filter_map(|e| match e {
+                Event::TornNoted { offset, .. } => Some(*offset),
+                _ => None,
+            })
+            .collect();
+        for (offset, text) in &replay.torn_lines {
+            let line = format!("byte {offset}: {text}");
+            if noted.contains(offset) {
+                r.torn_lines.push(line);
+            } else {
+                r.log_damage.push(line);
+            }
+        }
+        // The snapshot must be what the log says, as of its length.
+        match self.read_snapshot() {
+            Ok(None) => {}
+            Err(e) => r.snapshot.push(e),
+            Ok(Some(snap)) => {
+                let mut prefix = Index::default();
+                for (e, end) in replay.events.iter().zip(&replay.ends) {
+                    if *end <= snap.log_len {
+                        prefix.apply(e);
+                    }
+                }
+                let mut chain = String::new();
+                for (e, end) in replay.events.iter().zip(&replay.ends) {
+                    if *end <= snap.log_len {
+                        chain = log::chain_of(&chain, e);
+                    }
+                }
+                if snap.names != prefix.names
+                    || snap.pending != prefix.pending
+                    || snap.conflicts != prefix.conflicts
+                    || snap.chain != chain
+                {
+                    r.snapshot.push(format!(
+                        "snapshot: doesn't match the log's first {} bytes ({} names there, {} in the snapshot)",
+                        snap.log_len,
+                        prefix.names.len(),
+                        snap.names.len()
+                    ));
+                }
+            }
+        }
         let held =
             objects::list(&self.dir()).map_err(|e| format!("{}: {e}", self.root.display()))?;
-        let mut by_hash: BTreeMap<&str, &objects::Held> = BTreeMap::new();
         let (held, wrong): (Vec<objects::Held>, Vec<objects::Held>) =
             held.into_iter().partition(|h| h.named_right);
         r.misnamed = wrong.iter().map(|h| h.path.display().to_string()).collect();
         r.objects = held.len();
+        // Every object, bound or not, is hashed (with `hash`): an earlier
+        // version or a pending one is data too.
+        let mut by_key: BTreeMap<(&str, &str), &objects::Held> = BTreeMap::new();
         for h in &held {
-            by_hash.insert(&h.sha256, h);
+            by_key.insert((h.sha256.as_str(), h.ext.as_str()), h);
+            if hash {
+                match objects::hash_file(&h.path) {
+                    Ok(got) if got == h.sha256 => {}
+                    Ok(got) => r
+                        .damaged
+                        .push(format!("object {} hashes to {got}", h.path.display())),
+                    Err(err) => r.damaged.push(err),
+                }
+            }
         }
         for (name, e) in &index.names {
-            match by_hash.get(e.sha256.as_str()) {
+            match by_key.get(&(e.sha256.as_str(), e.ext.as_str())) {
                 None => r
                     .missing
-                    .push(format!("{name}: object {} isn't there", e.sha256)),
+                    .push(format!("{name}: object {}.{} isn't there", e.sha256, e.ext)),
                 Some(h) if h.size != e.size => r.damaged.push(format!(
                     "{name}: object {} is {} bytes, bound as {}",
                     e.sha256, h.size, e.size
                 )),
-                Some(h) if hash => match objects::hash_file(&h.path) {
-                    Ok(got) if got == e.sha256 => {}
-                    Ok(got) => r
-                        .damaged
-                        .push(format!("{name}: object {} hashes to {got}", e.sha256)),
-                    Err(err) => r.damaged.push(format!("{name}: {err}")),
-                },
                 Some(_) => {}
             }
         }
-        let named: std::collections::HashSet<&str> = index
+        // A pending object is the only copy of what it holds (a conflict's
+        // other version): it must be there too.
+        for e in &replay.events {
+            if let Event::Pending {
+                sha256, ext, for_, ..
+            } = e
+                && index.pending.contains_key(sha256)
+                && !by_key.contains_key(&(sha256.as_str(), ext.as_str()))
+                && !index.names.values().any(|n| n.sha256 == *sha256)
+            {
+                r.missing.push(format!(
+                    "pending object {sha256}.{ext} ({for_}) isn't there"
+                ));
+            }
+        }
+        r.missing.sort();
+        r.missing.dedup();
+        let current: std::collections::HashSet<(&str, &str)> = index
             .names
             .values()
-            .map(|e| e.sha256.as_str())
-            .chain(index.pending.keys().map(String::as_str))
+            .map(|e| (e.sha256.as_str(), e.ext.as_str()))
             .collect();
+        let pending: std::collections::HashSet<&str> =
+            index.pending.keys().map(String::as_str).collect();
         // An object no name points at now may be an earlier version: it's
-        // an orphan only if no binding ever named it.
-        let ever: std::collections::HashSet<&str> = replay
+        // an orphan only if no event ever named it.
+        let ever: std::collections::HashSet<(&str, &str)> = replay
             .events
             .iter()
             .filter_map(|e| match e {
-                Event::Bind { sha256, .. } | Event::Pending { sha256, .. } => Some(sha256.as_str()),
+                Event::Bind { sha256, ext, .. } | Event::Pending { sha256, ext, .. } => {
+                    Some((sha256.as_str(), ext.as_str()))
+                }
                 _ => None,
             })
             .collect();
         for h in &held {
-            if !named.contains(h.sha256.as_str()) {
-                if ever.contains(h.sha256.as_str()) {
-                    r.unreferenced += 1;
-                } else {
-                    r.orphans.push(h.path.display().to_string());
-                }
+            let key = (h.sha256.as_str(), h.ext.as_str());
+            if current.contains(&key) || pending.contains(h.sha256.as_str()) {
+                continue;
+            }
+            if ever.contains(&key) {
+                r.unreferenced += 1;
+            } else {
+                r.orphans.push(h.path.display().to_string());
             }
         }
         r.names = index.names.len();
@@ -434,6 +553,63 @@ impl Volume {
     }
 }
 
+impl Volume {
+    fn receipt_path(&self, source: &str) -> PathBuf {
+        self.dir().join("sources").join(format!("{source}.json"))
+    }
+
+    /// The receipt of what was read from the source `source` (by
+    /// `store migrate-cas`): `{ source, root, runs: [...], files: { rel:
+    /// { size, mtime_ns, sha256, outcome } } }`, or none.
+    ///
+    /// # Errors
+    /// If it's there but unreadable.
+    pub fn receipt(&self, source: &str) -> Result<Option<Value>, String> {
+        let p = self.receipt_path(source);
+        match fs::read(&p) {
+            Ok(t) => serde_json::from_slice(&t)
+                .map(Some)
+                .map_err(|e| format!("{}: {e}", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("{}: {e}", p.display())),
+        }
+    }
+
+    /// Every source receipt kept, by source name.
+    ///
+    /// # Errors
+    /// If one is unreadable.
+    pub fn receipts(&self) -> Result<BTreeMap<String, Value>, String> {
+        let mut out = BTreeMap::new();
+        let dir = self.dir().join("sources");
+        let Ok(rd) = fs::read_dir(&dir) else {
+            return Ok(out);
+        };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(src) = name.strip_suffix(".json")
+                && let Some(r) = self.receipt(src)?
+            {
+                out.insert(src.to_owned(), r);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write a source's receipt whole.
+    ///
+    /// # Errors
+    /// If it can't be written.
+    pub fn write_receipt(&self, source: &str, receipt: &Value) -> Result<(), String> {
+        if source.is_empty() || source.contains(['/', '\\']) || source.starts_with('.') {
+            return Err(format!("{source:?} isn't a source name"));
+        }
+        let p = self.receipt_path(source);
+        let body = serde_json::to_vec(receipt).map_err(|e| e.to_string())?;
+        objects::write_whole(&p, &body).map_err(|e| format!("{}: {e}", p.display()))
+    }
+}
+
 /// What [`Volume::verify`] found.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct Report {
@@ -453,6 +629,15 @@ pub struct Report {
     pub conflicts: Vec<String>,
     /// The log's last line, torn by a crash mid-write, if it was.
     pub torn_last_line: Option<String>,
+    /// Lines before the last cut short by a crash and noted by the next
+    /// writer (tolerated, listed with their offsets).
+    pub torn_lines: Vec<String>,
+    /// Lines before the last cut short and never noted: damage.
+    pub log_damage: Vec<String>,
+    /// The snapshot unreadable, its checksum failing, or unlike the log.
+    pub snapshot: Vec<String>,
+    /// Whether objects were hashed (else sizes only).
+    pub hashed: bool,
 }
 
 impl Report {
@@ -464,6 +649,8 @@ impl Report {
             && self.orphans.is_empty()
             && self.misnamed.is_empty()
             && self.conflicts.is_empty()
+            && self.log_damage.is_empty()
+            && self.snapshot.is_empty()
     }
 }
 

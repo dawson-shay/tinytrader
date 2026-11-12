@@ -48,83 +48,6 @@ fn kind(rel: &str) -> &'static str {
     }
 }
 
-/// The operating system's own files and folders, never data.
-fn os_own(name: &str) -> bool {
-    matches!(
-        name,
-        ".DS_Store"
-            | ".Spotlight-V100"
-            | ".fseventsd"
-            | ".Trashes"
-            | ".TemporaryItems"
-            | ".DocumentRevisions-V100"
-            | "lost+found"
-            | "$RECYCLE.BIN"
-            | "System Volume Information"
-    ) || name.starts_with("._")
-}
-
-/// A file found on a source.
-struct Found {
-    rel: String,
-    path: PathBuf,
-    size: u64,
-}
-
-/// Every regular file under `root`, with what couldn't be read.
-fn walk(root: &Path) -> (Vec<Found>, Vec<String>, usize) {
-    let (mut out, mut errors, mut skipped) = (Vec::new(), Vec::new(), 0usize);
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let rd = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
-            Err(e) => {
-                errors.push(format!("{}: {e}", dir.display()));
-                continue;
-            }
-        };
-        for e in rd {
-            let e = match e {
-                Ok(e) => e,
-                Err(err) => {
-                    errors.push(format!("{}: {err}", dir.display()));
-                    continue;
-                }
-            };
-            let name = e.file_name().to_string_lossy().into_owned();
-            let path = e.path();
-            // A CAS volume already here (the destination on the same pool)
-            // isn't a source.
-            if os_own(&name) || (dir == root && name == tinytrader_cas::DIR) {
-                skipped += 1;
-                continue;
-            }
-            match e.file_type() {
-                Ok(t) if t.is_dir() => stack.push(path),
-                Ok(t) if t.is_file() => match e.metadata() {
-                    Ok(m) => out.push(Found {
-                        rel: path
-                            .strip_prefix(root)
-                            .unwrap_or(&path)
-                            .to_string_lossy()
-                            .into_owned(),
-                        path,
-                        size: m.len(),
-                    }),
-                    Err(err) => errors.push(format!("{}: {err}", path.display())),
-                },
-                Ok(_) => errors.push(format!(
-                    "{}: a link or special file; not copied",
-                    path.display()
-                )),
-                Err(err) => errors.push(format!("{}: {err}", path.display())),
-            }
-        }
-    }
-    out.sort_by(|a, b| a.rel.cmp(&b.rel));
-    (out, errors, skipped)
-}
-
 /// The extension an object keeps: the file's, from its first dot (so
 /// `2026-10-02.dbn.zst` keeps `dbn.zst`), or `bin`.
 fn ext_of(rel: &str) -> String {
@@ -172,7 +95,8 @@ const WRITER: &str = concat!("store migrate-cas ", env!("CARGO_PKG_VERSION"));
 /// could be).
 ///
 /// # Errors
-/// If the destination can't be opened or its log written.
+/// If the destination can't be opened or its log written, or a source is
+/// empty (not mounted, say).
 pub fn run(
     sources: &[Source],
     dest: Option<(&Path, &str)>,
@@ -198,26 +122,51 @@ pub fn run(
         (Some(v), false) => Some(v.log()?),
         _ => None,
     };
-    // Each name: every source's file, with its recorded hash.
+    // What each source gave before (its receipt in the destination): a file
+    // is skipped only when this same path, at the same size and time, was
+    // hashed into an object still there (review C1).
+    let mut receipts: BTreeMap<String, Value> = BTreeMap::new();
+    for s in sources {
+        let r = match &vol {
+            Some(v) => v.receipt(&s.name)?,
+            None => None,
+        };
+        receipts.insert(
+            s.name.clone(),
+            r.unwrap_or_else(|| json!({ "source": s.name, "runs": [], "files": {} })),
+        );
+    }
+    // What each source is now (its volume id, or its device).
+    let identities: BTreeMap<String, String> = sources
+        .iter()
+        .map(|s| (s.name.clone(), tinytrader_cas::tree::identity(&s.root)))
+        .collect();
     struct Copy<'a> {
         source: &'a Source,
-        found: Found,
+        found: tinytrader_cas::tree::Found,
         recorded: Option<String>,
         bad_record: Option<String>,
     }
     let mut names: BTreeMap<String, Vec<Copy>> = BTreeMap::new();
-    let mut errors = Vec::new();
-    let mut os_skipped = 0usize;
+    let (mut errors, mut skipped) = (Vec::new(), Vec::new());
     for s in sources {
         progress(&format!("reading {} ({})", s.name, s.root.display()));
         if !s.root.is_dir() {
-            errors.push(format!("{}: {} isn't a folder", s.name, s.root.display()));
-            continue;
+            return Err(format!("{}: {} isn't a folder", s.name, s.root.display()));
         }
-        let (found, errs, skipped) = walk(&s.root);
-        errors.extend(errs.into_iter().map(|e| format!("{}: {e}", s.name)));
-        os_skipped += skipped;
-        for f in found {
+        let w = tinytrader_cas::tree::walk(&s.root);
+        // An empty source is more likely a drive not mounted than a drive
+        // with nothing on it: never read as "nothing to copy" (review C2).
+        if w.files.is_empty() {
+            return Err(format!(
+                "{}: {} holds no files; is the drive mounted? Nothing was copied",
+                s.name,
+                s.root.display()
+            ));
+        }
+        errors.extend(w.errors.into_iter().map(|e| format!("{}: {e}", s.name)));
+        skipped.extend(w.skipped.into_iter().map(|e| format!("{}: {e}", s.name)));
+        for f in w.files {
             let (recorded, bad_record) = match crate::recorded::of(&s.root, &f.path, f.size, 0) {
                 crate::recorded::Recorded::Known(h) => (Some(h), None),
                 crate::recorded::Recorded::Unknown => (None, None),
@@ -232,11 +181,12 @@ pub fn run(
         }
     }
     let mut by_kind: BTreeMap<&str, (u64, u64)> = BTreeMap::new();
-    let (mut to_copy, mut to_copy_bytes, mut already, mut bound) = (0u64, 0u64, 0u64, 0u64);
+    let (mut to_read, mut to_read_bytes, mut already, mut bound) = (0u64, 0u64, 0u64, 0u64);
     let (mut conflicts, mut damaged, mut unrecorded) = (Vec::new(), Vec::new(), 0u64);
-    let (mut duplicates, mut copied_bytes) = (0u64, 0u64);
+    let (mut duplicates, mut copied_bytes, mut kept_pending) = (0u64, 0u64, 0u64);
     for (name, copies) in &names {
         let k = kind(name);
+        let ext = ext_of(name);
         let e = by_kind.entry(k).or_default();
         e.0 += 1;
         e.1 += copies[0].found.size;
@@ -246,69 +196,100 @@ pub fn run(
         if copies.iter().all(|c| c.recorded.is_none()) {
             unrecorded += 1;
         }
-        for c in copies
-            .iter()
-            .filter_map(|c| c.bad_record.as_ref().map(|w| (c, w)))
-        {
-            damaged.push(format!(
-                "{name} on {}: its recorded hashes disagree ({}); copied, but checked against none",
-                c.0.source.name, c.1
-            ));
-        }
-        // Told apart without reading: sizes, and recorded hashes.
-        let sizes: std::collections::BTreeSet<u64> = copies.iter().map(|c| c.found.size).collect();
-        let hashes: std::collections::BTreeSet<&str> = copies
-            .iter()
-            .filter_map(|c| c.recorded.as_deref())
-            .collect();
-        if sizes.len() > 1 || hashes.len() > 1 {
-            conflicts.push(json!({
-                "name": name,
-                "copies": copies.iter().map(|c| json!({ "source": c.source.name, "size": c.found.size, "recorded_sha256": c.recorded })).collect::<Vec<_>>(),
-            }));
-            if plan {
-                continue;
+        let current = index.names.get(name);
+        // Each copy's content: from its receipt when it's provably the same
+        // file read before, else read now.
+        let known = |c: &Copy| -> Option<String> {
+            let r = &receipts[&c.source.name];
+            // A receipt from another drive mounted under this name is never
+            // believed (re-review (2)).
+            if r["identity"].as_str() != Some(identities[&c.source.name].as_str()) {
+                return None;
             }
-        }
-        // Already bound, and nothing says it's another content: done.
-        if let Some(b) = index.names.get(name)
-            && copies.iter().all(|c| c.found.size == b.size)
-            && hashes.iter().all(|h| *h == b.sha256)
-        {
-            already += 1;
+            let prev = &r["files"][&c.found.rel];
+            let sha = prev["sha256"].as_str()?;
+            // The same file, unchanged: a rewrite with its time put back, or
+            // a copy, has another inode or change time.
+            let f = &c.found;
+            let same = prev["size"].as_u64() == Some(f.size)
+                && prev["mtime_ns"].as_str() == Some(f.mtime_ns.to_string().as_str())
+                && prev["dev"].as_u64() == Some(f.dev)
+                && prev["ino"].as_u64() == Some(f.ino)
+                && prev["ctime_ns"].as_str() == Some(f.ctime_ns.to_string().as_str());
+            let held = vol.as_ref().is_some_and(|v| v.object(sha, &ext).is_some());
+            (same && held).then(|| sha.to_owned())
+        };
+        if plan {
+            let sizes: std::collections::BTreeSet<u64> =
+                copies.iter().map(|c| c.found.size).collect();
+            let hashes: std::collections::BTreeSet<&str> = copies
+                .iter()
+                .filter_map(|c| c.recorded.as_deref())
+                .collect();
+            if sizes.len() > 1 || hashes.len() > 1 {
+                conflicts.push(json!({ "name": name, "copies": copies.iter().map(|c| json!({ "source": c.source.name, "size": c.found.size, "recorded_sha256": c.recorded })).collect::<Vec<_>>() }));
+            }
+            for c in copies.iter().filter(|c| c.bad_record.is_some()) {
+                damaged.push(format!(
+                    "{name} on {}: {}",
+                    c.source.name,
+                    c.bad_record.as_deref().unwrap_or_default()
+                ));
+            }
+            if copies.iter().all(|c| known(c).is_some()) && current.is_some() {
+                already += 1;
+            } else {
+                to_read += 1;
+                to_read_bytes += copies.iter().map(|c| c.found.size).sum::<u64>();
+            }
             continue;
         }
-        to_copy += 1;
-        to_copy_bytes += copies[0].found.size;
         let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
             continue;
         };
-        // Copy every source's file; each distinct content is one object.
-        let mut objects: Vec<(&Copy, tinytrader_cas::ObjectRef)> = Vec::new();
+        // (copy, its content's hash, whether it may be bound)
+        let mut got: Vec<(&Copy, String, bool)> = Vec::new();
         for c in copies {
-            match v.put_file(&c.found.path, &ext_of(name), c.recorded.as_deref()) {
+            if let Some(sha) = known(c) {
+                got.push((c, sha, c.bad_record.is_none()));
+                continue;
+            }
+            // Read whatever the record says: bytes unlike their record are
+            // kept (they may be the only copy), never bound (review H2).
+            match v.put_file(&c.found.path, &ext, None) {
                 Ok(o) => {
                     if !o.existed {
                         copied_bytes += o.size;
                     }
-                    objects.push((c, o));
+                    let mut ok = true;
+                    if let Some(why) = &c.bad_record {
+                        damaged.push(format!(
+                            "{name} on {}: its record disagrees ({why}); kept, not bound",
+                            c.source.name
+                        ));
+                        ok = false;
+                    }
+                    if let Some(want) = c.recorded.as_deref().filter(|w| *w != o.sha256) {
+                        damaged.push(format!("{name} on {}: SHA-256 {}, but {want} was recorded when filed; kept, not bound", c.source.name, o.sha256));
+                        ok = false;
+                    }
+                    got.push((c, o.sha256, ok));
                 }
                 Err(e) => damaged.push(format!("{name} on {}: {e}", c.source.name)),
             }
         }
-        let distinct: std::collections::BTreeSet<&str> =
-            objects.iter().map(|(_, o)| o.sha256.as_str()).collect();
-        let current = index.names.get(name);
-        let fits = |sha: &str| current.is_none_or(|b| b.sha256 == sha);
-        if distinct.len() == 1 && objects.len() == copies.len() && fits(&objects[0].1.sha256) {
-            let (c, o) = &objects[0];
+        let distinct: std::collections::BTreeSet<&str> = got.iter().map(|g| g.1.as_str()).collect();
+        let clean = got.len() == copies.len() && got.iter().all(|g| g.2) && distinct.len() == 1;
+        let sha = got.first().map(|g| g.1.clone()).unwrap_or_default();
+        let fits = current.is_none_or(|b| b.sha256 == sha);
+        let outcome = if clean && fits {
             if current.is_none() {
                 log.append(&Event::Bind {
                     name: name.clone(),
                     version: 1,
-                    sha256: o.sha256.clone(),
-                    size: o.size,
-                    ext: ext_of(name),
+                    sha256: sha.clone(),
+                    size: copies[0].found.size,
+                    ext: ext.clone(),
                     kind: k.to_owned(),
                     source: format!(
                         "migrated from {}",
@@ -323,27 +304,44 @@ pub fn run(
                     at: now(),
                 })?;
                 bound += 1;
+                "bound"
+            } else {
+                already += 1;
+                "already"
             }
-            let _ = c;
         } else {
-            // Kept, not bound: every content found for the name, pending
-            // an operator's choice.
-            for (c, o) in &objects {
+            // Every content found for the name is kept, pending an
+            // operator's choice; none is bound over another.
+            for (c, h, _) in &got {
+                if current.is_some_and(|b| b.sha256 == *h) {
+                    continue;
+                }
                 log.append(&Event::Pending {
-                    sha256: o.sha256.clone(),
-                    ext: ext_of(name),
+                    sha256: h.clone(),
+                    ext: ext.clone(),
                     for_: format!("conflict over {name} (from {})", c.source.name),
                     writer: WRITER.into(),
                     at: now(),
                 })?;
+                kept_pending += 1;
             }
-            if sizes.len() <= 1 && hashes.len() <= 1 {
+            if distinct.len() > 1 || !fits {
                 conflicts.push(json!({
                     "name": name,
-                    "copies": objects.iter().map(|(c, o)| json!({ "source": c.source.name, "size": o.size, "sha256": o.sha256 })).collect::<Vec<_>>(),
+                    "copies": got.iter().map(|(c, h, _)| json!({ "source": c.source.name, "size": c.found.size, "sha256": h })).collect::<Vec<_>>(),
                     "bound": current.map(|b| &b.sha256),
                 }));
             }
+            "pending"
+        };
+        for (c, h, ok) in &got {
+            receipts
+                .get_mut(&c.source.name)
+                .expect("each source has a receipt")["files"][&c.found.rel] = json!({
+                "size": c.found.size, "mtime_ns": c.found.mtime_ns.to_string(),
+                "dev": c.found.dev, "ino": c.found.ino, "ctime_ns": c.found.ctime_ns.to_string(), "sha256": h,
+                "outcome": if *ok { outcome } else { "pending" },
+            });
         }
         if (bound + already) % 1000 == 0 {
             progress(&format!(
@@ -362,19 +360,40 @@ pub fn run(
         && conflicts.is_empty()
         && damaged.is_empty()
         && verify.as_ref().is_none_or(tinytrader_cas::Report::sound);
+    // Each source's receipt: every file read, and how this run ended, kept
+    // in the volume so a check later knows (review C2).
+    if let (Some(v), false) = (&vol, plan) {
+        for s in sources {
+            let r = receipts
+                .get_mut(&s.name)
+                .expect("each source has a receipt");
+            r["root"] = json!(s.root);
+            r["identity"] = json!(identities[&s.name]);
+            if let Some(runs) = r["runs"].as_array_mut() {
+                runs.push(json!({
+                    "at": now(), "writer": WRITER, "ok": ok,
+                    "conflicts": conflicts.len(), "damaged": damaged.len(),
+                    "errors": errors.iter().filter(|e| e.starts_with(&format!("{}: ", s.name))).collect::<Vec<_>>(),
+                    "skipped": skipped.iter().filter(|e| e.starts_with(&format!("{}: ", s.name))).collect::<Vec<_>>(),
+                }));
+            }
+            v.write_receipt(&s.name, r)?;
+        }
+    }
     let report = json!({
         "plan": plan,
         "sources": sources.iter().map(|s| json!({ "name": s.name, "path": s.root })).collect::<Vec<_>>(),
         "destination": vol.as_ref().map(|v| json!({ "path": v.root, "volume": v.id })),
         "names": names.len(),
         "by_kind": by_kind.iter().map(|(k, (n, b))| (k.to_string(), json!({ "names": n, "bytes": b }))).collect::<serde_json::Map<_, _>>(),
-        "to_copy": { "names": to_copy, "bytes": to_copy_bytes },
+        "to_read": { "names": to_read, "bytes": to_read_bytes },
         "already_there": already,
         "bound": bound,
+        "kept_pending": kept_pending,
         "bytes_written": copied_bytes,
         "on_several_sources": duplicates,
         "without_a_recorded_hash": unrecorded,
-        "os_files_skipped": os_skipped,
+        "os_files_skipped": skipped,
         "conflicts": conflicts,
         "damaged": damaged,
         "errors": errors,
@@ -475,6 +494,10 @@ mod tests {
             b"pending upload",
         );
         put(&a, ".DS_Store", b"junk");
+        // The OS's folder at the root is skipped (listed); an OS-like name
+        // anywhere else is data, copied (re-review (1)).
+        put(&a, ".Trashes/501/x", b"trash");
+        put(&a, "Databento/x/._notes.dbn.zst", b"not apple's");
         put(&b, DAY1, b"day one");
         put(&b, DAY2, b"day 2!!");
         put(&b, "notes.txt", b"other");
@@ -489,18 +512,24 @@ mod tests {
         assert_eq!(
             (
                 p["names"].clone(),
-                p["to_copy"]["names"].clone(),
+                p["to_read"]["names"].clone(),
                 p["on_several_sources"].clone()
             ),
-            (json!(5), json!(5), json!(2))
+            (json!(7), json!(7), json!(2))
         );
-        assert_eq!(p["by_kind"]["day"]["names"], 2);
+        assert_eq!(p["by_kind"]["day"]["names"], 3);
         assert_eq!(p["by_kind"]["incoming"]["names"], 1);
-        assert_eq!(p["os_files_skipped"], 1);
+        assert_eq!(p["os_files_skipped"].as_array().unwrap().len(), 1, "{p}");
+        assert!(
+            p["os_files_skipped"][0]
+                .as_str()
+                .unwrap()
+                .ends_with(".Trashes")
+        );
         // The copy: DAY1 once, DAY2's two contents kept and unbound.
         let (r, ok) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
         assert!(!ok, "a conflict isn't ok: {r}");
-        assert_eq!(r["bound"], 4, "{r}");
+        assert_eq!(r["bound"], 6, "{r}");
         assert_eq!(r["conflicts"].as_array().unwrap().len(), 1);
         assert_eq!(r["conflicts"][0]["name"], DAY2);
         let v = Volume::open(&dest).unwrap();
@@ -519,10 +548,169 @@ mod tests {
         let (again, _) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
         assert_eq!(
             (again["bound"].clone(), again["already_there"].clone()),
-            (json!(0), json!(4)),
+            (json!(0), json!(6)),
             "{again}"
         );
         assert_eq!(again["bytes_written"], 0);
+    }
+
+    /// Review C1: a resumed run doesn't skip another source's file of the
+    /// same name and size: it's read, and a different content is a conflict,
+    /// kept, not lost.
+    #[test]
+    fn a_later_source_with_other_bytes_at_the_same_size_is_kept() {
+        let d = scratch("c1");
+        let (a, b, dest) = (d.join("data"), d.join("tt03"), d.join("nas"));
+        put(&a, DAY1, b"day one");
+        put(&b, DAY1, b"day 1!!");
+        let data = [source(&format!("data={}", a.display())).unwrap()];
+        let tt03 = [source(&format!("tt03={}", b.display())).unwrap()];
+        assert!(
+            run(&data, Some((&dest, "nas-1")), false, &mut |_| {})
+                .unwrap()
+                .1
+        );
+        let (r, ok) = run(&tt03, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert!(!ok, "{r}");
+        assert_eq!(r["conflicts"][0]["name"], DAY1, "{r}");
+        let v = Volume::open(&dest).unwrap();
+        let i = v.index().unwrap();
+        assert_eq!(i.pending.len(), 1, "tt03's version is kept");
+        let theirs = i.pending.keys().next().unwrap();
+        assert_eq!(
+            fs::read(v.object(theirs, "dbn.zst").unwrap()).unwrap(),
+            b"day 1!!"
+        );
+        // Its receipt says what happened.
+        let rec = v.receipt("tt03").unwrap().unwrap();
+        assert_eq!(rec["files"][DAY1]["outcome"], "pending");
+        assert_eq!(rec["runs"][0]["ok"], false);
+        // data again, unchanged: skipped from its receipt, nothing read.
+        let (again, _) = run(&data, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert_eq!(
+            (
+                again["already_there"].clone(),
+                again["bytes_written"].clone()
+            ),
+            (json!(1), json!(0))
+        );
+    }
+
+    /// Re-review (2): a rewrite at the same size with its modification time
+    /// put back, or a copy mounted under the same name, isn't skipped from
+    /// the receipt: it's read, and other bytes are a conflict.
+    #[test]
+    fn a_rewrite_with_its_time_restored_is_read_again() {
+        let d = scratch("mtime");
+        let (a, dest) = (d.join("data"), d.join("nas"));
+        put(&a, DAY1, b"day one");
+        let data = [source(&format!("data={}", a.display())).unwrap()];
+        assert!(
+            run(&data, Some((&dest, "nas-1")), false, &mut |_| {})
+                .unwrap()
+                .1
+        );
+        let when = fs::metadata(a.join(DAY1)).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let tmp = a.join("rewrite.tmp");
+        fs::write(&tmp, b"day 1!!").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&tmp)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+        fs::rename(&tmp, a.join(DAY1)).unwrap();
+        let (r, ok) = run(&data, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert!(!ok, "{r}");
+        assert_eq!(r["conflicts"][0]["name"], DAY1, "{r}");
+        // A copy of the original, under the same source name: read (another
+        // inode), the same bytes, so already there.
+        let clone = d.join("clone");
+        put(&clone, DAY1, b"day one");
+        let again = [source(&format!("data={}", clone.display())).unwrap()];
+        let (r, _) = run(&again, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert_eq!(
+            (
+                r["already_there"].clone(),
+                r["conflicts"].as_array().unwrap().len()
+            ),
+            (json!(1), 0),
+            "{r}"
+        );
+    }
+
+    /// Review C2: a source with no files (a drive not mounted) is refused,
+    /// never read as nothing to copy.
+    #[test]
+    fn an_empty_source_is_refused() {
+        let d = scratch("empty");
+        fs::create_dir_all(d.join("mnt-data")).unwrap();
+        let sources = [source(&format!("data={}", d.join("mnt-data").display())).unwrap()];
+        let e = run(
+            &sources,
+            Some((&d.join("nas"), "nas-1")),
+            false,
+            &mut |_| {},
+        )
+        .unwrap_err();
+        assert!(e.contains("is the drive mounted"), "{e}");
+        assert!(
+            run(&sources, None, true, &mut |_| {}).is_err(),
+            "the plan too"
+        );
+    }
+
+    /// Review H1 and H2: a ledger written where the drive was mounted then
+    /// (`/Volumes/Data/...`) still gives the expected hash read elsewhere;
+    /// bytes unlike it, or unlike their manifest's size, are kept, not bound.
+    #[test]
+    fn records_from_another_mount_point_are_used_and_mismatches_kept() {
+        let d = scratch("h1");
+        let (a, dest) = (d.join("mnt-data"), d.join("nas"));
+        put(&a, DAY1, b"what's on disk");
+        put(&a, DAY2, b"right");
+        let sha = |b: &[u8]| {
+            use sha2::Digest as _;
+            format!("{:x}", sha2::Sha256::digest(b))
+        };
+        let lines = [
+            json!({ "step": "moved", "from": "x", "to": format!("/Volumes/Data/{DAY1}"), "sha256": sha(b"what was filed") }),
+            json!({ "step": "moved", "from": "x", "to": format!("/Volumes/Data/{DAY2}"), "sha256": sha(b"right") }),
+        ];
+        put(
+            &a,
+            "Databento/migrations/2026-10-06-incorporate-B.events.jsonl",
+            format!("{}\n{}\n", lines[0], lines[1]).as_bytes(),
+        );
+        // A partial day whose manifest records another size.
+        let day3 = "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2022-09-09.dbn.zst";
+        put(&a, day3, b"short");
+        crate::manifest::set_entry(
+            &a.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m"),
+            "2022-09-09",
+            Some(json!({ "file": "2022-09-09.dbn.zst", "size": 999, "coverage": {} })),
+        )
+        .unwrap();
+        let sources = [source(&format!("data={}", a.display())).unwrap()];
+        let (r, ok) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert!(!ok);
+        let damaged = r["damaged"].to_string();
+        assert!(
+            damaged.contains(DAY1) && damaged.contains("was recorded when filed"),
+            "{r}"
+        );
+        assert!(damaged.contains(day3) && damaged.contains("999"), "{r}");
+        let i = Volume::open(&dest).unwrap().index().unwrap();
+        assert!(i.names.contains_key(DAY2), "matched its record: bound");
+        assert!(
+            !i.names.contains_key(DAY1) && !i.names.contains_key(day3),
+            "kept, not bound"
+        );
+        assert!(
+            i.pending.contains_key(&sha(b"what's on disk"))
+                && i.pending.contains_key(&sha(b"short"))
+        );
     }
 
     #[test]

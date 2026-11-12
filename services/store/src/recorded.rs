@@ -155,7 +155,16 @@ fn build(volume: &Path) -> Map {
                 let (Some(to), Some(sha)) = (to, step["sha256"].as_str()) else {
                     continue;
                 };
-                let Some(rel) = within(volume, real.as_deref(), Path::new(to)) else {
+                // A ledger names where the volume was mounted when it filed
+                // (`/Volumes/Data/...`); read elsewhere (`/mnt/data`), the
+                // part from the provider's folder on is the same (review H1).
+                let rel = within(volume, real.as_deref(), Path::new(to)).or_else(|| {
+                    let pname = provider.file_name()?;
+                    let parts: Vec<_> = Path::new(to).components().collect();
+                    let at = parts.iter().rposition(|c| c.as_os_str() == pname)?;
+                    Some(parts[at..].iter().collect::<PathBuf>())
+                });
+                let Some(rel) = rel else {
                     continue;
                 };
                 let receipt = from.map(Path::new).and_then(|f| {

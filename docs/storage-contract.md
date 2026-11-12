@@ -37,19 +37,27 @@ Under the volume's root:
     `previous`;
   - `pending`: `sha256`, `ext`, `for`;
   - `retire`: `name`, `sha256`, `why`;
-  - `verified`: `sha256`.
+  - `verified`: `sha256`;
+  - `torn_noted`: `offset`, `text`: the next writer's note that the line at
+    `offset` was cut short by a crash.
   - Each event also carries `writer` (program and version) and `at` (Unix
     seconds).
 - A name's versions are bound in order: the first is 1, and each later one
   is the last plus one, with `previous` set to the last one's hash. An event
   that breaks this is a conflict: it's reported, never applied. The same
   binding written twice is not a conflict.
-- Damage: a torn last line, from a crash mid-append, is the only damage
-  tolerated. It's ignored and reported. The next append ends it with a
-  newline first. Any other line that isn't an event is an error.
+- **Damage:**
+  - a torn last line, from a crash mid-append, is tolerated and reported;
+  - the next writer ends it with a newline and appends `torn_noted` for
+    it. A line cut short before the last is tolerated only with its
+    `torn_noted`, and is listed with its offset either way. Without one it's
+    damage;
+  - any other line that isn't an event is an error.
 - **The index is a cache.** It's what the log says when replayed in order,
-  and it's never the only record of anything. A snapshot that can't be read
-  is ignored, and the log replayed whole.
+  and it's never the only record of anything. The snapshot is
+  `{"index", "sha256"}`, the hash of the index it holds. One that can't be
+  read, whose hash fails, or that isn't what the log says as of its length
+  is ignored (the log is replayed whole) and reported by a check.
 
 **S3, provenance.** Every object bound under a name has a provenance record
 (its source, its request, when it was fetched or received, the upstream
@@ -76,8 +84,16 @@ copy. Nothing counts as held without at least one verified copy.
 ## Checking
 
 ```sh
-tt-fsck [--quick] [--json] [--min-copies N] PATH...
+tt-fsck [--quick] [--json] [--min-copies N] [--against NAME=PATH]... PATH...
 ```
+
+**`--against NAME=PATH` is the gate for deleting, reformatting or reusing a
+source drive.**
+- It walks the source again, read-only, and hashes every file. Each one's
+  path, size and SHA-256 must be bound on a volume given. A file kept only
+  as pending, or not held at all, is a finding.
+- A source with no files (not mounted) is refused (exit 2).
+- Each volume's migration receipts (`cas/sources/`) must end clean.
 
 `tt-fsck` checks volumes from the disk alone, with nothing else writing
 them. It holds each volume's `cas/LOCK` shared, so it refuses a volume being
@@ -90,8 +106,9 @@ A volume is sound when:
 - every name's object is there, at its size and hash;
 - every object is named, pending, or named by an earlier version
   (unreferenced, kept until an operator's garbage collection);
-- no object is misnamed;
-- the log has no conflicts.
+- no object is misnamed, and every object (bound or not) hashes to its name;
+- the log has no conflicts and no damage, and the snapshot is what it
+  says.
 
 An object that no binding ever named is an **orphan**. It's kept, and
 reported. `tinytrader-cas`'s `Volume::verify` checks S1 and S2. `tt-fsck`
