@@ -560,6 +560,41 @@ impl Scan {
         self.errors.push((path.to_path_buf(), e));
     }
 
+    /// A path's metadata (following links), or `None` when it isn't there. Any
+    /// other failure (an I/O error, a drive dropping out) is the scan's error,
+    /// never "not there": a scan with errors doesn't change what the volume is
+    /// remembered to hold (P0, 2026-11-10).
+    fn stat(&mut self, path: &Path) -> Option<std::fs::Metadata> {
+        match std::fs::metadata(path) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.fail(path, e.to_string());
+                None
+            }
+        }
+    }
+
+    /// As [`Scan::stat`], not following a link.
+    fn lstat(&mut self, path: &Path) -> Option<std::fs::Metadata> {
+        match std::fs::symlink_metadata(path) {
+            Ok(m) => Some(m),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                self.fail(path, e.to_string());
+                None
+            }
+        }
+    }
+
+    fn is_dir(&mut self, path: &Path) -> bool {
+        self.stat(path).is_some_and(|m| m.is_dir())
+    }
+
+    fn is_file(&mut self, path: &Path) -> bool {
+        self.stat(path).is_some_and(|m| m.is_file())
+    }
+
     /// `path` within the volume, as `/files` names it.
     fn within(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
@@ -616,7 +651,7 @@ impl Dataset {
 /// Look for datasets under `dir`, in `provider`'s folder if any; returns
 /// whether any were found.
 fn visit(dir: &Path, depth: usize, provider: Option<&str>, scan: &mut Scan) -> bool {
-    if !dir.is_dir() {
+    if !scan.is_dir(dir) {
         return false;
     }
     // Deeper, the files are counted by their headers.
@@ -627,7 +662,7 @@ fn visit(dir: &Path, depth: usize, provider: Option<&str>, scan: &mut Scan) -> b
     if is_dataset_name(&name) {
         return store_dataset(dir, &name, provider, scan);
     }
-    if dir.join("metadata.json").is_file() && dir.join("manifest.json").is_file() {
+    if scan.is_file(&dir.join("metadata.json")) && scan.is_file(&dir.join("manifest.json")) {
         return databento_batch(dir, provider, scan);
     }
     let mut found = false;
@@ -645,15 +680,15 @@ fn visit(dir: &Path, depth: usize, provider: Option<&str>, scan: &mut Scan) -> b
 /// and read again on the next scan. An empty file holds nothing. Returns
 /// whether any were found.
 fn loose(path: &Path, provider: Option<&str>, scan: &mut Scan) -> bool {
-    let Ok(meta) = std::fs::symlink_metadata(path) else {
+    let Some(meta) = scan.lstat(path) else {
         return false;
     };
     if scan.claimed.contains(path) {
         return false;
     }
     if meta.is_dir() {
-        let mut found = path.join("metadata.json").is_file()
-            && !path.join("manifest.json").exists()
+        let mut found = scan.is_file(&path.join("metadata.json"))
+            && scan.stat(&path.join("manifest.json")).is_none()
             && unmanifested(path, provider, scan);
         for child in listing(path, true, scan) {
             found |= loose(&child, provider, scan);
@@ -924,7 +959,10 @@ fn store_dataset(dir: &Path, id: &str, provider: Option<&str>, scan: &mut Scan) 
             d.sources.push(source.clone());
         }
     };
-    for child in listing(dir, true, scan).into_iter().filter(|c| c.is_dir()) {
+    for child in listing(dir, true, scan) {
+        if !scan.is_dir(&child) {
+            continue;
+        }
         let k = key(provider, id, None);
         if add_days(&child, &k, &file_name(&child), scan) {
             note(scan, k);
@@ -932,10 +970,10 @@ fn store_dataset(dir: &Path, id: &str, provider: Option<&str>, scan: &mut Scan) 
             continue;
         }
         let sym = file_name(&child);
-        for grandchild in listing(&child, true, scan)
-            .into_iter()
-            .filter(|c| c.is_dir())
-        {
+        for grandchild in listing(&child, true, scan) {
+            if !scan.is_dir(&grandchild) {
+                continue;
+            }
             let k = key(provider, id, Some(&sym));
             if add_days(&grandchild, &k, &file_name(&grandchild), scan) {
                 note(scan, k);
@@ -977,14 +1015,14 @@ fn add_days(dir: &Path, k: &Key, schema: &str, scan: &mut Scan) -> bool {
         let n = file_name(&f);
         let (day, size, encoding, served) = if let Some(day) =
             n.strip_suffix(".dbn.zst").filter(|d| is_iso_date(d))
-            && f.is_file()
+            && scan.is_file(&f)
         {
-            let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let size = scan.stat(&f).map_or(0, |m| m.len());
             let within = scan.within(&f);
             scan.served.push((within.clone(), size));
             let served = if size > 0 { vec![within] } else { Vec::new() };
             (day.to_owned(), size, "dbn.zst", served)
-        } else if is_iso_date(&n) && f.is_dir() {
+        } else if is_iso_date(&n) && scan.is_dir(&f) {
             let mut found = Vec::new();
             crate::read::walk(&scan.root, &f, &mut found);
             scan.served.extend(found.iter().cloned());
@@ -1230,7 +1268,13 @@ pub fn read_batch(dir: &Path) -> Result<Option<Batch>, String> {
         else {
             continue;
         };
-        let size = f.metadata().map(|m| m.len()).unwrap_or(0);
+        // Gone since it was listed: not there. Any other failure is an error
+        // of the batch, never an empty file (P0, 2026-11-10).
+        let size = match f.metadata() {
+            Ok(m) => m.len(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("{}: {e}", f.display())),
+        };
         // An empty file holds no day.
         if size == 0 {
             continue;
