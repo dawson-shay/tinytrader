@@ -39,6 +39,7 @@
 #                         NAME:MAX_AGE_SECONDS:PATH (e.g.
 #                         backup:108000:/var/lib/backup/last-backup): one
 #                         missing or older than its max age is a warning
+#                         (its age in minutes when the max is under an hour)
 #
 # Alerting: a problem must be seen two runs in a row before it is sent; it is
 # sent again every WATCH_REPEAT_HIGH seconds (default 1800) while high

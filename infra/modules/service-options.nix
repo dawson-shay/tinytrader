@@ -1,5 +1,5 @@
 # The options of tinytrader.services.<name>, shared by the NixOS module
-# (systemd units, services.nix) and the nix-darwin module (launchd agents,
+# (systemd units, services.nix) and the nix-darwin module (launchd daemons,
 # darwin-services.nix), so one service definition runs on either.
 { lib, ... }:
 let
@@ -81,14 +81,32 @@ in
                 "agent"
                 "daemon"
               ];
-              default = "agent";
+              default = "daemon";
               description = ''
                 macOS only: how launchd runs the service, always as the primary
-                user. "agent" (launchd.user.agents) starts it when the user logs
-                in; "daemon" (launchd.daemons, with UserName set) starts it at
-                boot without a login, so it comes back after a reboot or power
-                cut. With FileVault on, boot waits for the disk to be unlocked
-                at the login window either way. Ignored on Linux.
+                user. "daemon" (the default: launchd.daemons, with UserName
+                set) starts it at boot without a login, so it comes back after
+                a reboot or power cut. "agent" (launchd.user.agents) starts it
+                only when the user logs in: after a reboot nothing runs until
+                someone does, so it is not for a service that must come back
+                by itself (a warning says so). With FileVault on, boot waits
+                for the disk to be unlocked at the login window either way.
+                Ignored on Linux.
+              '';
+            };
+            user = mkOption {
+              type = types.nullOr types.str;
+              default = null;
+              example = "tinytrader-store";
+              description = ''
+                Linux only: run as this static system user (and the group of
+                the same name, both created here) instead of a transient
+                DynamicUser. For a service whose files outlive the unit, such
+                as the store's on its data volumes: a DynamicUser's uid may
+                change between boots and rebuilds, a static user's doesn't.
+                Its state directory stays /var/lib/tinytrader/<name> (systemd
+                moves it out of /var/lib/private when DynamicUser goes).
+                Ignored on macOS, where every service runs as the primary user.
               '';
             };
             observe = {

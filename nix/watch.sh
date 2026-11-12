@@ -260,7 +260,12 @@ check_fresh() {
       continue
     fi
     age=$(( now - mtime ))
-    [ "$age" -le "$max" ] || problem "fresh:$name" warn "$name: last done $(( age / 3600 )) h ago (limit $(( max / 3600 )) h)"
+    # In minutes for a stamp kept every few minutes (a link check), else hours.
+    if [ "$max" -lt 3600 ]; then
+      [ "$age" -le "$max" ] || problem "fresh:$name" warn "$name: last done $(( age / 60 )) min ago (limit $(( max / 60 )) min)"
+    else
+      [ "$age" -le "$max" ] || problem "fresh:$name" warn "$name: last done $(( age / 3600 )) h ago (limit $(( max / 3600 )) h)"
+    fi
   done <<<"$fresh"
 }
 
