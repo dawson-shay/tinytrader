@@ -500,6 +500,12 @@ async fn scan(store: &Shared, observer: &Observer) {
         (held, r.ignored.clone())
     };
     let s = store.clone();
+    let cas_before = lock(&store.cas).clone();
+    let views = store
+        .state_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("cas-views");
     let found = tokio::task::spawn_blocking(move || {
         #[cfg(test)]
         if lock(&SCAN_PANICS).as_ref() == Some(&s.state_path) {
@@ -556,18 +562,29 @@ async fn scan(store: &Shared, observer: &Observer) {
                 if let Some(_turn) = s.filer.turn_if_idle() {
                     settle_merges(v, &mut root, &mut places, &mut served);
                 }
+                // A content-addressed volume's datasets come from its index
+                // (decision 0035), read through its view as a tree is: before
+                // its errors are taken, and before the check below that the
+                // volume still holds something.
+                let cas = (root["present"] == true)
+                    .then(|| {
+                        cas_of(
+                            v,
+                            &views.join(&v.name),
+                            limits,
+                            cas_before.get(&v.name),
+                            &mut root,
+                            &mut places,
+                            &mut served,
+                        )
+                    })
+                    .flatten();
                 let errors: Vec<String> = if root["present"] == true {
                     root["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_owned)).collect()
                 } else {
                     Vec::new()
                 };
                 root["ignored"] = json!(mine);
-                // A content-addressed volume's datasets come from its index
-                // (decision 0035), before the check below that the volume
-                // still holds something.
-                let cas = (root["present"] == true)
-                    .then(|| cas_of(v, &mut root, &mut places, &mut served))
-                    .flatten();
                 // Data that was there and is gone is unknown, not absent.
                 if root["present"] == true
                     && held.contains_key(&v.name)
@@ -1083,7 +1100,7 @@ impl Store {
     fn parts(&self, provider: &str, batch: &str) -> Vec<ingest::Part> {
         self.volumes()
             .iter()
-            .filter(|v| v.writable && volumes::present(v).is_ok())
+            .filter(|v| writes_to(v) && volumes::present(v).is_ok())
             .map(|v| v.path.join(provider))
             .map(|root| ingest::Part {
                 inc: root.join(ingest::INCOMING).join(batch),
@@ -1114,7 +1131,7 @@ impl Store {
         let need = size.unwrap_or(0);
         self.volumes()
             .iter()
-            .filter(|v| v.writable && volumes::present(v).is_ok())
+            .filter(|v| writes_to(v) && volumes::present(v).is_ok())
             .filter_map(|v| {
                 let total = fs4::total_space(&v.path).ok()?;
                 let free = fs4::available_space(&v.path).ok()?.checked_sub(need)?;
@@ -1386,7 +1403,7 @@ async fn upload(
 /// Batches waiting to be incorporated, with their files.
 async fn list_incoming(AxState(store): AxState<Shared>) -> Json<Value> {
     let mut out = Vec::new();
-    for v in store.volumes().iter().filter(|v| v.writable) {
+    for v in store.volumes().iter().filter(|v| writes_to(v)) {
         let Ok(providers) = std::fs::read_dir(&v.path) else {
             continue;
         };
@@ -1458,7 +1475,7 @@ async fn incorporate(
     let read_only: Vec<PathBuf> = store
         .volumes()
         .iter()
-        .filter(|v| !v.writable)
+        .filter(|v| !writes_to(v))
         .map(|v| v.path.join(pdir))
         .collect();
     let targets = target_folders(&parts, &elsewhere, q.parent.as_deref());
@@ -1730,11 +1747,28 @@ async fn batches(AxState(store): AxState<Shared>, UrlPath(provider): UrlPath<Str
             "the store is still scanning",
         );
     };
-    let volumes = store.volumes();
+    // Each volume's folder, and a content-addressed volume's view too (its
+    // names as a tree, decision 0035): listed by the same rules, so a
+    // migrated volume's batches read as the tree's did.
+    let views = store
+        .state_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("cas-views");
+    let cas: Vec<String> = lock(&store.cas).keys().cloned().collect();
+    let targets: Vec<(Volume, PathBuf)> = store
+        .volumes()
+        .into_iter()
+        .flat_map(|v| {
+            let view = cas.contains(&v.name).then(|| views.join(&v.name));
+            let tree = v.path.clone();
+            std::iter::once((v.clone(), tree)).chain(view.map(|p| (v, p)))
+        })
+        .collect();
     let found = tokio::task::spawn_blocking(move || {
         let mut out = serde_json::Map::new();
         let mut unread: Vec<String> = Vec::new();
-        for v in &volumes {
+        for (v, base) in &targets {
             if volumes::present(v).is_err() {
                 unread.push(v.name.clone());
                 continue;
@@ -1761,11 +1795,11 @@ async fn batches(AxState(store): AxState<Shared>, UrlPath(provider): UrlPath<Str
                     }
                 }
             };
-            let root = v.path.join(pdir);
+            let root = base.join(pdir);
             // Raw download folders first, so a filed copy wins.
-            let mut parents = vec![v.path.clone(), root.clone()];
+            let mut parents = vec![base.clone(), root.clone()];
             parents.extend(
-                dirs(&v.path)
+                dirs(base)
                     .iter()
                     .map(std::fs::DirEntry::path)
                     .filter(|p| *p != root),
@@ -1801,35 +1835,12 @@ async fn batches(AxState(store): AxState<Shared>, UrlPath(provider): UrlPath<Str
         (Value::Object(out), unread)
     })
     .await;
-    let Ok((mut found, unread)) = found else {
+    let Ok((found, unread)) = found else {
         return refused(
             StatusCode::INTERNAL_SERVER_ERROR,
             "the batches couldn't be listed",
         );
     };
-    // Batches filed on a content-addressed volume (decision 0035): their
-    // receipts are bound under `<provider>/provenance/<batch>/`, as on a
-    // tree volume. A filed copy wins over one waiting in incoming.
-    let prefix = format!("{pdir}/provenance/");
-    for (vol, (_, index)) in lock(&store.cas).iter() {
-        for name in index.names.keys() {
-            let Some(batch) = name
-                .strip_prefix(&prefix)
-                .and_then(|rest| rest.split_once('/'))
-                .map(|(b, _)| b)
-            else {
-                continue;
-            };
-            if let Some(o) = found.as_object_mut()
-                && o.get(batch).is_none_or(|b| b["how"] != "filed")
-            {
-                o.insert(
-                    batch.to_owned(),
-                    json!({ "volume": vol, "how": "filed", "path": format!("{prefix}{batch}") }),
-                );
-            }
-        }
-    }
     for u in unread {
         if !missing.contains(&u) {
             missing.push(u);
@@ -1881,10 +1892,13 @@ async fn adopt(
             "the folder must be at the top of a volume, or one level down",
         );
     };
-    if !volume.writable {
+    if !writes_to(&volume) {
         return refused(
             StatusCode::FORBIDDEN,
-            format!("{} is read-only", volume.name),
+            format!(
+                "{} is read-only (or content-addressed: written only through its index)",
+                volume.name
+            ),
         );
     }
     if let Some(why) = Scope::of_batch(&provider, &dir).and_then(|s| away_conflict(&store, &s)) {
@@ -2165,58 +2179,204 @@ async fn send_file(
     r
 }
 
-/// A volume's content-addressed index (decision 0035), if it holds one: its
-/// DBN names are served, and its summary is in the catalog. An index that
-/// can't be read is an error of the volume.
+/// Whether the store writes to this volume: it's writable, and not in the
+/// content-addressed format (decision 0035), which nothing writes to but
+/// through its index (0035 step 3): until then, no upload, filing or
+/// adoption lands beside its `cas/`, where its index would never see it.
+fn writes_to(v: &Volume) -> bool {
+    v.writable && !v.path.join(tinytrader_cas::DIR).join("FORMAT").exists()
+}
+
+/// A volume's content-addressed index (decision 0035), if it holds one,
+/// and what it holds as the scan reads a tree volume: its view (its names,
+/// each a link to its object, under `view`) is scanned exactly as a tree is,
+/// so a migrated volume answers `/catalog`, `/coverage` and `/batches` as
+/// the tree it came from did. Its DBN names are served. What can't be read
+/// is an error of the volume, and its last good index is kept (reads by
+/// name fail over with it).
 fn cas_of(
     v: &Volume,
+    view: &Path,
+    limits: Thresholds,
+    before: Option<&CasVolume>,
     root: &mut Value,
     places: &mut Vec<catalog::Place>,
     served: &mut Vec<catalog::Served>,
 ) -> Option<CasVolume> {
+    let fail = |root: &mut Value, e: String| {
+        if let Some(errs) = root["errors"].as_array_mut() {
+            errs.push(json!(e));
+        }
+    };
     if !v.path.join(tinytrader_cas::DIR).join("FORMAT").exists() {
+        // It was content-addressed at the last scan: gone mid-scan (an
+        // unmount), not a tree now.
+        if before.is_some() {
+            fail(
+                root,
+                "its content-addressed index went away during the scan".into(),
+            );
+            return before.cloned();
+        }
         return None;
     }
-    let read = tinytrader_cas::Volume::open(&v.path).and_then(|c| c.index().map(|i| (c, i)));
-    match read {
-        Ok((c, index)) => {
-            served.extend(
-                index
-                    .names
-                    .iter()
-                    .filter(|(n, _)| read::served(n.rsplit('/').next().unwrap_or_default()))
-                    .map(|(n, e)| (n.clone(), e.size)),
-            );
-            root["cas"] = json!({
-                "format": tinytrader_cas::FORMAT, "volume": c.id, "names": index.names.len(),
-                "pending": index.pending.len(), "conflicts": index.conflicts,
-            });
-            // Its days, for the catalog and `/coverage`, as a tree volume's.
-            let (datasets, found, errors) = catalog::cas_places(&v.path, &index, &c);
-            if let Some(d) = root["datasets"].as_array_mut() {
-                d.extend(datasets);
-            } else {
-                root["datasets"] = json!(datasets);
-            }
-            places.extend(found);
-            if let Some(errs) = root["errors"].as_array_mut() {
-                errs.extend(
-                    errors
-                        .into_iter()
-                        .map(|e| json!(format!("its content-addressed index: {e}"))),
-                );
-            }
-            Some((c, Arc::new(index)))
+    let opened = tinytrader_cas::Volume::open(&v.path).and_then(|c| {
+        // Unchanged since the last scan (its log the same length): that index.
+        let len = std::fs::metadata(c.log_path()).map_or(0, |m| m.len());
+        match before {
+            Some((_, i)) if i.log_len == len && len > 0 => Ok((c, i.clone())),
+            _ => c.index().map(|i| (c, Arc::new(i))),
         }
+    });
+    let (c, index) = match opened {
+        Ok(x) => x,
         Err(e) => {
-            if let Some(errs) = root["errors"].as_array_mut() {
-                errs.push(json!(format!(
-                    "its content-addressed index can't be read: {e}"
-                )));
-            }
-            None
+            fail(
+                root,
+                format!("its content-addressed index can't be read: {e}"),
+            );
+            return before.cloned();
+        }
+    };
+    for e in cas_view(&c, &index, view) {
+        fail(root, format!("its content-addressed index: {e}"));
+    }
+    let (vroot, vplaces, _) = catalog::scan_view(&v.name, view, limits);
+    if let (Some(d), Some(vd)) = (
+        root["datasets"].as_array_mut(),
+        vroot["datasets"].as_array(),
+    ) {
+        d.extend(vd.iter().cloned());
+    }
+    for k in ["other", "unrecognised"] {
+        if let (Some(d), Some(vd)) = (root[k].as_array_mut(), vroot[k].as_array()) {
+            d.extend(vd.iter().cloned());
         }
     }
+    let bytes =
+        root["dataset_bytes"].as_u64().unwrap_or(0) + vroot["dataset_bytes"].as_u64().unwrap_or(0);
+    root["dataset_bytes"] = json!(bytes);
+    for e in vroot["errors"].as_array().into_iter().flatten() {
+        fail(
+            root,
+            format!(
+                "its content-addressed index: {}",
+                e.as_str().unwrap_or_default()
+            ),
+        );
+    }
+    places.extend(vplaces);
+    served.extend(
+        index
+            .names
+            .iter()
+            .filter(|(n, e)| e.size > 0 && read::served(n.rsplit('/').next().unwrap_or_default()))
+            .map(|(n, e)| (n.clone(), e.size)),
+    );
+    root["cas"] = json!({
+        "format": tinytrader_cas::FORMAT, "volume": c.id, "names": index.names.len(),
+        "pending": index.pending.len(), "conflicts": index.conflicts,
+    });
+    Some((c, index))
+}
+
+/// Make `view` a content-addressed volume's names, each a link to its object
+/// (rebuilt only when the volume's log has changed), so the store layout's
+/// scan reads it as it reads a tree. A name whose versions conflict (none
+/// bound, each kept pending: `store migrate-cas`) is shown as an older-layout
+/// day folder holding each version, so the day reads as held but unfiled,
+/// never as absent. Returns what couldn't be shown: a missing object, a
+/// manifest left in conflict.
+fn cas_view(c: &tinytrader_cas::Volume, index: &tinytrader_cas::Index, view: &Path) -> Vec<String> {
+    let mut problems = Vec::new();
+    // The manifests of a folder in conflict: its days' conditions and
+    // coverage can't be told (they'd read as complete).
+    for (sha, why) in &index.pending {
+        if let Some(name) = why
+            .strip_prefix("conflict over ")
+            .and_then(|r| r.split(" (from ").next())
+            && !index.names.contains_key(name)
+            && (name.ends_with("/manifest.json") || name.contains("/manifest.d/"))
+        {
+            problems.push(format!(
+                "{name} is in conflict (a version {sha} is kept pending): the days beside it can't be told complete or partial until it's resolved"
+            ));
+        }
+    }
+    let stamp = view.with_extension("of");
+    let want =
+        json!({ "volume": c.id, "log_len": index.log_len, "chain": index.chain }).to_string();
+    if std::fs::read_to_string(&stamp).is_ok_and(|s| s == want) && view.is_dir() {
+        return problems;
+    }
+    let fresh = view.with_extension("new");
+    let _ = std::fs::remove_dir_all(&fresh);
+    let ok_part = |p: &str| !p.is_empty() && p != "." && p != "..";
+    let link = |name: &str, target: &Path| -> Result<(), String> {
+        if name.starts_with('/') || !name.split('/').all(ok_part) {
+            return Err(format!("{name}: not a name the view can hold"));
+        }
+        let at = fresh.join(name);
+        if let Some(parent) = at.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        std::os::unix::fs::symlink(target, &at).map_err(|e| format!("{}: {e}", at.display()))
+    };
+    if let Err(e) = std::fs::create_dir_all(&fresh) {
+        problems.push(format!("{}: {e}", fresh.display()));
+        return problems;
+    }
+    for (name, e) in &index.names {
+        let Some(obj) = c.object(&e.sha256, &e.ext) else {
+            problems.push(format!(
+                "{name}: its object {}.{} isn't there",
+                e.sha256, e.ext
+            ));
+            continue;
+        };
+        if let Err(err) = link(name, &obj) {
+            problems.push(err);
+        }
+    }
+    // Days whose versions conflict: an older-layout day folder of them.
+    for (sha, why) in &index.pending {
+        let Some(name) = why
+            .strip_prefix("conflict over ")
+            .and_then(|r| r.split(" (from ").next())
+        else {
+            continue;
+        };
+        let Some(day_dir) = name.strip_suffix(".dbn.zst") else {
+            continue;
+        };
+        let day = day_dir.rsplit('/').next().unwrap_or_default();
+        if index.names.contains_key(name) || crate::ingest::day_ns(day).is_none() {
+            continue;
+        }
+        let ext = "dbn.zst";
+        match c.object(sha, ext) {
+            Some(obj) => {
+                if let Err(err) = link(
+                    &format!("{day_dir}/conflict-{}.{ext}", &sha[..16.min(sha.len())]),
+                    &obj,
+                ) {
+                    problems.push(err);
+                }
+            }
+            None => problems.push(format!("{name}: its pending version {sha} isn't there")),
+        }
+    }
+    // Swapped in whole, then stamped.
+    let old = view.with_extension("old");
+    let _ = std::fs::remove_dir_all(&old);
+    let _ = std::fs::rename(view, &old);
+    if let Err(e) = std::fs::rename(&fresh, view) {
+        problems.push(format!("{}: {e}", view.display()));
+        return problems;
+    }
+    let _ = std::fs::remove_dir_all(&old);
+    let _ = std::fs::write(&stamp, want);
+    problems
 }
 
 /// Where a name on a content-addressed volume can be read now: its object

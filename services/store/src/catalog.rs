@@ -62,6 +62,31 @@ pub fn scan_volume(
     t: Thresholds,
     ignored: &[PathBuf],
 ) -> (Value, Vec<Place>, Vec<Served>) {
+    scan_tree(name, path, t, ignored, false)
+}
+
+/// A content-addressed volume's view (decision 0035), read exactly as a
+/// volume in the store layout is: the view is its names, each a link to its
+/// object, so what the store says of a migrated volume is what it said of
+/// the tree it came from. Its days' places are marked `cas` (nothing is
+/// written beside them).
+pub fn scan_view(name: &str, view: &Path, t: Thresholds) -> (Value, Vec<Place>, Vec<Served>) {
+    let (root, mut places, served) = scan_tree(name, view, t, &[], true);
+    for p in &mut places {
+        if let Place::Days { cas, .. } = p {
+            *cas = true;
+        }
+    }
+    (root, places, served)
+}
+
+fn scan_tree(
+    name: &str,
+    path: &Path,
+    t: Thresholds,
+    ignored: &[PathBuf],
+    follow: bool,
+) -> (Value, Vec<Place>, Vec<Served>) {
     if !path.is_dir() {
         let root = json!({ "name": name, "path": path, "present": false, "datasets": [], "unrecognised": [], "errors": [], "pending_files": [] });
         return (root, Vec::new(), Vec::new());
@@ -79,6 +104,7 @@ pub fn scan_volume(
     let mut scan = Scan {
         skip: ignored.iter().cloned().collect(),
         root: path.to_path_buf(),
+        follow,
         ..Scan::default()
     };
     let mut unrecognised = Vec::new();
@@ -87,7 +113,7 @@ pub fn scan_volume(
         let found = top(&entry, &mut scan);
         if !found {
             let name = file_name(&entry);
-            let u = usage(&entry);
+            let u = usage_with(&entry, scan.follow);
             other.push(
                 json!({ "name": name, "bytes": u.bytes, "files": u.files, "modified": u.modified }),
             );
@@ -539,6 +565,9 @@ struct Scan {
     claimed: HashSet<PathBuf>,
     /// DBN files still being written, read again on the next scan.
     pending: Vec<String>,
+    /// Links are followed: a content-addressed volume's view (its names,
+    /// each a link to its object), read as a tree is.
+    follow: bool,
     /// The volume, and the top-level entry being read.
     root: PathBuf,
     top: PathBuf,
@@ -683,7 +712,12 @@ fn visit(dir: &Path, depth: usize, provider: Option<&str>, scan: &mut Scan) -> b
 /// and read again on the next scan. An empty file holds nothing. Returns
 /// whether any were found.
 fn loose(path: &Path, provider: Option<&str>, scan: &mut Scan) -> bool {
-    let Some(meta) = scan.lstat(path) else {
+    let meta = if scan.follow {
+        scan.stat(path)
+    } else {
+        scan.lstat(path)
+    };
+    let Some(meta) = meta else {
         return false;
     };
     if scan.claimed.contains(path) {
@@ -1031,7 +1065,7 @@ fn add_days(dir: &Path, k: &Key, schema: &str, scan: &mut Scan) -> bool {
             scan.served.extend(found.iter().cloned());
             (
                 n.clone(),
-                usage(&f).bytes,
+                usage_with(&f, scan.follow).bytes,
                 "day folders",
                 day_folder_files(found, schema),
             )
@@ -1101,144 +1135,6 @@ fn add_days(dir: &Path, k: &Key, schema: &str, scan: &mut Scan) -> bool {
     any
 }
 
-/// What a content-addressed volume holds, from its index, as the scan finds
-/// a volume in the store layout: its datasets for the catalog, and a place
-/// per schema for `/coverage`. A day is a name
-/// `<Provider>/<DATASET>[/<SYMBOL>]/<schema>/<YYYY-MM-DD>.dbn.zst`; its
-/// manifest entry (a partial day's coverage, a day's condition) is read from
-/// the manifest objects bound beside it. Returns the datasets, the places,
-/// and what couldn't be read (an error of the volume).
-pub fn cas_places(
-    root: &Path,
-    index: &tinytrader_cas::Index,
-    vol: &tinytrader_cas::Volume,
-) -> (Vec<Value>, Vec<Place>, Vec<String>) {
-    let mut errors = Vec::new();
-    // Each schema folder's days: (day, size, name).
-    type Folder = (Key, String, String);
-    let mut folders: BTreeMap<Folder, Vec<(String, u64, String)>> = BTreeMap::new();
-    for (name, e) in &index.names {
-        let parts: Vec<&str> = name.split('/').collect();
-        let (pdir, dataset, symbol, schema, file) = match parts.as_slice() {
-            [p, d, s, k, f] => (*p, *d, Some(*s), *k, *f),
-            [p, d, k, f] => (*p, *d, None, *k, *f),
-            _ => continue,
-        };
-        let Some(provider) = provider_name(pdir) else {
-            continue;
-        };
-        let Some(day) = file.strip_suffix(".dbn.zst").filter(|d| is_iso_date(d)) else {
-            continue;
-        };
-        if !is_dataset_name(dataset)
-            || schema.starts_with('.')
-            || symbol.is_some_and(|s| s.starts_with('.'))
-        {
-            continue;
-        }
-        let dir = parts[..parts.len() - 1].join("/");
-        folders
-            .entry((
-                key(Some(&provider), dataset, symbol),
-                schema.to_owned(),
-                dir,
-            ))
-            .or_default()
-            .push((day.to_owned(), e.size, name.clone()));
-    }
-    // A bound object's JSON, by name.
-    let read = |name: &str| -> Result<Option<Value>, String> {
-        let Some(e) = index.names.get(name) else {
-            return Ok(None);
-        };
-        let path = vol
-            .object(&e.sha256, &e.ext)
-            .ok_or_else(|| format!("{name}: its object {} isn't there", e.sha256))?;
-        let text = std::fs::read(&path).map_err(|err| format!("{name}: {err}"))?;
-        serde_json::from_slice(&text)
-            .map(Some)
-            .map_err(|err| format!("{name}: {err}"))
-    };
-    let mut datasets: BTreeMap<Key, Dataset> = BTreeMap::new();
-    let mut places = Vec::new();
-    for ((k, schema, dir), mut days) in folders {
-        days.sort();
-        let manifest = match read(&format!("{dir}/{}", crate::manifest::MANIFEST)) {
-            Ok(m) => m,
-            Err(e) => {
-                errors.push(e.clone());
-                None
-            }
-        };
-        let indexed: BTreeMap<String, Value> = manifest
-            .as_ref()
-            .and_then(|m| m["days"].as_object())
-            .map(|o| o.iter().map(|(d, v)| (d.clone(), v.clone())).collect())
-            .unwrap_or_default();
-        let entry_of = |day: &str, e: &Value| -> Result<Value, String> {
-            if e["sidecar"].is_string()
-                || e.get("partial").is_some_and(|p| p == true) && e.get("coverage").is_none()
-            {
-                let side = format!("{dir}/{}/{day}.json", crate::manifest::SIDECARS);
-                return read(&side)?
-                    .ok_or_else(|| format!("{side}: its partial day's entry isn't bound"));
-            }
-            Ok(e.clone())
-        };
-        let d = datasets.entry(k.clone()).or_default();
-        let source = format!("cas: {dir}");
-        if !d.sources.contains(&source) {
-            d.sources.push(source);
-        }
-        let s = d.schemas.entry(schema.clone()).or_default();
-        note_encoding(s, "dbn.zst");
-        let mut entries = BTreeMap::new();
-        let mut files = BTreeMap::new();
-        for (day, size, name) in &days {
-            s.files += 1;
-            s.bytes += size;
-            *s.days.entry(day.clone()).or_default() += size;
-            files.insert(day.clone(), vec![name.clone()]);
-            if let Some(e) = indexed.get(day) {
-                let full = entry_of(day, e);
-                if let Ok(f) = &full {
-                    match f["condition"]["state"].as_str() {
-                        Some("degraded") if !s.degraded.contains(day) => {
-                            s.degraded.push(day.clone())
-                        }
-                        Some("missing") if !s.missing.contains(day) => s.missing.push(day.clone()),
-                        _ => {}
-                    }
-                    if crate::partial::is_partial(f) && !s.partial.contains(day) {
-                        s.partial.push(day.clone());
-                    }
-                }
-                if let Err(e) = &full {
-                    errors.push(e.clone());
-                }
-                entries.insert(day.clone(), full.map(|f| crate::partial::reported(&f)));
-            }
-        }
-        let (provider, dataset, symbol) = k;
-        places.push(Place::Days {
-            provider,
-            dataset,
-            symbol,
-            schema,
-            dir: root.join(tinytrader_cas::DIR).join(&dir),
-            days: days
-                .iter()
-                .map(|(d, sz, _)| (d.clone(), *sz, true))
-                .collect(),
-            entries: std::sync::Arc::new(Ok(entries)),
-            files,
-            cas: true,
-        });
-    }
-    let datasets = datasets.iter().map(|(k, d)| d.to_json(k)).collect();
-    (datasets, places, errors)
-}
-
 /// The files of a day folder (the older layout) the store serves, its data
 /// first, then sidecars such as the day's definitions; none when it holds no
 /// data (only receipts, an `.archive`, a sidecar, or empty files).
@@ -1266,12 +1162,18 @@ pub struct Usage {
     pub modified: f64,
 }
 
-/// Walk `path` (not following links), adding up its files.
-pub fn usage(path: &Path) -> Usage {
+/// Walk `path`, adding up its files: links not followed, unless `follow`
+/// (a content-addressed volume's view, whose files are links to objects).
+fn usage_with(path: &Path, follow: bool) -> Usage {
     let mut u = Usage::default();
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+        let meta = if follow {
+            std::fs::metadata(&p)
+        } else {
+            std::fs::symlink_metadata(&p)
+        };
+        let Ok(meta) = meta else {
             continue;
         };
         if meta.is_dir() {

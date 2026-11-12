@@ -226,9 +226,10 @@ pub fn apply(
                     else {
                         continue;
                     };
-                    // A content-addressed volume's days take conditions once
-                    // filing goes through its index (0035 step 3); until
-                    // then nothing is written beside them.
+                    // A content-addressed volume's days (read through its
+                    // view) take no conditions until filing goes through
+                    // its index (0035 step 3): nothing is written beside
+                    // them, and they're answered as not held here.
                     if *cas {
                         continue;
                     }
