@@ -48,6 +48,33 @@ fn kind(rel: &str) -> &'static str {
     }
 }
 
+/// The name a source path is bound under: the provider's folder spelled as
+/// the store spells it (`databento/…` and `Databento/…` are one provider's,
+/// so one name, merged as one: review of #160), the rest as it is.
+fn canonical(rel: &str) -> String {
+    match rel.split_once('/') {
+        Some((first, rest)) => match crate::ingest::provider_dir(first) {
+            Some(p) => format!("{p}/{rest}"),
+            None => rel.to_owned(),
+        },
+        None => rel.to_owned(),
+    }
+}
+
+/// Whether `name` is a schema folder's manifest in the store layout
+/// (`<Provider>/<DATASET>[/<SYMBOL>]/<schema>/manifest.json`), not a batch's
+/// own (a provider's download folder, provenance).
+fn store_manifest(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    let (pdir, dataset, last) = match parts.as_slice() {
+        [p, d, _, _, f] | [p, d, _, f] => (*p, *d, *f),
+        _ => return false,
+    };
+    last == crate::manifest::MANIFEST
+        && crate::catalog::provider_name(pdir).is_some()
+        && crate::catalog::is_dataset_name(dataset)
+}
+
 /// The extension an object keeps: the file's, from its first dot (so
 /// `2026-10-02.dbn.zst` keeps `dbn.zst`), or `bin`.
 fn ext_of(rel: &str) -> String {
@@ -172,7 +199,7 @@ pub fn run(
                 crate::recorded::Recorded::Unknown => (None, None),
                 crate::recorded::Recorded::Conflict(why) => (None, Some(why)),
             };
-            names.entry(f.rel.clone()).or_default().push(Copy {
+            names.entry(canonical(&f.rel)).or_default().push(Copy {
                 source: s,
                 found: f,
                 recorded,
@@ -224,7 +251,7 @@ pub fn run(
         // (review of #160: Data and tt03 share folders, each with its own
         // manifest, so differing copies are expected). Each copy is kept
         // as it was, "merged into" the name.
-        if k == "manifest" && name.ends_with(&format!("/{}", crate::manifest::MANIFEST)) {
+        if store_manifest(name) {
             let mut parsed = Vec::new();
             for c in copies {
                 match std::fs::read(&c.found.path)
@@ -760,6 +787,74 @@ mod tests {
             (json!(1), 0),
             "{r}"
         );
+    }
+
+    /// Review of #160: one schema folder on two drives, each with its own
+    /// manifest. Different days merge; the same day with different entries
+    /// is a conflict, counted by --plan, unknown in the merged manifest, and
+    /// the run isn't ok. Each drive's manifest is kept, "merged into" it.
+    #[test]
+    fn a_folder_s_manifests_on_two_drives_merge_by_day() {
+        let d = scratch("manifests");
+        let (a, b, dest) = (d.join("data"), d.join("tt03"), d.join("nas"));
+        let folder = "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m";
+        put(&a, &format!("{folder}/2026-10-01.dbn.zst"), b"one");
+        put(&b, &format!("{folder}/2026-10-01.dbn.zst"), b"one");
+        put(&b, &format!("{folder}/2026-10-02.dbn.zst"), b"two");
+        crate::manifest::set_entry(
+            &a.join(folder),
+            "2026-10-01",
+            Some(json!({ "condition": { "state": "degraded" } })),
+        )
+        .unwrap();
+        crate::manifest::set_entry(
+            &b.join(folder),
+            "2026-10-01",
+            Some(json!({ "condition": { "state": "missing" } })),
+        )
+        .unwrap();
+        crate::manifest::set_entry(
+            &b.join(folder),
+            "2026-10-02",
+            Some(json!({ "condition": { "state": "degraded" } })),
+        )
+        .unwrap();
+        let sources = [
+            source(&format!("data={}", a.display())).unwrap(),
+            source(&format!("tt03={}", b.display())).unwrap(),
+        ];
+        let (p, _) = run(&sources, Some((&dest, "nas-1")), true, &mut |_| {}).unwrap();
+        assert_eq!(p["manifests"]["merged"].as_array().unwrap().len(), 1, "{p}");
+        assert_eq!(
+            p["manifests"]["day_conflicts"],
+            json!([{ "name": format!("{folder}/manifest.json"), "day": "2026-10-01" }])
+        );
+        let (r, ok) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert!(!ok, "a day's entries in conflict: {r}");
+        let v = Volume::open(&dest).unwrap();
+        let i = v.index().unwrap();
+        let e = &i.names[&format!("{folder}/manifest.json")];
+        let m: Value =
+            serde_json::from_slice(&fs::read(v.object(&e.sha256, &e.ext).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(m["days"]["2026-10-01"]["condition"]["state"], "unknown");
+        assert_eq!(m["days"]["2026-10-02"]["condition"]["state"], "degraded");
+        assert_eq!(
+            i.pending
+                .values()
+                .filter(|w| w.starts_with("merged into"))
+                .count(),
+            2,
+            "{:?}",
+            i.pending
+        );
+        assert_eq!(
+            v.receipt("tt03").unwrap().unwrap()["files"][format!("{folder}/manifest.json")]["outcome"],
+            "merged"
+        );
+        // Again: nothing changes.
+        let (again, _) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert_eq!(again["bound"], 0, "{again}");
     }
 
     /// Review C2: a source with no files (a drive not mounted) is refused,

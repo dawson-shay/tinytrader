@@ -3703,6 +3703,129 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Review of #160: two drives share a schema folder, each with its own
+    /// manifest (a degraded day on one, a partial day on the other); one
+    /// names its provider in lower case; there's a batch download folder, a
+    /// filed batch and an upload waiting. Migrated (manifests merged by
+    /// day), the CAS volume alone answers `/batches` (every batch, and how
+    /// it's held) and `/coverage` as the two trees did.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_drives_migrated_answer_as_their_trees_did() {
+        let dir = scratch("cas-two-drives");
+        let (data, tt03) = (dir.join("data"), dir.join("tt03"));
+        let fa = data.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        let fb = tt03.join("databento/OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        for f in [&fa, &fb] {
+            std::fs::create_dir_all(f).unwrap();
+        }
+        std::fs::write(fa.join("2026-10-01.dbn.zst"), b"a degraded day").unwrap();
+        manifest::set_entry(
+            &fa,
+            "2026-10-01",
+            Some(json!({ "condition": { "state": "degraded", "reason": "x" } })),
+        )
+        .unwrap();
+        std::fs::write(fb.join("2026-10-02.dbn.zst"), b"a partial day").unwrap();
+        manifest::set_entry(
+            &fb,
+            "2026-10-02",
+            Some(json!({ "file": "2026-10-02.dbn.zst", "records": 2, "coverage": { "kind": "contracts", "symbols": [crate::partial::tests::C1, crate::partial::tests::C2], "window": [0, 1] } })),
+        )
+        .unwrap();
+        // A batch download folder on Data, a filed batch and an upload on tt03.
+        let dl = data.join("OPRA-DL-1");
+        std::fs::create_dir_all(&dl).unwrap();
+        std::fs::write(dl.join("metadata.json"), json!({ "query": { "dataset": "OPRA.PILLAR", "schema": "tcbbo", "symbols": ["SPY.OPT"], "start": "2026-10-01", "end": "2026-10-02" } }).to_string()).unwrap();
+        std::fs::write(dl.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(dl.join("opra-pillar-20261001.tcbbo.dbn.zst"), b"downloaded").unwrap();
+        let prov = tt03.join("databento/provenance/OPRA-FILED-2");
+        std::fs::create_dir_all(&prov).unwrap();
+        std::fs::write(prov.join("manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(tt03.join("databento/.incoming/OPRA-IN-3")).unwrap();
+        std::fs::write(
+            tt03.join("databento/.incoming/OPRA-IN-3/x.dbn.zst"),
+            b"waiting",
+        )
+        .unwrap();
+
+        let answers = |vols: Vec<(&'static str, PathBuf)>, tag: &'static str| {
+            let dir = dir.clone();
+            async move {
+                let v: Vec<(&str, &Path)> = vols.iter().map(|(n, p)| (*n, p.as_path())).collect();
+                let s = store(&v, &dir.join(format!("state-{tag}.json")));
+                scanned(&s).await;
+                let addr = serve_plain(&s).await;
+                let (_, b) = get(&addr, "/batches/databento").await;
+                let (_, c) =
+                    get(&addr, COVERAGE.replace("2026-10-09", "2026-10-03").as_str()).await;
+                (b, c)
+            }
+        };
+        let (tb, tc) = answers(
+            vec![("data", data.clone()), ("tt03", tt03.clone())],
+            "trees",
+        )
+        .await;
+        let cas = dir.join("cas");
+        for src in [
+            format!("data={}", data.display()),
+            format!("tt03={}", tt03.display()),
+        ] {
+            let (r, ok) = migrate::run(
+                &[migrate::source(&src).unwrap()],
+                Some((&cas, "cas-1")),
+                false,
+                &mut |_| {},
+            )
+            .unwrap();
+            assert!(ok, "{r}");
+        }
+        let (cb, cc) = answers(vec![("cas", cas.clone())], "cas").await;
+        let how = |b: &Value| -> BTreeMap<String, Value> {
+            b["batches"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v["how"].clone()))
+                .collect()
+        };
+        assert_eq!(how(&tb).len(), 3, "{tb}");
+        assert_eq!(how(&cb), how(&tb), "batches\ntrees: {tb}\ncas: {cb}");
+        fn strip(v: &Value) -> Value {
+            match v {
+                Value::Object(o) => Value::Object(
+                    o.iter()
+                        .filter(|(k, _)| {
+                            ![
+                                "volume",
+                                "volumes",
+                                "path",
+                                "paths",
+                                "files",
+                                "file",
+                                "scanned_at",
+                                "sources",
+                                "copies",
+                            ]
+                            .contains(&k.as_str())
+                        })
+                        .map(|(k, v)| (k.clone(), strip(v)))
+                        .collect(),
+                ),
+                Value::Array(a) => Value::Array(a.iter().map(strip).collect()),
+                x => x.clone(),
+            }
+        }
+        assert_eq!(tc["days"].as_array().map(Vec::len), Some(2), "{tc}");
+        assert_eq!(
+            strip(&cc["days"]),
+            strip(&tc["days"]),
+            "coverage\ntrees: {tc}\ncas: {cc}"
+        );
+        assert_eq!(cc["missing_volumes"], json!([]), "{cc}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn files_are_listed_from_the_scan_and_refused_while_away() {
         let dir = scratch("files");

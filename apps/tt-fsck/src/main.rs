@@ -189,17 +189,30 @@ fn check(a: &Args) -> (Value, i32) {
                     continue;
                 }
             };
+            // Bound under its path, or under it with the first folder
+            // spelled otherwise (a provider's folder, which the migration
+            // spells one way: `databento/…` bound as `Databento/…`).
+            let fold = |n: &str| match n.split_once('/') {
+                Some((first, rest)) => format!("{}/{rest}", first.to_ascii_lowercase()),
+                None => n.to_owned(),
+            };
+            let want = fold(&file.rel);
             let bound = indexes.iter().any(|(_, i)| {
                 i.names
                     .get(&file.rel)
                     .is_some_and(|e| e.sha256 == sha && e.size == file.size)
+                    || i.names
+                        .iter()
+                        .any(|(n, e)| e.sha256 == sha && e.size == file.size && fold(n) == want)
             });
             // A manifest kept as it was, merged by day into the folder's
             // manifest (store migrate-cas): held.
             let merged = indexes.iter().any(|(_, i)| {
-                i.pending
-                    .get(&sha)
-                    .is_some_and(|w| w.starts_with(&format!("merged into {} ", file.rel)))
+                i.pending.get(&sha).is_some_and(|w| {
+                    w.strip_prefix("merged into ")
+                        .and_then(|r| r.split(" (from ").next())
+                        .is_some_and(|n| fold(n) == want)
+                })
             });
             if bound || merged {
                 held += 1;
