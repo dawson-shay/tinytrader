@@ -18,7 +18,7 @@
 # this host read, so nothing is declared by hand. Health and metrics stay on
 # loopback unless `observe.bind` says otherwise. To show services from other
 # hosts, add their `tinytrader.topology.exported` lists to `extraServices`.
-{ config, lib, ... }:
+{ config, lib, options, ... }:
 let
   inherit (lib) mkOption types;
   enabled = lib.filterAttrs (_: s: s.enable) config.tinytrader.services;
@@ -182,10 +182,23 @@ in
     };
 
     # Logs can't fill the disk: cap the journal unless the host says otherwise.
-    services.journald.extraConfig = lib.mkDefault ''
-      SystemMaxUse=1G
-      MaxRetentionSec=1month
-    '';
+    # Newer NixOS sets journald.conf through `settings` (`extraConfig` is
+    # gone); older through `extraConfig`. Either way, the same two limits.
+    services.journald =
+      if options.services.journald ? settings then
+        {
+          settings.Journal = {
+            SystemMaxUse = lib.mkDefault "1G";
+            MaxRetentionSec = lib.mkDefault "1month";
+          };
+        }
+      else
+        {
+          extraConfig = lib.mkDefault ''
+            SystemMaxUse=1G
+            MaxRetentionSec=1month
+          '';
+        };
 
     environment.etc."tinytrader/topology.json".text = builtins.toJSON (
       {
