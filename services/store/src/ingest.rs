@@ -801,8 +801,18 @@ fn file_batch(
             (Some(rel), Some(d)) => everywhere
                 .iter()
                 .map(|r| r.join(rel))
-                .filter(|p| p.exists())
+                // Whether a copy is there: an error (a volume dropping out)
+                // refuses the filing, never reads as "not held" (P0, 2026-11-10).
+                .filter_map(|p| match p.try_exists() {
+                    Ok(true) => Some(Ok(p)),
+                    Ok(false) => None,
+                    Err(e) => Some(Err(format!(
+                        "{}: {e}; not filed, since it can't be told whether this day is held there",
+                        p.display()
+                    ))),
+                })
                 .map(|p| {
+                    let p = p?;
                     let entry = crate::manifest::settle(p.parent().ok_or("no folder")?, d)?;
                     hash_file(&p).map(|h| (p, h, entry))
                 })
@@ -1242,6 +1252,29 @@ mod tests {
         let s = incorporate(&parts, &[], "OPRA-S", "2026-10-06").unwrap();
         assert_eq!(s["files"].as_array().unwrap().len(), 2);
         assert_eq!(fs::read(a.join(DAY)).unwrap(), one_day);
+        // What filing recorded is what a read sends (ingress review (E)):
+        // the ledger's move, checked against the provider's receipt.
+        for (vol, file, sha) in [
+            (d.join("a"), a.join(DAY), &sha1),
+            (
+                d.join("b"),
+                b.join("OPRA.PILLAR/SPX.OPT/cmbp-1/2025-10-02.dbn.zst"),
+                &sha2,
+            ),
+        ] {
+            let len = fs::metadata(&file).unwrap().len();
+            let l = crate::recorded::ledgered(&vol, u64::MAX);
+            let got = l.get(file.strip_prefix(&vol).unwrap()).unwrap();
+            assert_eq!(
+                got.receipt.as_deref(),
+                Some(sha.as_str()),
+                "the receipt was found"
+            );
+            assert_eq!(
+                crate::recorded::of(&vol, &file, len, u64::MAX),
+                crate::recorded::Recorded::Known(sha.clone())
+            );
+        }
         assert_eq!(
             fs::read(b.join("OPRA.PILLAR/SPX.OPT/cmbp-1/2025-10-02.dbn.zst")).unwrap(),
             two_day
@@ -1593,6 +1626,34 @@ mod tests {
         assert!(err.contains("different manifest.json"), "{err}");
         assert!(!root.join(DAY).exists());
         let _ = fs::remove_dir_all(root.parent().unwrap());
+    }
+
+    /// Volume `a` holds the day, in a folder the store can't look into (as a
+    /// drive dropping out reads): filing the same day on `b` is refused, never
+    /// placed as a second, different copy (P0, 2026-11-10).
+    #[test]
+    fn a_day_whose_copy_cannot_be_checked_is_not_filed_elsewhere() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let a = scratch("io-a").join("Databento");
+        let b = scratch("io-b").join("Databento");
+        let held = a.join(DAY);
+        fs::create_dir_all(held.parent().unwrap()).unwrap();
+        fs::write(&held, b"held on a").unwrap();
+        let folder = held.parent().unwrap().to_path_buf();
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o644)).unwrap();
+        stage(&b, "OPRA-E", &["SPX.OPT"], b"day one");
+        let r = incorporate(
+            &one(&b, "OPRA-E"),
+            std::slice::from_ref(&a),
+            "OPRA-E",
+            "2026-10-06",
+        );
+        fs::set_permissions(&folder, fs::Permissions::from_mode(0o755)).unwrap();
+        let err = r.unwrap_err();
+        assert!(err.contains("can't be told"), "{err}");
+        assert!(!b.join(DAY).exists(), "not filed on b");
+        let _ = fs::remove_dir_all(a.parent().unwrap());
+        let _ = fs::remove_dir_all(b.parent().unwrap());
     }
 
     #[test]
