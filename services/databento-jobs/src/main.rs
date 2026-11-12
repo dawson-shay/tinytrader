@@ -3143,6 +3143,14 @@ async fn fetch_to_cache(
         set_cache(jobs, job, |t| t.file = f.filename.clone());
         let path = dir.join(&f.filename);
         let want = f.hash.trim_start_matches("sha256:").to_ascii_lowercase();
+        // Nothing is cached that can't be checked (ingress review (F)): a file
+        // Databento lists without a SHA-256, or with one that isn't one.
+        if want.len() != 64 || !want.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(Permanent(format!(
+                "{}: Databento lists no usable SHA-256 for it ({:?}); not cached unchecked",
+                f.filename, f.hash
+            )));
+        }
         let whole = std::fs::metadata(&path).is_ok_and(|m| m.len() == f.size)
             && sha256_file(&path).is_ok_and(|h| h == want);
         if !whole {
@@ -3192,12 +3200,11 @@ async fn fetch_to_cache(
             "files": files.iter().map(|f| json!({ "filename": f.filename, "size": f.size, "hash": f.hash })).collect::<Vec<_>>(),
         });
         let path = dir.join("manifest.json");
-        std::fs::write(
+        write_whole(
             &path,
-            serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
+            &serde_json::to_vec_pretty(&manifest).unwrap_or_default(),
         )
         .map_err(|e| Permanent(format!("{}: {e}", path.display())))?;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644));
     }
     let done = json!({
         "job_id": job,
@@ -3205,13 +3212,32 @@ async fn fetch_to_cache(
         "bytes": total,
         "finished_at": tinytrader_observe::unix_seconds(),
     });
-    std::fs::write(
+    write_whole(
         &complete,
-        serde_json::to_vec_pretty(&done).unwrap_or_default(),
+        &serde_json::to_vec_pretty(&done).unwrap_or_default(),
     )
     .map_err(|e| Permanent(format!("{}: {e}", complete.display())))?;
-    let _ = std::fs::set_permissions(&complete, std::fs::Permissions::from_mode(0o644));
     Ok(fetched)
+}
+
+/// Write `path` whole: beside it, flushed, readable by everyone, renamed
+/// over it, and its folder flushed, so a crash leaves the old file or the
+/// new one, never part of one.
+fn write_whole(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let name = path
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let tmp = dir.join(format!(".{name}.new"));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(bytes)?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o644))?;
+    std::fs::rename(&tmp, path)?;
+    std::fs::File::open(dir)?.sync_all()
 }
 
 /// One file into `path`: written to `<path>.part`, checked for its size
@@ -3278,7 +3304,7 @@ async fn copy_to_file(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    if got != size || (!sha256.is_empty() && hash != sha256) {
+    if got != size || hash != sha256 {
         let _ = std::fs::remove_file(&part);
         let m =
             format!("got {got} bytes with SHA-256 {hash}; Databento lists {size} bytes, {sha256}");
@@ -3290,7 +3316,13 @@ async fn copy_to_file(
         });
     }
     let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o644));
-    std::fs::rename(&part, path).map_err(|e| Permanent(format!("{}: {e}", path.display())))
+    std::fs::rename(&part, path).map_err(|e| Permanent(format!("{}: {e}", path.display())))?;
+    // The rename is kept only once its folder is flushed.
+    path.parent()
+        .map_or(Ok(()), |d| {
+            std::fs::File::open(d).and_then(|d| d.sync_all())
+        })
+        .map_err(|e| Permanent(format!("{}: {e}", path.display())))
 }
 
 /// The SHA-256 of a file, as lowercase hex.
