@@ -1,0 +1,15 @@
+[package]
+name = "tinytrader-cas"
+description = "The content-addressed volume format (decisions 0035, 0039): immutable objects named by their SHA-256, an append-only bindings log, and the index rebuilt from it"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2 = "0.10"
