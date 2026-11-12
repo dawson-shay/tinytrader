@@ -26,7 +26,7 @@ It declares each endpoint in `/describe`'s `streams` (`chain`, `bars`, ...), and
 
 ## Units
 
-Bar times (`t`), `at`, `as_of` and `end` are integer Unix **seconds** (a bar's `t` is its start); dates are `YYYY-MM-DD` (New York). Prices are dollars; `change_pct`, `iv`, `implied_move` and the like are fractions. Bars are `[t, o, h, l, c, v]` arrays.
+Bar times (`t`), `at`, `as_of` and `end` are integer Unix **seconds** (a bar's `t` is its start); dates are `YYYY-MM-DD` (New York). Prices are dollars; `change_pct`, `iv`, `implied_move` and the like are fractions. Bars are `[t, o, h, l, c, v]` arrays; `/bars` appends Alpaca's VWAP and trade count, `[t, o, h, l, c, v, vw, n]` (null where Alpaca gives none).
 
 ## Endpoints
 
