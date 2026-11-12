@@ -425,6 +425,11 @@ fn router(store: Shared, token: WriteToken) -> Router {
         .with_state(store)
 }
 
+/// A test's way to make a store's scans panic: by its state file, so other
+/// tests' stores scan as usual meanwhile.
+#[cfg(test)]
+static SCAN_PANICS: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// Rescan every volume into the catalog.
 async fn scan(store: &Shared, observer: &Observer) {
     // Approved drives join as they are found; one that goes missing stays
@@ -481,6 +486,10 @@ async fn scan(store: &Shared, observer: &Observer) {
     };
     let s = store.clone();
     let found = tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        if lock(&SCAN_PANICS).as_ref() == Some(&s.state_path) {
+            panic!("a scan that panics (test)");
+        }
         volumes
             .iter()
             .map(|v| {
@@ -548,8 +557,20 @@ async fn scan(store: &Shared, observer: &Observer) {
             })
             .collect::<Vec<_>>()
     })
-    .await
-    .unwrap_or_default();
+    .await;
+    // A scan that panicked found nothing, rather than that nothing is
+    // there: the last scan's answer stands (ingress review P0 7), and the
+    // next scan tries again.
+    let found = match found {
+        Ok(f) => f,
+        Err(e) => {
+            let why = format!("the scan failed ({e}); the last scan's answer stands");
+            eprintln!("store: {why}");
+            store.events.push("the scan failed".into(), why.clone());
+            observer.set_state(State::Degraded, &why);
+            return;
+        }
+    };
     let mut index = Index {
         scanned_at: unix_seconds(),
         ..Index::default()
@@ -1658,18 +1679,51 @@ async fn batches(AxState(store): AxState<Shared>, UrlPath(provider): UrlPath<Str
             format!("unknown provider {provider}"),
         );
     };
+    // What can't be seen can't be said not to hold a batch (ingress review
+    // P0 5): the volumes the last scan found missing, and any whose folders
+    // this listing couldn't read, are listed with the answer.
+    let Some(mut missing) = lock(&store.catalog)["missing_volumes"].as_array().map(|m| {
+        m.iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    }) else {
+        return refused(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "the store is still scanning",
+        );
+    };
     let volumes = store.volumes();
     let found = tokio::task::spawn_blocking(move || {
         let mut out = serde_json::Map::new();
-        let dirs = |p: &std::path::Path| -> Vec<std::fs::DirEntry> {
-            std::fs::read_dir(p)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter(|e| e.path().is_dir())
-                .collect()
-        };
+        let mut unread: Vec<String> = Vec::new();
         for v in &volumes {
+            if volumes::present(v).is_err() {
+                unread.push(v.name.clone());
+                continue;
+            }
+            // A folder that's there but can't be read leaves the volume
+            // unread; one that isn't there holds nothing.
+            let mut failed = false;
+            let mut dirs = |p: &std::path::Path| -> Vec<std::fs::DirEntry> {
+                match std::fs::read_dir(p) {
+                    Ok(rd) => rd
+                        .filter_map(|e| match e {
+                            Ok(e) => Some(e),
+                            Err(_) => {
+                                failed = true;
+                                None
+                            }
+                        })
+                        .filter(|e| e.path().is_dir())
+                        .collect(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+                    Err(_) => {
+                        failed = true;
+                        Vec::new()
+                    }
+                }
+            };
             let root = v.path.join(pdir);
             // Raw download folders first, so a filed copy wins.
             let mut parents = vec![v.path.clone(), root.clone()];
@@ -1703,14 +1757,27 @@ async fn batches(AxState(store): AxState<Shared>, UrlPath(provider): UrlPath<Str
                     );
                 }
             }
+            if failed {
+                unread.push(v.name.clone());
+            }
         }
-        Value::Object(out)
+        (Value::Object(out), unread)
     })
-    .await
-    .unwrap_or_default();
+    .await;
+    let Ok((found, unread)) = found else {
+        return refused(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the batches couldn't be listed",
+        );
+    };
+    for u in unread {
+        if !missing.contains(&u) {
+            missing.push(u);
+        }
+    }
     reply(
         StatusCode::OK,
-        json!({ "provider": pdir, "batches": found }),
+        json!({ "provider": pdir, "batches": found, "missing_volumes": missing }),
     )
 }
 
@@ -2881,6 +2948,81 @@ mod tests {
         // The provider must be given.
         let (code, _) = get(&addr, &COVERAGE.replace("provider=databento&", "")).await;
         assert_eq!(code, 400);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `/batches` never reads as "not held" what it couldn't see: before the
+    /// first scan it's 503, and a volume missing or with a folder it
+    /// couldn't read is listed in `missing_volumes` (ingress review P0 5).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn batches_say_which_volumes_they_couldnt_see() {
+        let dir = scratch("batches-missing");
+        let (a, b) = (dir.join("a"), dir.join("b"));
+        std::fs::create_dir_all(a.join("Databento/provenance/OPRA-A")).unwrap();
+        std::fs::create_dir_all(b.join("Databento/provenance/OPRA-B")).unwrap();
+        let s = store(&[("a", &a), ("b", &b)], &dir.join("state.json"));
+        let addr = serve_plain(&s).await;
+        let (code, _) = get(&addr, "/batches/databento").await;
+        assert_eq!(code, 503, "before the first scan");
+        scanned(&s).await;
+        let (code, v) = get(&addr, "/batches/databento").await;
+        assert_eq!((code, v["missing_volumes"].clone()), (200, json!([])));
+        assert_eq!(v["batches"]["OPRA-B"]["how"], "filed");
+        // b's provenance can't be read: b is missing from the answer.
+        let prov = b.join("Databento/provenance");
+        std::fs::set_permissions(&prov, std::os::unix::fs::PermissionsExt::from_mode(0o000))
+            .unwrap();
+        let (code, v) = get(&addr, "/batches/databento").await;
+        std::fs::set_permissions(&prov, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        assert_eq!(
+            (code, v["missing_volumes"].clone()),
+            (200, json!(["b"])),
+            "{v}"
+        );
+        assert_eq!(v["batches"]["OPRA-A"]["how"], "filed");
+        // a goes away.
+        std::fs::rename(&a, dir.join("a-away")).unwrap();
+        let (code, v) = get(&addr, "/batches/databento").await;
+        assert_eq!(
+            (code, v["missing_volumes"].clone()),
+            (200, json!(["a"])),
+            "{v}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A scan that panics leaves the last scan's answer in place, rather
+    /// than an empty catalog that reports nothing missing (ingress review
+    /// P0 7); the next scan tries again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_scan_that_panics_keeps_the_last_answer() {
+        let dir = scratch("scan-panics");
+        let v = dir.join("v");
+        let day = v.join("Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m");
+        std::fs::create_dir_all(&day).unwrap();
+        std::fs::write(day.join("2022-09-07.dbn.zst"), b"x").unwrap();
+        let s = store(&[("v", &v)], &dir.join("state.json"));
+        scanned(&s).await;
+        let (before, files) = (lock(&s.catalog).clone(), lock(&s.index).files.clone());
+        assert!(!files.is_empty() && !files[0].1.is_empty());
+        *lock(&SCAN_PANICS) = Some(s.state_path.clone());
+        scanned(&s).await;
+        *lock(&SCAN_PANICS) = None;
+        assert_eq!(*lock(&s.catalog), before, "the catalog stands");
+        assert_eq!(lock(&s.index).files, files, "and the index");
+        assert!(
+            s.events
+                .since(0, 100)
+                .to_string()
+                .contains("the scan failed")
+        );
+        scanned(&s).await;
+        assert_ne!(
+            lock(&s.catalog)["generated_at"],
+            before["generated_at"],
+            "the next scan answers"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
