@@ -27,6 +27,7 @@
           ../libs/tinytrader
           ../libs/alpaca
           ../libs/openapi
+          ../libs/cas
           ../docs/api/openapi # the committed documents the tests compare with
           ../apps/tui
           ../apps/tt
