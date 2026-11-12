@@ -218,6 +218,45 @@ expect 1 "$W/fsck-snap.json" "$FSCK_BIN" --json --min-copies 1 "$W/nas/snap"
 has "$W/fsck-snap.json" '[.findings[] | select(.finding | startswith("snapshot"))] | length == 1' "the edited snapshot"
 rm -rf "$W/nas/snap"
 
+# A store over these volumes on a free port, until stop_store.
+start_store() {
+  PORT=$((20000 + RANDOM % 20000))
+  local args=()
+  for v in "$@"; do args+=(--volume "$v"); done
+  STORE_LISTEN=127.0.0.1:$PORT "$STORE_BIN" "${args[@]}" \
+    --state "$W/store-state-$PORT.json" --rescan-seconds 1 >>"$LOG" 2>&1 &
+  STORE_PID=$!
+  URL=http://127.0.0.1:$PORT
+  for _ in $(seq 100); do
+    curl -sf "$URL/batches/databento" >/dev/null 2>&1 && break
+    sleep 0.2
+  done
+}
+stop_store() { kill "$STORE_PID" 2>/dev/null; wait "$STORE_PID" 2>/dev/null || true; STORE_PID=; }
+COV="/coverage?provider=databento&dataset=OPRA.PILLAR&symbol=SPY.OPT&schema=cbbo-1m&start=2022-09-07&end=2022-09-08"
+# Days as /coverage gives them, without where they are.
+days_of() { jq -S '[.days[] | del(.volume, .volumes, .path, .paths, .files, .file, .copies)]' "$1"; }
+filed_of() { jq -S '[.batches | to_entries[] | select(.value.how == "filed") | .key] | sort' "$1"; }
+
+step "the source's answers: a store over Data's tree (read-only)"
+start_store "data=$D:ro:anydir"
+curl -s "$URL/batches/databento" >"$W/batches-before.json"
+curl -s "$URL$COV" >"$W/coverage-before.json"
+stop_store
+has "$W/batches-before.json" '.missing_volumes == [] and (.batches | to_entries | map(select(.value.how == "filed")) | length) == 1' "Data's filed batch"
+has "$W/coverage-before.json" '(.days | length) == 2' "Data's two SPY days"
+
+step "the migrated volume answers the same: /batches lists Data's batches filed, /coverage the same days"
+start_store "tt04=$NAS:ro:anydir"
+curl -s "$URL/batches/databento" >"$W/batches-after.json"
+curl -s "$URL$COV" >"$W/coverage-after.json"
+stop_store
+has "$W/batches-after.json" '.missing_volumes == []' "no volume missing after"
+[ "$(filed_of "$W/batches-before.json" | jq -c .)" = "$(filed_of "$W/batches-after.json" | jq -c '[.[] | select(. == "OPRA-20220908-X")]')" ] \
+  || fail "the migrated volume doesn't list Data's filed batches as filed"
+[ "$(days_of "$W/coverage-before.json" | jq -c .)" = "$(days_of "$W/coverage-after.json" | jq -c .)" ] \
+  || fail "the migrated volume's /coverage days differ from the tree's"
+
 step "a second copy: Data migrated to another volume; both checked together, two copies"
 expect 0 "$W/migrate-second.json" "$STORE_BIN" migrate-cas --to "$NAS2" --id second --from data="$D"
 expect 1 "$W/fsck-two.json" "$FSCK_BIN" --json --min-copies 2 "$NAS" "$NAS2"
