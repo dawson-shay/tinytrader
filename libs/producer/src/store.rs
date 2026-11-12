@@ -185,6 +185,98 @@ impl Holdings for StoreApi {
             return Err(format!("{}: not a store file name", file.name));
         }
         let r = self.get(&format!("/files/{}", escape(&file.name, true)))?;
-        Ok(Box::new(r.into_reader()))
+        // The hash the store recorded for it (ingress review (E)): checked as
+        // it's read, and against what `/coverage` stated, if both are given.
+        let recorded = r
+            .header("x-content-sha256")
+            .map(|h| h.trim().to_ascii_lowercase());
+        if let (Some(got), Some(want)) = (&recorded, &file.sha256)
+            && !got.eq_ignore_ascii_case(want)
+        {
+            return Err(format!(
+                "{}: the store sends SHA-256 {got}, but {want} is stated",
+                file.name
+            ));
+        }
+        let reader = r.into_reader();
+        Ok(match recorded {
+            Some(want) => Box::new(Checked::new(reader, want, file.name.clone())),
+            None => Box::new(reader),
+        })
+    }
+}
+
+/// A download checked against the hash the store recorded for it: reading
+/// past its end fails, without yielding the end, if what was read differs.
+struct Checked<R> {
+    inner: R,
+    hash: sha2::Sha256,
+    want: String,
+    name: String,
+    done: bool,
+}
+
+impl<R> Checked<R> {
+    fn new(inner: R, want: String, name: String) -> Self {
+        use sha2::Digest as _;
+        Self {
+            inner,
+            hash: sha2::Sha256::new(),
+            want,
+            name,
+            done: false,
+        }
+    }
+}
+
+impl<R: Read> Read for Checked<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use sha2::Digest as _;
+        if self.done {
+            return Ok(0);
+        }
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hash.update(&buf[..n]);
+            return Ok(n);
+        }
+        let got: String = std::mem::take(&mut self.hash)
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        if got != self.want {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "{}: read SHA-256 {got}, but the store recorded {}",
+                    self.name, self.want
+                ),
+            ));
+        }
+        self.done = true;
+        Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod checked_tests {
+    use super::Checked;
+    use std::io::Read as _;
+
+    #[test]
+    fn a_download_is_checked_against_the_recorded_hash() {
+        // sha256("abc").
+        let abc = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        let mut out = String::new();
+        Checked::new(&b"abc"[..], abc.into(), "f".into())
+            .read_to_string(&mut out)
+            .unwrap();
+        assert_eq!(out, "abc");
+        let e = Checked::new(&b"abd"[..], abc.into(), "f".into())
+            .read_to_string(&mut String::new())
+            .unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("the store recorded"), "{e}");
     }
 }

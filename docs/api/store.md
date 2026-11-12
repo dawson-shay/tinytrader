@@ -20,19 +20,35 @@ Shared conventions are in the [API overview](README.md).
 | `GET /files` | read | DBN files the last scan found, by logical name (below). |
 | `GET /files/{volume}/{path}` | read | One DBN file, as it is on the volume. |
 | `GET /incoming` | read | Batches uploaded and waiting to be filed. |
-| `GET /batches/{provider}` | read | Which batches the volumes hold, and how. |
+| `GET /batches/{provider}` | read | Which batches the volumes hold, and how, with `missing_volumes`: those it couldn't read (a client must not take a batch as not held while it's non-empty). `503` before the first scan. |
 | `PUT /incoming/{provider}/{batch}/{file}?size=&sha256=` | write | Upload one file of a batch, verified on arrival. |
 | `POST /incorporate/{provider}/{batch}?parent=` | write | File a complete batch into the standard layout; a parent's whole chain supersedes partial days of it ([below](#a-complete-day-supersedes-a-partial-day)). With `parent` (such as `SPY.OPT`), a batch bought as a list of that parent's contracts is filed as partial days, as an import. Besides DBN's own schemas, it files tinytrader's extension schemas `conditions` and `quote-conditions` ([datasets](../datasets.md)), whose files' headers name no schema. |
 | `POST /import/{provider}/{id}` | write | File DBN that didn't come from a provider batch, uploaded with an `import.json` ([below](#partial-days)). |
 | `POST /adopt/{provider}` | write | File a download folder already on a volume, where it is. |
 | `POST /volumes/approve` | write | Approve a drive found in the mount directory. |
 | `POST /volumes/{name}/retire` | write | Forget a remembered volume that is away for good ([below](#remembered-volumes)). |
+| `POST /volumes/{name}/held` | write | Correct what a volume is remembered to hold: from a listing while it's away, or by accepting a mounted volume's scan ([below](#post-volumesnameheld)). |
 | `POST /conditions/{provider}` | write | Record days' conditions from the provider's API ([below](#day-conditions)). |
 | `POST /conditions/backfill` | write | Record the conditions in the `condition.json` receipts already kept. |
 | `POST /volumes/{name}/ignore`, `DELETE` | write | Skip, or stop skipping, a path on a volume that can't be read ([below](#post-volumesnameignore)). |
 | `POST /volumes/{name}/accept-empty` | write | Accept that a mounted volume which held datasets is now empty ([below](#post-volumesnameaccept-empty)). |
 
 Writes are refused from a web page of another origin.
+
+**No day is filed beside a copy the store can't see** (P0, 2026-11-10):
+
+- **Before its first scan, or while any volume is erroring** (present but
+  not read in full, as when a drive is dropping out), every upload, filing,
+  import and adoption is answered `503` and nothing is done. Retry later.
+- **While a volume is away** (not mounted), a filing, import or adoption
+  whose days fall within what that volume is remembered to hold is answered
+  `503`. That's the same dataset, symbol and schema, between the first and
+  last day remembered. Everything else is filed as usual, and a volume away
+  that held nothing blocks nothing. Bring the volume back, or
+  [retire](#post-volumesnameretire) it if it's gone for good.
+- **During a filing,** a check whether a day is already held that fails
+  (an I/O error rather than "not there") refuses the filing, never reads as
+  "not held".
 
 ## Write token
 
@@ -200,6 +216,33 @@ mount points (on another device than the folder they sit in), and nothing is
 written to one that isn't. Add `:anydir` to a `STORE_VOLUMES` entry
 (`NAME=PATH:anydir`, with or before `:ro`) to take a plain folder.
 
+#### `POST /volumes/{name}/held`
+
+What a volume away is remembered to hold decides which filings wait for it
+(above). When that memory is wrong, an operator corrects it.
+
+- **From a listing, while the volume is away:**
+  `{"by": "...", "listing": [{"path": "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2023-05-01.dbn.zst", "size": 1169420, "sha256": "..."}]}`.
+  - Paths are within the volume, in the store layout. Any other path (the
+    store's own folders, other layouts) is counted in `unparsed`, with a
+    sample of up to 20, and adds nothing.
+  - What it holds is only ever widened. It's checked against at once, before
+    the next scan.
+  - A mounted volume is `409`: its scan says what it holds.
+- **Accepting a scan, for a mounted volume read in full:**
+  `{"by": "...", "accept_scan": true}`. What it holds becomes what the last
+  scan found, including what was kept as suspect (below). Otherwise it's
+  `409`.
+- **Recorded:** each correction is kept in the state file (`held_listings`,
+  with who, when, the listing's sha256 and what it added), and is an event.
+
+**What a volume stops holding is kept, suspect.** A volume read in full
+whose scan finds less of a schema than before (it's gone, or its first..last
+narrowed) keeps the earlier extent, marked `"suspect": true` with
+`suspect_since`, and an event says so once. Days don't leave a volume on
+their own, so a shrink is treated as a scan's mistake until an operator
+accepts the scan.
+
 #### `POST /volumes/{name}/retire`
 
 For a volume that is away for good. It is forgotten, so it no longer counts
@@ -355,6 +398,26 @@ there but can't be read now, `503`, so a client can ask again:
 - `volume newdrive is being scanned; ask again shortly`: the file wasn't
   found, and the volume hasn't been scanned yet (the store just started, or
   the drive just appeared).
+
+**Its hash, as filed:** `X-Content-SHA256: <hex>` and
+`Digest: sha-256=<base64>` give the SHA-256 the store recorded when it filed
+the file, so a reader checks what it got. The store never hashes on a read.
+The hash comes from every source that recorded it:
+
+- the day's manifest entry (partial days, and complete days that superseded
+  them; there, the size must match the file too);
+- the filing ledgers' `moved` and `swapped` steps
+  (`<provider>/migrations/*.events.jsonl`), which cover every day filed from
+  a batch;
+- the batch's receipt (the provider's own manifest, kept in
+  `<provider>/provenance/<batch>/`), for a day the ledger says came from a
+  batch file.
+
+If the sources disagree, the file is sent **without** a hash, and an event
+(`…: its recorded hashes disagree`) says once which sources said what. A
+file nothing recorded is sent without one too. Every file migrated into the
+content-addressed store (0035) will have one. `tinytrader-producer` checks it
+as it reads, and fails the read on a mismatch.
 
 Each file sent is logged on the store's standard error with its size and
 how long it took: `store: sent newdrive/…/2026-09-01.dbn.zst: 1234 bytes in
