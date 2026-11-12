@@ -710,8 +710,8 @@ fn file_batch(
     // (interrupted: an I/O error, a crash) is replaced, set aside and on
     // record, rather than refusing every later filing over its receipts.
     // Read before this filing's own ledger is opened.
-    let replace_provenance = interrupted_earlier(&roots, batch)?
-        && roots.iter().any(|r| prov(r).exists());
+    let replace_provenance =
+        interrupted_earlier(&roots, batch)? && roots.iter().any(|r| prov(r).exists());
     let mut ledger = Ledger::open(
         &roots
             .iter()
@@ -938,8 +938,7 @@ fn file_batch(
             let aside = root
                 .join("provenance")
                 .join(format!("{batch}.interrupted-{at}"));
-            fs::rename(prov(root), &aside)
-                .map_err(|e| format!("{}: {e}", prov(root).display()))?;
+            fs::rename(prov(root), &aside).map_err(|e| format!("{}: {e}", prov(root).display()))?;
             ledger.record(json!({ "step": "provenance-set-aside", "from": prov(root), "to": aside,
                                   "why": "an earlier filing of this batch began and never completed" }))?;
         }
@@ -1569,7 +1568,10 @@ mod tests {
             .filter(|p| p.to_string_lossy().contains("OPRA-I.interrupted-"))
             .collect();
         assert_eq!(aside.len(), 1, "set aside, not deleted");
-        assert_eq!(fs::read_to_string(aside[0].join("manifest.json")).unwrap(), "{}");
+        assert_eq!(
+            fs::read_to_string(aside[0].join("manifest.json")).unwrap(),
+            "{}"
+        );
         let ledger =
             fs::read_to_string(root.join("migrations/2026-10-06-incorporate-OPRA-I.events.jsonl"))
                 .unwrap();

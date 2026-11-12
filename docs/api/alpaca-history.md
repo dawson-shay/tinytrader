@@ -50,6 +50,10 @@
 
 `through` is cut to the last day that has ended. `held` symbol-days have every batch in the store; `partly_held` have their records but not every sidecar (a SIP day filed before quote conditions), and are fetched again to file the rest: each is a full refetch of both lanes, counted in `to_fetch` and `requests` and called out in `partly_held_requests`. The estimate is the mean pages and bytes of the days this service has committed for the feed (the run's symbols if it has any, else any), or assumed (200 pages, 50 MB) with none.
 
+## Which days
+
+A day is a **UTC day**, `00:00:00Z` to `23:59:59.999999999Z`, as Databento's files are, and each of the market's sessions is one. A session's extended hours run until four hours after its close, so under Eastern Standard Time a full day's 19:00–20:00 New York is 00:00–01:00 UTC on the next date. When that date is a session, it's fetched anyway. When it isn't (after every winter Friday, and before a winter holiday), **it's fetched too, as a day of its own** holding that hour, or the hour would never be. This doesn't happen in summer (20:00 EDT is midnight UTC), or after an early close (whose extended hours end at 17:00). Before 2026-11-11 these hours weren't fetched; a run over those dates now fetches them, as days the store doesn't hold.
+
 ## How a day is fetched
 
 - **Pages are spooled as they arrive** (`HISTORY_STATE/spool/lanes/`): each page's body, its receipt and the lane's next page token, synced before the next page is asked for. A restart, a rate limit, an outage or live capture beginning resumes the lane at its next page; nothing fetched is asked for again. A day's pages are removed once its batches are written and checked.
