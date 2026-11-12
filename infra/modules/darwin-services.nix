@@ -9,19 +9,25 @@
 # newsyslog rotates those logs past 10 MB, keeping 7. Its `launchd` option
 # says how it starts:
 #
-#   "agent" (the default)  a launchd agent (launchd.user.agents, in
-#                          ~/Library/LaunchAgents): started when the user
-#                          logs in, in the gui/<uid> domain
-#   "daemon"               a launchd daemon (launchd.daemons, in
-#                          /Library/LaunchDaemons) with UserName set to the
-#                          primary user: started at boot without anyone
-#                          logging in, in the system domain. With FileVault
-#                          on, boot still waits for the disk to be unlocked
-#                          at the login window (no full login needed after).
+#   "daemon" (the default)  a launchd daemon (launchd.daemons, in
+#                           /Library/LaunchDaemons) with UserName set to the
+#                           primary user: started at boot without anyone
+#                           logging in, in the system domain. With FileVault
+#                           on, boot still waits for the disk to be unlocked
+#                           at the login window (no full login needed after).
+#   "agent"                 a launchd agent (launchd.user.agents, in
+#                           ~/Library/LaunchAgents): started only when the
+#                           user logs in, in the gui/<uid> domain. After a
+#                           reboot it stays down until someone logs in, so
+#                           it warns: no service that must come back by
+#                           itself should be one (checks.darwin-services
+#                           keeps the default a daemon).
 #
 # A daemon runs as the user but outside their login session: it gets HOME
-# and USER (set here), not the user's keychain or GUI. Switching a service
-# from agent to daemon, activation boots out the still-running agent first
+# and USER (set here), not the user's login keychain or GUI, and macOS's
+# privacy prompts (removable or network volumes, Full Disk Access) can't be
+# answered for it: a grant it needs is made in System Settings. Switching a
+# service from agent to daemon, activation boots out the still-running agent first
 # (nix-darwin removes the agent's plist but can't unload it from the user's
 # session), so the two never run at once.
 #
@@ -99,6 +105,11 @@ in
         assertion = lib.count (l: l == label name) (labelsOf config.launchd.daemons) == 0;
         message = "tinytrader.services.${name} runs as a launchd agent, but a launchd daemon (launchd.daemons) is also labelled ${label name}; set its launchd = \"daemon\" instead.";
       }) agents;
+
+    warnings = lib.mapAttrsToList (
+      name: _:
+      "tinytrader.services.${name} runs as a launchd agent: after a reboot it stays down until the user logs in. Drop its launchd = \"agent\" to run it as a daemon."
+    ) agents;
 
     # Before the launchd services are loaded: launchd opens the log files but
     # doesn't create their directory (and a daemon's would be root's), and a

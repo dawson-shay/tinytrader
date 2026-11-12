@@ -7,7 +7,8 @@
 #     observe.port = 9105;
 #   };
 #
-# Each service gets its own transient user, a private state directory
+# Each service gets its own transient user (or the static system user named
+# by its `user`, for files that outlive the unit), a private state directory
 # (/var/lib/tinytrader/<name>), write access to nothing else unless granted
 # through `writablePaths`, restart on failure (giving up after repeated fast
 # failures), and resource limits with sensible defaults (`resources`). The
@@ -23,6 +24,7 @@ let
   inherit (lib) mkOption types;
   enabled = lib.filterAttrs (_: s: s.enable) config.tinytrader.services;
   observed = lib.filterAttrs (_: s: s.observe.port != null) enabled;
+  withUser = lib.filterAttrs (_: s: s.user != null) enabled;
   host = config.networking.hostName;
   # "512M", "1G" or a byte count, as bytes.
   memoryBytes =
@@ -143,7 +145,10 @@ in
           CPUQuota = lib.mkIf (svc.resources.cpu != null) svc.resources.cpu;
           TasksMax = svc.resources.tasks;
           LimitNOFILE = svc.resources.openFiles;
-          DynamicUser = true;
+          # A transient user, unless the service names a static one.
+          DynamicUser = svc.user == null;
+          User = lib.mkIf (svc.user != null) svc.user;
+          Group = lib.mkIf (svc.user != null) svc.user;
           StateDirectory = "tinytrader/${name}";
           WorkingDirectory = "/var/lib/tinytrader/${name}";
           ReadWritePaths = svc.writablePaths;
@@ -174,6 +179,18 @@ in
         };
       }
     ) enabled;
+
+    # The static users services name (`user`): system users, each with a
+    # group of its own name. A machine may add to them (a description, say).
+    users.users = lib.mapAttrs' (
+      name: svc:
+      lib.nameValuePair svc.user {
+        isSystemUser = true;
+        group = lib.mkDefault svc.user;
+        description = lib.mkDefault "tinytrader ${name}";
+      }
+    ) withUser;
+    users.groups = lib.mapAttrs' (_: svc: lib.nameValuePair svc.user { }) withUser;
 
     services.prometheus.exporters.node = lib.mkIf cfg.nodeExporter {
       enable = lib.mkDefault true;

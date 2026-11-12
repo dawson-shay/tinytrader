@@ -32,11 +32,12 @@
         ./nix/images.nix
         ./nix/watch.nix
         ./nix/darwin-check.nix
+        ./nix/services-check.nix
       ];
 
       flake = {
         nixosModules.services = ./infra/modules/services.nix;
-        # The same service definitions as launchd agents or daemons on macOS (nix-darwin).
+        # The same service definitions as launchd daemons (or, opted into, agents) on macOS (nix-darwin).
         darwinModules.services = ./infra/modules/darwin-services.nix;
         # For a deployment's own launchd jobs: `launchd.waitForNix argv` starts a
         # job once the Nix store is mounted (infra/lib/launchd.nix).
@@ -90,9 +91,11 @@
                 # The data store on Linux: drives mounted under /mnt that carry
                 # an approval marker are used as they appear (decision 0007);
                 # others are offered for approval in the console's Storage.
+                # A static user of its own: what it writes outlives the unit.
                 tinytrader.services.store = {
                   enable = true;
                   package = packages.store;
+                  user = "tinytrader-store";
                   observe.port = 9120;
                   environment.STORE_DISCOVER = "/mnt";
                   writablePaths = [ "/mnt" ];
