@@ -1061,7 +1061,7 @@ fn add_days(dir: &Path, k: &Key, schema: &str, scan: &mut Scan) -> bool {
             (day.to_owned(), size, "dbn.zst", served)
         } else if is_iso_date(&n) && scan.is_dir(&f) {
             let mut found = Vec::new();
-            crate::read::walk(&scan.root, &f, &mut found);
+            crate::read::walk_with(&scan.root, &f, &mut found, scan.follow);
             scan.served.extend(found.iter().cloned());
             (
                 n.clone(),
@@ -1396,7 +1396,7 @@ fn databento_batch(dir: &Path, provider: Option<&str>, scan: &mut Scan) -> bool 
     };
     scan.claimed.insert(dir.to_path_buf());
     let mut found = Vec::new();
-    crate::read::walk(&scan.root, dir, &mut found);
+    crate::read::walk_with(&scan.root, dir, &mut found, scan.follow);
     scan.served.extend(found);
     count_batch(b, dir, provider, scan)
 }

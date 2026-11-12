@@ -56,6 +56,12 @@ pub fn list(
 /// Served files under `dir`, as paths relative to `root`, with sizes. Links
 /// are not followed and hidden entries are skipped.
 pub fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
+    walk_with(root, dir, out, false);
+}
+
+/// As [`walk`], following links when `follow` (a content-addressed
+/// volume's view, whose files are links to its objects).
+pub fn walk_with(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>, follow: bool) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -64,11 +70,16 @@ pub fn walk(root: &Path, dir: &Path, out: &mut Vec<(String, u64)>) {
         if name.starts_with('.') {
             continue;
         }
-        let Ok(meta) = fs::symlink_metadata(e.path()) else {
+        let meta = if follow {
+            fs::metadata(e.path())
+        } else {
+            fs::symlink_metadata(e.path())
+        };
+        let Ok(meta) = meta else {
             continue;
         };
         if meta.is_dir() {
-            walk(root, &e.path(), out);
+            walk_with(root, &e.path(), out, follow);
         } else if meta.is_file()
             && served(&name)
             && let Ok(rel) = e.path().strip_prefix(root)

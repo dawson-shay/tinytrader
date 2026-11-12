@@ -176,6 +176,9 @@ pub fn run(
     }
     let mut names: BTreeMap<String, Vec<Copy>> = BTreeMap::new();
     let (mut errors, mut skipped) = (Vec::new(), Vec::new());
+    // Folders holding nothing: each kept by a marker (an empty batch
+    // receipt folder still says a batch was filed; review of #160).
+    let mut empty_dirs: Vec<String> = Vec::new();
     for s in sources {
         progress(&format!("reading {} ({})", s.name, s.root.display()));
         if !s.root.is_dir() {
@@ -192,6 +195,7 @@ pub fn run(
             ));
         }
         errors.extend(w.errors.into_iter().map(|e| format!("{}: {e}", s.name)));
+        empty_dirs.extend(w.empty_dirs.into_iter().map(|d| canonical(&d)));
         skipped.extend(w.skipped.into_iter().map(|e| format!("{}: {e}", s.name)));
         for f in w.files {
             let (recorded, bad_record) = match crate::recorded::of(&s.root, &f.path, f.size, 0) {
@@ -494,6 +498,38 @@ pub fn run(
             ));
         }
     }
+    empty_dirs.sort();
+    empty_dirs.dedup();
+    for d in &empty_dirs {
+        let name = format!("{d}/{}", tinytrader_cas::tree::EMPTY_FOLDER);
+        if index.names.contains_key(&name) {
+            continue;
+        }
+        let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
+            to_read += 1;
+            continue;
+        };
+        match v.put(&b""[..], "empty-folder", None) {
+            Ok(o) => {
+                log.append(&Event::Bind {
+                    name,
+                    version: 1,
+                    sha256: o.sha256,
+                    size: 0,
+                    ext: "empty-folder".into(),
+                    kind: "folder".into(),
+                    source: format!("an empty folder, migrated: {d}"),
+                    previous: None,
+                    writer: WRITER.into(),
+                    at: now(),
+                })?;
+                bound += 1;
+            }
+            Err(e) => damaged.push(format!(
+                "{d}: its empty-folder marker couldn't be written: {e}"
+            )),
+        }
+    }
     let verify = match (&vol, plan) {
         (Some(v), false) => {
             v.snapshot()?;
@@ -543,6 +579,7 @@ pub fn run(
         "on_several_sources": duplicates,
         "without_a_recorded_hash": unrecorded,
         "os_files_skipped": skipped,
+        "empty_folders": empty_dirs,
         "conflicts": conflicts,
         "damaged": damaged,
         "errors": errors,

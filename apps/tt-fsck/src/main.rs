@@ -166,6 +166,13 @@ fn check(a: &Args) -> (Value, i32) {
         indexes.push((v.id.clone(), index));
         drop(held);
     }
+    // A name with its first folder in either case (a provider's folder,
+    // which the migration spells one way: `databento/…` bound as
+    // `Databento/…`).
+    let fold = |n: &str| match n.split_once('/') {
+        Some((first, rest)) => format!("{}/{rest}", first.to_ascii_lowercase()),
+        None => n.to_owned(),
+    };
     // Each source, walked again and hashed: every file must be held.
     let mut against = Vec::new();
     for (src, root) in &a.against {
@@ -188,13 +195,6 @@ fn check(a: &Args) -> (Value, i32) {
                     f("S6", src, format!("source unreadable: {e}"));
                     continue;
                 }
-            };
-            // Bound under its path, or under it with the first folder
-            // spelled otherwise (a provider's folder, which the migration
-            // spells one way: `databento/…` bound as `Databento/…`).
-            let fold = |n: &str| match n.split_once('/') {
-                Some((first, rest)) => format!("{}/{rest}", first.to_ascii_lowercase()),
-                None => n.to_owned(),
             };
             let want = fold(&file.rel);
             let bound = indexes.iter().any(|(_, i)| {
@@ -234,6 +234,20 @@ fn check(a: &Args) -> (Value, i32) {
                         "{} ({} bytes, {sha}): not held on any volume given",
                         file.rel, file.size
                     ),
+                );
+            }
+        }
+        // Every empty folder kept by its marker.
+        for d in &w.empty_dirs {
+            let want = fold(&format!("{d}/{}", tinytrader_cas::tree::EMPTY_FOLDER));
+            if !indexes
+                .iter()
+                .any(|(_, i)| i.names.keys().any(|n| fold(n) == want))
+            {
+                f(
+                    "S6",
+                    src,
+                    format!("{d}/: an empty folder, not kept on any volume given"),
                 );
             }
         }

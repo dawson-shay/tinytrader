@@ -3741,6 +3741,7 @@ mod tests {
         let prov = tt03.join("databento/provenance/OPRA-FILED-2");
         std::fs::create_dir_all(&prov).unwrap();
         std::fs::write(prov.join("manifest.json"), b"{}").unwrap();
+        std::fs::create_dir_all(tt03.join("databento/provenance/OPRA-EMPTY-4")).unwrap();
         std::fs::create_dir_all(tt03.join("databento/.incoming/OPRA-IN-3")).unwrap();
         std::fs::write(
             tt03.join("databento/.incoming/OPRA-IN-3/x.dbn.zst"),
@@ -3789,7 +3790,7 @@ mod tests {
                 .map(|(k, v)| (k.clone(), v["how"].clone()))
                 .collect()
         };
-        assert_eq!(how(&tb).len(), 3, "{tb}");
+        assert_eq!(how(&tb).len(), 4, "{tb}");
         assert_eq!(how(&cb), how(&tb), "batches\ntrees: {tb}\ncas: {cb}");
         fn strip(v: &Value) -> Value {
             match v {
@@ -3823,6 +3824,33 @@ mod tests {
             "coverage\ntrees: {tc}\ncas: {cc}"
         );
         assert_eq!(cc["missing_volumes"], json!([]), "{cc}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review of #160 (8): a day whose versions conflict, none bound, isn't
+    /// absent from the catalog and `/coverage`: it reads held but unfiled,
+    /// so nobody buys it again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_day_in_conflict_reads_held_but_unfiled() {
+        let dir = scratch("cas-conflict-day");
+        let (a, b, cas) = (dir.join("a"), dir.join("b"), dir.join("cas"));
+        let day = "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2026-10-05.dbn.zst";
+        for (root, body) in [(&a, b"version one"), (&b, b"version two")] {
+            std::fs::create_dir_all(root.join(day).parent().unwrap()).unwrap();
+            std::fs::write(root.join(day), body).unwrap();
+        }
+        let sources = [
+            migrate::source(&format!("a={}", a.display())).unwrap(),
+            migrate::source(&format!("b={}", b.display())).unwrap(),
+        ];
+        let (r, ok) = migrate::run(&sources, Some((&cas, "cas-1")), false, &mut |_| {}).unwrap();
+        assert!(!ok && r["conflicts"].as_array().unwrap().len() == 1, "{r}");
+        let s = store(&[("cas", &cas)], &dir.join("state.json"));
+        scanned(&s).await;
+        let cat = lock(&s.catalog).clone();
+        let schema = &cat["roots"][0]["datasets"][0]["schemas"]["cbbo-1m"];
+        assert_eq!(schema["unfiled"], json!(["2026-10-05"]), "{cat}");
+        assert!(schema["days"].get("2026-10-05").is_some(), "{cat}");
         let _ = std::fs::remove_dir_all(dir);
     }
 
