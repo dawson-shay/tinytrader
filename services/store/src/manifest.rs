@@ -287,6 +287,31 @@ pub fn settle(dir: &Path, day: &str) -> Result<Option<Value>, String> {
     ))
 }
 
+/// Whether `name` (within a volume) is a schema folder's manifest in the
+/// store layout, its index or a day's sidecar
+/// (`<Provider>/<DATASET>[/<SYMBOL>]/<schema>/manifest.json`, or
+/// `…/manifest.d/<day>.json`), not a batch's own manifest.
+#[must_use]
+pub fn is_store_manifest(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    let n = parts.len();
+    // The schema folder's parts, by what the name ends with.
+    let folder = if n >= 2 && parts[n - 2] == SIDECARS {
+        let day = parts[n - 1].strip_suffix(".json").unwrap_or_default();
+        if crate::ingest::day_ns(day).is_none() {
+            return false;
+        }
+        &parts[..n - 2]
+    } else if parts.last() == Some(&MANIFEST) {
+        &parts[..n - 1]
+    } else {
+        return false;
+    };
+    matches!(folder.len(), 3 | 4)
+        && crate::catalog::provider_name(folder[0]).is_some()
+        && crate::catalog::is_dataset_name(folder[1])
+}
+
 /// Several copies of one schema folder's manifest index (`manifest.json`),
 /// as `store migrate-cas` finds them on different drives, merged into one:
 /// every day any copy has an entry for. A day whose entries differ is a

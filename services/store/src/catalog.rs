@@ -599,6 +599,17 @@ impl Scan {
     fn stat(&mut self, path: &Path) -> Option<std::fs::Metadata> {
         match std::fs::metadata(path) {
             Ok(m) => Some(m),
+            // In a content-addressed volume's view, a link to an object
+            // that isn't there is a missing object, never "not there"
+            // (review of #160).
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && self.follow
+                    && std::fs::symlink_metadata(path).is_ok() =>
+            {
+                self.fail(path, "its object is missing".into());
+                None
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 self.fail(path, e.to_string());

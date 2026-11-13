@@ -579,6 +579,17 @@ async fn scan(store: &Shared, observer: &Observer) {
                         )
                     })
                     .flatten();
+                // The drive the same after its index and view were read too
+                // (an unmount mid-scan reads as missing objects otherwise).
+                if cas.is_some()
+                    && volumes::present(v).ok().and_then(|()| identity(&v.path)) != began
+                    && let Some(errs) = root["errors"].as_array_mut()
+                {
+                    errs.push(json!(format!(
+                        "{} went away or changed while its content-addressed index was read; what it held is kept from before",
+                        v.path.display()
+                    )));
+                }
                 let errors: Vec<String> = if root["present"] == true {
                     root["errors"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(str::to_owned)).collect()
                 } else {
@@ -2223,8 +2234,16 @@ fn cas_of(
     let opened = tinytrader_cas::Volume::open(&v.path).and_then(|c| {
         // Unchanged since the last scan (its log the same length): that index.
         let len = std::fs::metadata(c.log_path()).map_or(0, |m| m.len());
+        // The same volume, its log the same length and ending in the same
+        // chain: that index, unchanged.
+        let same = |b: &CasVolume| {
+            b.0.id == c.id
+                && b.1.log_len == len
+                && len > 0
+                && last_chain(&c.log_path()).is_some_and(|ch| ch == b.1.chain)
+        };
         match before {
-            Some((_, i)) if i.log_len == len && len > 0 => Ok((c, i.clone())),
+            Some(b) if same(b) => Ok((c, b.1.clone())),
             _ => c.index().map(|i| (c, Arc::new(i))),
         }
     });
@@ -2280,102 +2299,155 @@ fn cas_of(
     Some((c, index))
 }
 
-/// Make `view` a content-addressed volume's names, each a link to its object
-/// (rebuilt only when the volume's log has changed), so the store layout's
-/// scan reads it as it reads a tree. A name whose versions conflict (none
-/// bound, each kept pending: `store migrate-cas`) is shown as an older-layout
-/// day folder holding each version, so the day reads as held but unfiled,
-/// never as absent. Returns what couldn't be shown: a missing object, a
-/// manifest left in conflict.
+/// The chain value on a log's last whole line, read from its end.
+fn last_chain(log: &Path) -> Option<String> {
+    use std::io::{Read as _, Seek as _};
+    let mut f = std::fs::File::open(log).ok()?;
+    let len = f.metadata().ok()?.len();
+    let from = len.saturating_sub(64 * 1024);
+    f.seek(std::io::SeekFrom::Start(from)).ok()?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail).ok()?;
+    let text = String::from_utf8_lossy(&tail);
+    let line = text.trim_end_matches('\n').rsplit('\n').next()?;
+    serde_json::from_str::<Value>(line).ok()?["chain"]
+        .as_str()
+        .map(str::to_owned)
+}
+
+/// Make `view` a content-addressed volume's names, each a link to its object,
+/// so the store layout's scan reads it as it reads a tree. `view` is itself a
+/// link to the current build (`<view>.<n>`), replaced in one rename, so a
+/// reader never finds no view. It's rebuilt only when the volume's log has
+/// changed, and stamped only when built without a problem.
+///
+/// A name whose versions conflict (none bound, each kept pending: `store
+/// migrate-cas`) is shown, when it's a day, as an older-layout day folder of
+/// its versions, so the day reads held but unfiled, never absent.
+///
+/// Every scan checks every name's object is there (a link to nothing would
+/// read as "not there"). Returns the problems, each an error of the volume:
+/// a missing object, a store manifest or a batch's receipt left in conflict.
 fn cas_view(c: &tinytrader_cas::Volume, index: &tinytrader_cas::Index, view: &Path) -> Vec<String> {
     let mut problems = Vec::new();
-    // The manifests of a folder in conflict: its days' conditions and
-    // coverage can't be told (they'd read as complete).
-    for (sha, why) in &index.pending {
-        if let Some(name) = why
-            .strip_prefix("conflict over ")
+    let conflict_name = |why: &str| {
+        why.strip_prefix("conflict over ")
             .and_then(|r| r.split(" (from ").next())
-            && !index.names.contains_key(name)
-            && (name.ends_with("/manifest.json") || name.contains("/manifest.d/"))
-        {
+            .map(str::to_owned)
+    };
+    for (sha, why) in &index.pending {
+        let Some(name) = conflict_name(why).filter(|n| !index.names.contains_key(n)) else {
+            continue;
+        };
+        if manifest::is_store_manifest(&name) {
             problems.push(format!(
                 "{name} is in conflict (a version {sha} is kept pending): the days beside it can't be told complete or partial until it's resolved"
+            ));
+        } else if name.contains("/provenance/")
+            || name.ends_with("/metadata.json")
+            || name.ends_with("/manifest.json")
+        {
+            problems.push(format!(
+                "{name}, a batch's receipt, is in conflict (a version {sha} is kept pending): its batch can't be told filed until it's resolved"
+            ));
+        }
+    }
+    // Every object there, every scan.
+    for (name, e) in &index.names {
+        if c.object(&e.sha256, &e.ext).is_none() {
+            problems.push(format!(
+                "{name}: its object {}.{} isn't there",
+                e.sha256, e.ext
             ));
         }
     }
     let stamp = view.with_extension("of");
     let want =
         json!({ "volume": c.id, "log_len": index.log_len, "chain": index.chain }).to_string();
-    if std::fs::read_to_string(&stamp).is_ok_and(|s| s == want) && view.is_dir() {
+    if problems.is_empty()
+        && std::fs::read_to_string(&stamp).is_ok_and(|s| s == want)
+        && view.is_dir()
+    {
         return problems;
     }
-    let fresh = view.with_extension("new");
-    let _ = std::fs::remove_dir_all(&fresh);
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let fresh = view.with_extension(n.to_string());
     let ok_part = |p: &str| !p.is_empty() && p != "." && p != "..";
-    let link = |name: &str, target: &Path| -> Result<(), String> {
+    let mut built = Vec::new();
+    let link = |name: &str, target: &Path, built: &mut Vec<String>| {
         if name.starts_with('/') || !name.split('/').all(ok_part) {
-            return Err(format!("{name}: not a name the view can hold"));
+            built.push(format!("{name}: not a name the view can hold"));
+            return;
         }
         let at = fresh.join(name);
-        if let Some(parent) = at.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        if let Some(parent) = at.parent()
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            built.push(format!("{}: {e}", parent.display()));
+            return;
         }
-        std::os::unix::fs::symlink(target, &at).map_err(|e| format!("{}: {e}", at.display()))
+        if let Err(e) = std::os::unix::fs::symlink(target, &at) {
+            built.push(format!("{}: {e}", at.display()));
+        }
     };
     if let Err(e) = std::fs::create_dir_all(&fresh) {
         problems.push(format!("{}: {e}", fresh.display()));
         return problems;
     }
     for (name, e) in &index.names {
-        let Some(obj) = c.object(&e.sha256, &e.ext) else {
-            problems.push(format!(
-                "{name}: its object {}.{} isn't there",
-                e.sha256, e.ext
-            ));
-            continue;
-        };
-        if let Err(err) = link(name, &obj) {
-            problems.push(err);
+        if let Some(obj) = c.object(&e.sha256, &e.ext) {
+            link(name, &obj, &mut built);
         }
     }
     // Days whose versions conflict: an older-layout day folder of them.
     for (sha, why) in &index.pending {
-        let Some(name) = why
-            .strip_prefix("conflict over ")
-            .and_then(|r| r.split(" (from ").next())
-        else {
+        let Some(name) = conflict_name(why) else {
             continue;
         };
         let Some(day_dir) = name.strip_suffix(".dbn.zst") else {
             continue;
         };
         let day = day_dir.rsplit('/').next().unwrap_or_default();
-        if index.names.contains_key(name) || crate::ingest::day_ns(day).is_none() {
+        if index.names.contains_key(&name) || crate::ingest::day_ns(day).is_none() {
             continue;
         }
-        let ext = "dbn.zst";
-        match c.object(sha, ext) {
-            Some(obj) => {
-                if let Err(err) = link(
-                    &format!("{day_dir}/conflict-{}.{ext}", &sha[..16.min(sha.len())]),
-                    &obj,
-                ) {
-                    problems.push(err);
-                }
-            }
-            None => problems.push(format!("{name}: its pending version {sha} isn't there")),
+        match c.object(sha, "dbn.zst") {
+            Some(obj) => link(
+                &format!("{day_dir}/conflict-{}.dbn.zst", &sha[..16.min(sha.len())]),
+                &obj,
+                &mut built,
+            ),
+            None => built.push(format!("{name}: its pending version {sha} isn't there")),
         }
     }
-    // Swapped in whole, then stamped.
-    let old = view.with_extension("old");
-    let _ = std::fs::remove_dir_all(&old);
-    let _ = std::fs::rename(view, &old);
-    if let Err(e) = std::fs::rename(&fresh, view) {
+    // The view link replaced in one rename; the build it pointed at, after.
+    let previous = std::fs::read_link(view).ok();
+    let tmp = view.with_extension("link");
+    let _ = std::fs::remove_file(&tmp);
+    let swapped = std::os::unix::fs::symlink(&fresh, &tmp).and_then(|()| {
+        // A view from before views were links: a folder, removed first.
+        if std::fs::symlink_metadata(view).is_ok_and(|m| m.is_dir()) {
+            std::fs::remove_dir_all(view)?;
+        }
+        std::fs::rename(&tmp, view)
+    });
+    if let Err(e) = swapped {
         problems.push(format!("{}: {e}", view.display()));
+        let _ = std::fs::remove_dir_all(&fresh);
         return problems;
     }
-    let _ = std::fs::remove_dir_all(&old);
-    let _ = std::fs::write(&stamp, want);
+    if let Some(old) = previous.filter(|p| *p != fresh) {
+        let _ = std::fs::remove_dir_all(old);
+    }
+    // Stamped only when built whole: otherwise rebuilt next scan.
+    if built.is_empty() && problems.is_empty() {
+        let _ = std::fs::write(&stamp, want);
+    } else {
+        let _ = std::fs::remove_file(&stamp);
+    }
+    problems.extend(built);
     problems
 }
 
@@ -3851,6 +3923,52 @@ mod tests {
         let schema = &cat["roots"][0]["datasets"][0]["schemas"]["cbbo-1m"];
         assert_eq!(schema["unfiled"], json!(["2026-10-05"]), "{cat}");
         assert!(schema["days"].get("2026-10-05").is_some(), "{cat}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Review of #160 (critical): an object gone from a CAS volume (after its
+    /// view was built, or a receipt's) is an error of the volume on every
+    /// scan, never a day or a batch silently "not there".
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_missing_object_is_an_error_of_the_volume_every_scan() {
+        let dir = scratch("cas-dangling");
+        let tree = dir.join("tree");
+        let day = "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m/2026-10-01.dbn.zst";
+        let receipt = "Databento/provenance/OPRA-X/manifest.json";
+        for (rel, body) in [(day, &b"a day"[..]), (receipt, &b"{}"[..])] {
+            std::fs::create_dir_all(tree.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(tree.join(rel), body).unwrap();
+        }
+        let cas = dir.join("cas");
+        let (r, ok) = migrate::run(
+            &[migrate::source(&format!("t={}", tree.display())).unwrap()],
+            Some((&cas, "cas-1")),
+            false,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(ok, "{r}");
+        let s = store(&[("cas", &cas)], &dir.join("state.json"));
+        scanned(&s).await;
+        assert_eq!(lock(&s.catalog)["missing_volumes"], json!([]));
+        let c = tinytrader_cas::Volume::open(&cas).unwrap();
+        let i = c.index().unwrap();
+        for name in [day, receipt] {
+            let e = &i.names[name];
+            let obj = c.object(&e.sha256, &e.ext).unwrap();
+            let mut p = std::fs::metadata(&obj).unwrap().permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            std::fs::set_permissions(&obj, p).unwrap();
+            std::fs::remove_file(&obj).unwrap();
+        }
+        for _ in 0..2 {
+            scanned(&s).await;
+            let cat = lock(&s.catalog).clone();
+            assert_eq!(cat["missing_volumes"], json!(["cas"]), "{cat}");
+            let errors = cat["roots"][0]["errors"].to_string();
+            assert!(errors.contains(day) && errors.contains(receipt), "{errors}");
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 
