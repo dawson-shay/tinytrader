@@ -1,6 +1,41 @@
 {
   "components": {
     "schemas": {
+      "Cas": {
+        "description": "A content-addressed volume's index, in brief.",
+        "properties": {
+          "conflicts": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "format": {
+            "type": "string"
+          },
+          "names": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "pending": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "volume": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "format",
+          "volume",
+          "names",
+          "pending",
+          "conflicts"
+        ],
+        "type": "object"
+      },
       "Catalog": {
         "properties": {
           "candidates": {
@@ -355,6 +390,17 @@
       "Root": {
         "description": "One volume.",
         "properties": {
+          "cas": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Cas"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For a volume in the content-addressed format (decision 0035): its\nformat, its id, and how many names, pending objects and conflicts\nits index holds."
+          },
           "dataset_bytes": {
             "format": "uint64",
             "minimum": 0,

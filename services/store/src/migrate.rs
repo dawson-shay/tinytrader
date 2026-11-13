@@ -48,6 +48,19 @@ fn kind(rel: &str) -> &'static str {
     }
 }
 
+/// The name a source path is bound under: the provider's folder spelled as
+/// the store spells it (`databento/…` and `Databento/…` are one provider's,
+/// so one name, merged as one: review of #160), the rest as it is.
+fn canonical(rel: &str) -> String {
+    match rel.split_once('/') {
+        Some((first, rest)) => match crate::ingest::provider_dir(first) {
+            Some(p) => format!("{p}/{rest}"),
+            None => rel.to_owned(),
+        },
+        None => rel.to_owned(),
+    }
+}
+
 /// The extension an object keeps: the file's, from its first dot (so
 /// `2026-10-02.dbn.zst` keeps `dbn.zst`), or `bin`.
 fn ext_of(rel: &str) -> String {
@@ -149,6 +162,9 @@ pub fn run(
     }
     let mut names: BTreeMap<String, Vec<Copy>> = BTreeMap::new();
     let (mut errors, mut skipped) = (Vec::new(), Vec::new());
+    // Folders holding nothing: each kept by a marker (an empty batch
+    // receipt folder still says a batch was filed; review of #160).
+    let mut empty_dirs: Vec<String> = Vec::new();
     for s in sources {
         progress(&format!("reading {} ({})", s.name, s.root.display()));
         if !s.root.is_dir() {
@@ -165,6 +181,7 @@ pub fn run(
             ));
         }
         errors.extend(w.errors.into_iter().map(|e| format!("{}: {e}", s.name)));
+        empty_dirs.extend(w.empty_dirs.into_iter().map(|d| canonical(&d)));
         skipped.extend(w.skipped.into_iter().map(|e| format!("{}: {e}", s.name)));
         for f in w.files {
             let (recorded, bad_record) = match crate::recorded::of(&s.root, &f.path, f.size, 0) {
@@ -172,7 +189,7 @@ pub fn run(
                 crate::recorded::Recorded::Unknown => (None, None),
                 crate::recorded::Recorded::Conflict(why) => (None, Some(why)),
             };
-            names.entry(f.rel.clone()).or_default().push(Copy {
+            names.entry(canonical(&f.rel)).or_default().push(Copy {
                 source: s,
                 found: f,
                 recorded,
@@ -184,6 +201,166 @@ pub fn run(
     let (mut to_read, mut to_read_bytes, mut already, mut bound) = (0u64, 0u64, 0u64, 0u64);
     let (mut conflicts, mut damaged, mut unrecorded) = (Vec::new(), Vec::new(), 0u64);
     let (mut duplicates, mut copied_bytes, mut kept_pending) = (0u64, 0u64, 0u64);
+    let (mut manifest_merges, mut manifest_conflicts) = (Vec::new(), Vec::new());
+    // Schema folders whose manifest is on more than one drive (or already
+    // bound): their index and sidecars merged by day, before the files are
+    // copied (review of #160: Data and tt03 share folders, so this is the
+    // expected case, and a day that differs is merged conservatively, never
+    // a conflict that fails the volume). The names written, with their hash.
+    let mut merged_names: BTreeMap<String, String> = BTreeMap::new();
+    for (name, copies) in names.iter().filter(|(n, _)| {
+        crate::manifest::is_store_manifest(n)
+            && n.ends_with(&format!("/{}", crate::manifest::MANIFEST))
+    }) {
+        let folder = name
+            .trim_end_matches(&format!("/{}", crate::manifest::MANIFEST))
+            .to_owned();
+        let side = |day: &str| format!("{folder}/{}/{day}.json", crate::manifest::SIDECARS);
+        let current = index.names.get(name);
+        if copies.len() + usize::from(current.is_some()) < 2 {
+            continue;
+        }
+        // Each drive's days, full: a partial day's from its sidecar there.
+        let read =
+            |p: &Path| -> Option<Value> { serde_json::from_slice(&std::fs::read(p).ok()?).ok() };
+        let full = |source: &str,
+                    m: &Value,
+                    sidecar: &dyn Fn(&str) -> Option<Value>|
+         -> Result<BTreeMap<String, Value>, String> {
+            let mut out = BTreeMap::new();
+            for (day, e) in m["days"]
+                .as_object()
+                .ok_or_else(|| format!("{name} on {source}: not a manifest that can be read"))?
+            {
+                let stubbed = e["sidecar"].is_string()
+                    || (e["partial"] == true && e.get("coverage").is_none());
+                let entry = if stubbed {
+                    sidecar(day).ok_or_else(|| {
+                        format!(
+                            "{} on {source}: its partial day's entry can't be read",
+                            side(day)
+                        )
+                    })?
+                } else {
+                    e.clone()
+                };
+                out.insert(day.clone(), entry);
+            }
+            Ok(out)
+        };
+        let mut all: Vec<(String, BTreeMap<String, Value>)> = Vec::new();
+        let mut failed = false;
+        if let (Some(b), Some(v)) = (current, &vol) {
+            let bound = |n: &str| -> Option<Value> {
+                let e = index.names.get(n)?;
+                read(&v.object(&e.sha256, &e.ext)?)
+            };
+            match bound(name)
+                .ok_or_else(|| format!("{name}: its bound version {} can't be read", b.sha256))
+                .and_then(|m| full("bound", &m, &|d| bound(&side(d))))
+            {
+                Ok(d) => all.push(("bound".into(), d)),
+                Err(e) => {
+                    damaged.push(e);
+                    failed = true;
+                }
+            }
+        }
+        for c in copies {
+            let dir = c
+                .found
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let got = read(&c.found.path)
+                .ok_or_else(|| {
+                    format!(
+                        "{name} on {}: not a manifest that can be read",
+                        c.source.name
+                    )
+                })
+                .and_then(|m| {
+                    full(&c.source.name, &m, &|d| {
+                        read(
+                            &dir.join(crate::manifest::SIDECARS)
+                                .join(format!("{d}.json")),
+                        )
+                    })
+                });
+            match got {
+                Ok(d) => all.push((c.source.name.clone(), d)),
+                Err(e) => {
+                    damaged.push(e);
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+        let (days, differed) = crate::manifest::merge_folder(&all);
+        // Listed only when the copies held different days or entries.
+        if all.iter().any(|(_, d)| *d != all[0].1) {
+            manifest_merges.push(
+                json!({ "name": name, "copies": all.iter().map(|(s, _)| s).collect::<Vec<_>>() }),
+            );
+        }
+        manifest_conflicts.extend(differed.iter().map(|d| json!({ "name": name, "day": d })));
+        let (index_v, sidecars) = crate::manifest::files_of(&days);
+        let mut files: Vec<(String, Value)> =
+            sidecars.into_iter().map(|(d, e)| (side(&d), e)).collect();
+        files.push((name.clone(), index_v));
+        for (n, content) in files {
+            let bytes = serde_json::to_vec_pretty(&content).unwrap_or_default();
+            let cur = index.names.get(&n);
+            let same = cur
+                .and_then(|e| vol.as_ref()?.object(&e.sha256, &e.ext))
+                .and_then(|p| read(&p))
+                .is_some_and(|b| b == content);
+            if plan {
+                if !same {
+                    to_read += 1;
+                }
+                merged_names.insert(n, String::new());
+                continue;
+            }
+            let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
+                continue;
+            };
+            if same {
+                merged_names.insert(n, cur.map(|e| e.sha256.clone()).unwrap_or_default());
+                continue;
+            }
+            match v.put(&bytes[..], "json", None) {
+                Ok(o) => {
+                    log.append(&Event::Bind {
+                        name: n.clone(),
+                        version: cur.map_or(1, |b| b.version + 1),
+                        sha256: o.sha256.clone(),
+                        size: o.size,
+                        ext: "json".into(),
+                        kind: "manifest".into(),
+                        source: format!(
+                            "merged from {}",
+                            all.iter()
+                                .map(|(s, _)| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        previous: cur.map(|b| b.sha256.clone()),
+                        writer: WRITER.into(),
+                        at: now(),
+                    })?;
+                    bound += 1;
+                    merged_names.insert(n, o.sha256);
+                }
+                Err(e) => {
+                    damaged.push(format!("{n}: the merged manifest couldn't be written: {e}"))
+                }
+            }
+        }
+    }
     for (name, copies) in &names {
         let k = kind(name);
         let ext = ext_of(name);
@@ -219,6 +396,52 @@ pub fn run(
             let held = vol.as_ref().is_some_and(|v| v.object(sha, &ext).is_some());
             (same && held).then(|| sha.to_owned())
         };
+        // A folder's manifest files merged above: each drive's copy kept as
+        // it was, "merged into" the merged version.
+        if let Some(merged_sha) = merged_names.get(name) {
+            if plan {
+                continue;
+            }
+            let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
+                continue;
+            };
+            // Bound already as it is on every drive, read before: there.
+            if current.is_some_and(|b| b.sha256 == *merged_sha)
+                && copies
+                    .iter()
+                    .all(|c| known(c).as_deref() == Some(merged_sha.as_str()))
+            {
+                already += 1;
+                continue;
+            }
+            for c in copies {
+                match v.put_file(&c.found.path, &ext, None) {
+                    Ok(o) => {
+                        if !o.existed {
+                            copied_bytes += o.size;
+                        }
+                        if o.sha256 != *merged_sha && !index.pending.contains_key(&o.sha256) {
+                            log.append(&Event::Pending {
+                                sha256: o.sha256.clone(),
+                                ext: ext.clone(),
+                                for_: format!("merged into {name} (from {})", c.source.name),
+                                writer: WRITER.into(),
+                                at: now(),
+                            })?;
+                        }
+                        receipts
+                            .get_mut(&c.source.name)
+                            .expect("each source has a receipt")["files"][&c.found.rel] = json!({
+                            "size": c.found.size, "mtime_ns": c.found.mtime_ns.to_string(),
+                            "dev": c.found.dev, "ino": c.found.ino, "ctime_ns": c.found.ctime_ns.to_string(),
+                            "sha256": o.sha256, "outcome": if o.sha256 == *merged_sha { "bound" } else { "merged" },
+                        });
+                    }
+                    Err(e) => damaged.push(format!("{name} on {}: {e}", c.source.name)),
+                }
+            }
+            continue;
+        }
         if plan {
             let sizes: std::collections::BTreeSet<u64> =
                 copies.iter().map(|c| c.found.size).collect();
@@ -349,6 +572,38 @@ pub fn run(
             ));
         }
     }
+    empty_dirs.sort();
+    empty_dirs.dedup();
+    for d in &empty_dirs {
+        let name = format!("{d}/{}", tinytrader_cas::tree::EMPTY_FOLDER);
+        if index.names.contains_key(&name) {
+            continue;
+        }
+        let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
+            to_read += 1;
+            continue;
+        };
+        match v.put(&b""[..], "empty-folder", None) {
+            Ok(o) => {
+                log.append(&Event::Bind {
+                    name,
+                    version: 1,
+                    sha256: o.sha256,
+                    size: 0,
+                    ext: "empty-folder".into(),
+                    kind: "folder".into(),
+                    source: format!("an empty folder, migrated: {d}"),
+                    previous: None,
+                    writer: WRITER.into(),
+                    at: now(),
+                })?;
+                bound += 1;
+            }
+            Err(e) => damaged.push(format!(
+                "{d}: its empty-folder marker couldn't be written: {e}"
+            )),
+        }
+    }
     let verify = match (&vol, plan) {
         (Some(v), false) => {
             v.snapshot()?;
@@ -359,6 +614,7 @@ pub fn run(
     let ok = errors.is_empty()
         && conflicts.is_empty()
         && damaged.is_empty()
+        && manifest_conflicts.is_empty()
         && verify.as_ref().is_none_or(tinytrader_cas::Report::sound);
     // Each source's receipt: every file read, and how this run ended, kept
     // in the volume so a check later knows (review C2).
@@ -387,6 +643,9 @@ pub fn run(
         "names": names.len(),
         "by_kind": by_kind.iter().map(|(k, (n, b))| (k.to_string(), json!({ "names": n, "bytes": b }))).collect::<serde_json::Map<_, _>>(),
         "to_read": { "names": to_read, "bytes": to_read_bytes },
+        // Folders whose manifests differ across drives, merged by day; the
+        // days whose entries disagree read as `unknown` until settled.
+        "manifests": { "merged": manifest_merges, "day_conflicts": manifest_conflicts },
         "already_there": already,
         "bound": bound,
         "kept_pending": kept_pending,
@@ -394,6 +653,7 @@ pub fn run(
         "on_several_sources": duplicates,
         "without_a_recorded_hash": unrecorded,
         "os_files_skipped": skipped,
+        "empty_folders": empty_dirs,
         "conflicts": conflicts,
         "damaged": damaged,
         "errors": errors,
@@ -638,6 +898,77 @@ mod tests {
             (json!(1), 0),
             "{r}"
         );
+    }
+
+    /// Review of #160: one schema folder on two drives, each with its own
+    /// manifest. Different days merge; the same day with different entries
+    /// is a conflict, counted by --plan, unknown in the merged manifest, and
+    /// the run isn't ok. Each drive's manifest is kept, "merged into" it.
+    #[test]
+    fn a_folder_s_manifests_on_two_drives_merge_by_day() {
+        let d = scratch("manifests");
+        let (a, b, dest) = (d.join("data"), d.join("tt03"), d.join("nas"));
+        let folder = "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m";
+        put(&a, &format!("{folder}/2026-10-01.dbn.zst"), b"one");
+        put(&b, &format!("{folder}/2026-10-01.dbn.zst"), b"one");
+        put(&b, &format!("{folder}/2026-10-02.dbn.zst"), b"two");
+        crate::manifest::set_entry(
+            &a.join(folder),
+            "2026-10-01",
+            Some(json!({ "condition": { "state": "degraded" } })),
+        )
+        .unwrap();
+        crate::manifest::set_entry(
+            &b.join(folder),
+            "2026-10-01",
+            Some(json!({ "condition": { "state": "missing" } })),
+        )
+        .unwrap();
+        crate::manifest::set_entry(
+            &b.join(folder),
+            "2026-10-02",
+            Some(json!({ "condition": { "state": "degraded" } })),
+        )
+        .unwrap();
+        let sources = [
+            source(&format!("data={}", a.display())).unwrap(),
+            source(&format!("tt03={}", b.display())).unwrap(),
+        ];
+        let (p, _) = run(&sources, Some((&dest, "nas-1")), true, &mut |_| {}).unwrap();
+        assert_eq!(p["manifests"]["merged"].as_array().unwrap().len(), 1, "{p}");
+        assert_eq!(
+            p["manifests"]["day_conflicts"],
+            json!([{ "name": format!("{folder}/manifest.json"), "day": "2026-10-01" }])
+        );
+        let (r, ok) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert!(!ok, "a day's entries in conflict: {r}");
+        let v = Volume::open(&dest).unwrap();
+        let i = v.index().unwrap();
+        let e = &i.names[&format!("{folder}/manifest.json")];
+        let m: Value =
+            serde_json::from_slice(&fs::read(v.object(&e.sha256, &e.ext).unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(
+            m["days"]["2026-10-01"]["condition"]["state"], "missing",
+            "the worse of degraded and missing"
+        );
+        assert_eq!(m["days"]["2026-10-02"]["condition"]["state"], "degraded");
+        assert_eq!(
+            i.pending
+                .values()
+                .filter(|w| w.starts_with("merged into"))
+                .count(),
+            2,
+            "{:?}",
+            i.pending
+        );
+        assert_eq!(
+            v.receipt("tt03").unwrap().unwrap()["files"][format!("{folder}/manifest.json")]["outcome"],
+            "merged"
+        );
+        // Again: nothing changes.
+        let (again, _) = run(&sources, Some((&dest, "nas-1")), false, &mut |_| {}).unwrap();
+        assert_eq!(again["bound"], 0, "{again}");
     }
 
     /// Review C2: a source with no files (a drive not mounted) is refused,

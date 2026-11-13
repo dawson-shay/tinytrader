@@ -62,6 +62,31 @@ pub fn scan_volume(
     t: Thresholds,
     ignored: &[PathBuf],
 ) -> (Value, Vec<Place>, Vec<Served>) {
+    scan_tree(name, path, t, ignored, false)
+}
+
+/// A content-addressed volume's view (decision 0035), read exactly as a
+/// volume in the store layout is: the view is its names, each a link to its
+/// object, so what the store says of a migrated volume is what it said of
+/// the tree it came from. Its days' places are marked `cas` (nothing is
+/// written beside them).
+pub fn scan_view(name: &str, view: &Path, t: Thresholds) -> (Value, Vec<Place>, Vec<Served>) {
+    let (root, mut places, served) = scan_tree(name, view, t, &[], true);
+    for p in &mut places {
+        if let Place::Days { cas, .. } = p {
+            *cas = true;
+        }
+    }
+    (root, places, served)
+}
+
+fn scan_tree(
+    name: &str,
+    path: &Path,
+    t: Thresholds,
+    ignored: &[PathBuf],
+    follow: bool,
+) -> (Value, Vec<Place>, Vec<Served>) {
     if !path.is_dir() {
         let root = json!({ "name": name, "path": path, "present": false, "datasets": [], "unrecognised": [], "errors": [], "pending_files": [] });
         return (root, Vec::new(), Vec::new());
@@ -79,6 +104,7 @@ pub fn scan_volume(
     let mut scan = Scan {
         skip: ignored.iter().cloned().collect(),
         root: path.to_path_buf(),
+        follow,
         ..Scan::default()
     };
     let mut unrecognised = Vec::new();
@@ -87,7 +113,7 @@ pub fn scan_volume(
         let found = top(&entry, &mut scan);
         if !found {
             let name = file_name(&entry);
-            let u = usage(&entry);
+            let u = usage_with(&entry, scan.follow);
             other.push(
                 json!({ "name": name, "bytes": u.bytes, "files": u.files, "modified": u.modified }),
             );
@@ -407,6 +433,9 @@ pub enum Place {
         /// answers from memory, and every write to the folder reads it again.
         entries: Entries,
         files: BTreeMap<String, Vec<String>>,
+        /// Read from a content-addressed volume's index (decision 0035):
+        /// `dir` is only its name, and nothing writes there.
+        cas: bool,
     },
     /// A batch download, with the folder it is in (within the volume).
     Batch {
@@ -536,6 +565,9 @@ struct Scan {
     claimed: HashSet<PathBuf>,
     /// DBN files still being written, read again on the next scan.
     pending: Vec<String>,
+    /// Links are followed: a content-addressed volume's view (its names,
+    /// each a link to its object), read as a tree is.
+    follow: bool,
     /// The volume, and the top-level entry being read.
     root: PathBuf,
     top: PathBuf,
@@ -567,6 +599,17 @@ impl Scan {
     fn stat(&mut self, path: &Path) -> Option<std::fs::Metadata> {
         match std::fs::metadata(path) {
             Ok(m) => Some(m),
+            // In a content-addressed volume's view, a link to an object
+            // that isn't there is a missing object, never "not there"
+            // (review of #160).
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && self.follow
+                    && std::fs::symlink_metadata(path).is_ok() =>
+            {
+                self.fail(path, "its object is missing".into());
+                None
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
             Err(e) => {
                 self.fail(path, e.to_string());
@@ -680,7 +723,12 @@ fn visit(dir: &Path, depth: usize, provider: Option<&str>, scan: &mut Scan) -> b
 /// and read again on the next scan. An empty file holds nothing. Returns
 /// whether any were found.
 fn loose(path: &Path, provider: Option<&str>, scan: &mut Scan) -> bool {
-    let Some(meta) = scan.lstat(path) else {
+    let meta = if scan.follow {
+        scan.stat(path)
+    } else {
+        scan.lstat(path)
+    };
+    let Some(meta) = meta else {
         return false;
     };
     if scan.claimed.contains(path) {
@@ -1024,11 +1072,11 @@ fn add_days(dir: &Path, k: &Key, schema: &str, scan: &mut Scan) -> bool {
             (day.to_owned(), size, "dbn.zst", served)
         } else if is_iso_date(&n) && scan.is_dir(&f) {
             let mut found = Vec::new();
-            crate::read::walk(&scan.root, &f, &mut found);
+            crate::read::walk_with(&scan.root, &f, &mut found, scan.follow);
             scan.served.extend(found.iter().cloned());
             (
                 n.clone(),
-                usage(&f).bytes,
+                usage_with(&f, scan.follow).bytes,
                 "day folders",
                 day_folder_files(found, schema),
             )
@@ -1092,6 +1140,7 @@ fn add_days(dir: &Path, k: &Key, schema: &str, scan: &mut Scan) -> bool {
             days: held,
             entries: std::sync::Arc::new(entries),
             files,
+            cas: false,
         });
     }
     any
@@ -1124,12 +1173,18 @@ pub struct Usage {
     pub modified: f64,
 }
 
-/// Walk `path` (not following links), adding up its files.
-pub fn usage(path: &Path) -> Usage {
+/// Walk `path`, adding up its files: links not followed, unless `follow`
+/// (a content-addressed volume's view, whose files are links to objects).
+fn usage_with(path: &Path, follow: bool) -> Usage {
     let mut u = Usage::default();
     let mut stack = vec![path.to_path_buf()];
     while let Some(p) = stack.pop() {
-        let Ok(meta) = std::fs::symlink_metadata(&p) else {
+        let meta = if follow {
+            std::fs::metadata(&p)
+        } else {
+            std::fs::symlink_metadata(&p)
+        };
+        let Ok(meta) = meta else {
             continue;
         };
         if meta.is_dir() {
@@ -1352,7 +1407,7 @@ fn databento_batch(dir: &Path, provider: Option<&str>, scan: &mut Scan) -> bool 
     };
     scan.claimed.insert(dir.to_path_buf());
     let mut found = Vec::new();
-    crate::read::walk(&scan.root, dir, &mut found);
+    crate::read::walk_with(&scan.root, dir, &mut found, scan.follow);
     scan.served.extend(found);
     count_batch(b, dir, provider, scan)
 }

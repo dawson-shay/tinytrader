@@ -30,7 +30,13 @@ pub struct Walk {
     /// The operating system's own folders at the root, skipped (each
     /// listed, never silently).
     pub skipped: Vec<String>,
+    /// Folders holding nothing (an empty batch receipt folder still says a
+    /// batch was filed), by their path within the root.
+    pub empty_dirs: Vec<String>,
 }
+
+/// The name a migration binds in an empty folder, so the folder is kept.
+pub const EMPTY_FOLDER: &str = ".empty-folder";
 
 /// The operating system's own folders at a volume's root, never data: the
 /// only things a walk skips, and only at the root. Anything else, whatever
@@ -77,7 +83,9 @@ pub fn walk(root: &Path) -> Walk {
                 continue;
             }
         };
+        let mut any = false;
         for e in rd {
+            any = true;
             let e = match e {
                 Ok(e) => e,
                 Err(err) => {
@@ -122,7 +130,16 @@ pub fn walk(root: &Path) -> Walk {
                 Err(err) => w.errors.push(format!("{}: {err}", path.display())),
             }
         }
+        if !any && dir != root {
+            w.empty_dirs.push(
+                dir.strip_prefix(root)
+                    .unwrap_or(&dir)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
     }
     w.files.sort_by(|a, b| a.rel.cmp(&b.rel));
+    w.empty_dirs.sort();
     w
 }

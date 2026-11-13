@@ -207,7 +207,7 @@ pub fn write_days(dir: &Path, days: &[(&str, Option<Value>)]) -> Result<(), Stri
 }
 
 /// A partial day's stub in the index.
-fn stub(day: &str, full: &Value) -> Value {
+pub(crate) fn stub(day: &str, full: &Value) -> Value {
     let mut s = json!({ "sidecar": format!("{SIDECARS}/{day}.json"), "partial": true });
     if let Some(c) = full.get("condition") {
         s["condition"] = c.clone();
@@ -285,4 +285,249 @@ pub fn settle(dir: &Path, day: &str) -> Result<Option<Value>, String> {
         "{}: SHA-256 {got} is neither its recorded file nor its pending merge",
         file.display()
     ))
+}
+
+/// Whether `name` (within a volume) is a schema folder's manifest in the
+/// store layout, its index or a day's sidecar
+/// (`<Provider>/<DATASET>[/<SYMBOL>]/<schema>/manifest.json`, or
+/// `…/manifest.d/<day>.json`), not a batch's own manifest.
+#[must_use]
+pub fn is_store_manifest(name: &str) -> bool {
+    let parts: Vec<&str> = name.split('/').collect();
+    let n = parts.len();
+    // The schema folder's parts, by what the name ends with.
+    let folder = if n >= 2 && parts[n - 2] == SIDECARS {
+        let day = parts[n - 1].strip_suffix(".json").unwrap_or_default();
+        if crate::ingest::day_ns(day).is_none() {
+            return false;
+        }
+        &parts[..n - 2]
+    } else if parts.last() == Some(&MANIFEST) {
+        &parts[..n - 1]
+    } else {
+        return false;
+    };
+    matches!(folder.len(), 3 | 4)
+        && crate::catalog::provider_name(folder[0]).is_some()
+        && crate::catalog::is_dataset_name(folder[1])
+}
+
+/// Several copies of one day's manifest entry (each full: a partial day's
+/// with its sidecar's coverage), as `store migrate-cas` finds them on
+/// different drives, as one. The same entry is itself. Entries that differ
+/// are merged conservatively, never by choosing one: partial if any copy is,
+/// holding only what every partial copy holds (the coverages' intersection),
+/// with the worst condition (missing over degraded over none), and fields
+/// the copies disagree on (records, sha256, size, file, source) left out.
+/// Every version is kept under `conflicting`, with its source. Returns the
+/// entry, and whether the copies differed.
+#[must_use]
+pub fn merge_day(versions: &[(String, Value)]) -> (Value, bool) {
+    let mut found: Vec<(String, Value)> = Vec::new();
+    for (source, e) in versions {
+        let each: Vec<(String, Value)> = match e["conflicting"].as_array() {
+            Some(c) => c
+                .iter()
+                .map(|x| {
+                    (
+                        x["source"].as_str().unwrap_or(source).to_owned(),
+                        x["entry"].clone(),
+                    )
+                })
+                .collect(),
+            None => vec![(source.clone(), e.clone())],
+        };
+        for (s, v) in each {
+            if !found.iter().any(|(_, f)| *f == v) {
+                found.push((s, v));
+            }
+        }
+    }
+    if found.len() == 1 {
+        return (found.remove(0).1, false);
+    }
+    let entries: Vec<&Value> = found.iter().map(|(_, e)| e).collect();
+    let mut out = serde_json::Map::new();
+    for k in ["file", "size", "sha256", "records", "source"] {
+        let first = &entries[0][k];
+        if !first.is_null() && entries.iter().all(|e| e[k] == *first) {
+            out.insert(k.into(), first.clone());
+        }
+    }
+    let partial: Vec<&Value> = entries.iter().copied().filter(|e| is_partial(e)).collect();
+    if !partial.is_empty() {
+        let mut held: Option<crate::partial::Coverage> = None;
+        for e in &partial {
+            let c = crate::partial::Coverage::from_json(&e["coverage"])
+                .unwrap_or(crate::partial::Coverage { pieces: Vec::new() });
+            held = Some(match held {
+                None => c,
+                Some(h) => h.intersect(&c),
+            });
+        }
+        out.insert("partial".into(), json!(true));
+        out.insert("coverage".into(), held.map_or(Value::Null, |c| c.to_json()));
+    }
+    let rank = |c: &Value| match c["state"].as_str() {
+        Some("missing") => 3,
+        Some("unknown") => 2,
+        Some("degraded") => 1,
+        _ => 0,
+    };
+    let worst = entries
+        .iter()
+        .map(|e| &e["condition"])
+        .max_by_key(|c| rank(c))
+        .cloned();
+    let states: Vec<String> = found
+        .iter()
+        .map(|(s, e)| {
+            format!(
+                "{s}: {}",
+                e["condition"]["state"].as_str().unwrap_or("none")
+            )
+        })
+        .collect();
+    if let Some(w) = worst.filter(|w| rank(w) > 0) {
+        let mut w = w;
+        w["reason"] = json!(format!(
+            "copies of this day's entry differ ({}); the worst is kept",
+            states.join(", ")
+        ));
+        out.insert("condition".into(), w);
+    }
+    out.insert(
+        "conflicting".into(),
+        json!(
+            found
+                .iter()
+                .map(|(s, e)| json!({ "source": s, "entry": e }))
+                .collect::<Vec<_>>()
+        ),
+    );
+    (Value::Object(out), true)
+}
+
+/// Several copies of one schema folder's days (each day's full entry), as
+/// one: each day merged by [`merge_day`]. Returns the days, and those whose
+/// copies differed.
+#[must_use]
+pub fn merge_folder(
+    copies: &[(String, BTreeMap<String, Value>)],
+) -> (BTreeMap<String, Value>, Vec<String>) {
+    let mut days: BTreeMap<String, Vec<(String, Value)>> = BTreeMap::new();
+    for (source, entries) in copies {
+        for (day, e) in entries {
+            days.entry(day.clone())
+                .or_default()
+                .push((source.clone(), e.clone()));
+        }
+    }
+    let mut out = BTreeMap::new();
+    let mut differed = Vec::new();
+    for (day, versions) in days {
+        let (e, d) = merge_day(&versions);
+        if d {
+            differed.push(day.clone());
+        }
+        out.insert(day, e);
+    }
+    (out, differed)
+}
+
+/// A folder's days (full entries) as its files: the index (`manifest.json`)
+/// and each partial day's sidecar (`manifest.d/<day>.json`), as
+/// [`write_days`] lays them out.
+#[must_use]
+pub fn files_of(days: &BTreeMap<String, Value>) -> (Value, BTreeMap<String, Value>) {
+    let mut index = serde_json::Map::new();
+    let mut sidecars = BTreeMap::new();
+    for (day, e) in days {
+        if is_partial(e) {
+            let mut full = e.clone();
+            full.as_object_mut().map(|o| o.remove("pending"));
+            index.insert(day.clone(), stub(day, &full));
+            sidecars.insert(day.clone(), full);
+        } else {
+            index.insert(day.clone(), e.clone());
+        }
+    }
+    (json!({ "schema": SCHEMA, "days": index }), sidecars)
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::*;
+
+    fn cov(symbols: &[&str], start: u64, end: u64) -> Value {
+        json!({ "kind": "contracts", "symbols": symbols, "window": [start, end] })
+    }
+
+    #[test]
+    fn a_day_s_copies_merge_conservatively() {
+        // The same partial day: a condition on one copy only, and other
+        // contracts: partial, the contracts both hold, the worse condition.
+        let a = json!({ "file": "d.dbn.zst", "records": 5, "coverage": cov(&["A", "B"], 0, 10) });
+        let b = json!({ "file": "d.dbn.zst", "records": 4, "coverage": cov(&["B", "C"], 0, 10), "condition": { "state": "degraded", "reason": "x" } });
+        let (m, differed) = merge_day(&[("data".into(), a.clone()), ("tt03".into(), b)]);
+        assert!(differed);
+        assert_eq!(m["partial"], true);
+        assert_eq!(
+            crate::partial::Coverage::from_json(&m["coverage"])
+                .unwrap()
+                .symbols(),
+            ["B".to_owned()].into()
+        );
+        assert_eq!(m["condition"]["state"], "degraded");
+        assert_eq!(m["file"], "d.dbn.zst");
+        assert!(m.get("records").is_none(), "{m}");
+        assert_eq!(m["conflicting"].as_array().unwrap().len(), 2);
+        // A complete copy and a partial one: partial.
+        let (m, _) = merge_day(&[("data".into(), json!({})), ("tt03".into(), a.clone())]);
+        assert!(is_partial(&m), "{m}");
+        // The same entry twice: itself; merged again: the same, not nested.
+        assert_eq!(
+            merge_day(&[("x".into(), a.clone()), ("y".into(), a.clone())]),
+            (a.clone(), false)
+        );
+        let (m1, _) = merge_day(&[
+            (
+                "data".into(),
+                json!({ "condition": { "state": "missing" } }),
+            ),
+            ("tt03".into(), json!({})),
+        ]);
+        let (m2, _) = merge_day(&[
+            ("bound".into(), m1.clone()),
+            (
+                "data".into(),
+                json!({ "condition": { "state": "missing" } }),
+            ),
+        ]);
+        assert_eq!(m1, m2);
+        assert_eq!(m1["condition"]["state"], "missing");
+    }
+
+    #[test]
+    fn a_folder_s_days_lay_out_as_its_files() {
+        let mut d = BTreeMap::new();
+        d.insert(
+            "2026-10-01".to_owned(),
+            json!({ "condition": { "state": "degraded" } }),
+        );
+        d.insert(
+            "2026-10-02".to_owned(),
+            json!({ "file": "x", "coverage": cov(&["A"], 0, 1) }),
+        );
+        let (index, sidecars) = files_of(&d);
+        assert_eq!(
+            index["days"]["2026-10-01"]["condition"]["state"],
+            "degraded"
+        );
+        assert_eq!(
+            index["days"]["2026-10-02"]["sidecar"],
+            "manifest.d/2026-10-02.json"
+        );
+        assert_eq!(sidecars.keys().collect::<Vec<_>>(), ["2026-10-02"]);
+    }
 }
