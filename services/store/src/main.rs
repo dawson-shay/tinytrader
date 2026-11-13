@@ -3972,6 +3972,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Re-review of #160 (2, 4): the same partial day on two drives, a
+    /// condition on one only and other contracts in each, migrated: the day
+    /// reads partial, holding only the contracts both hold, with the
+    /// condition, and the volume stays sound (no 500, not missing).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_partial_day_on_two_drives_merges_conservatively() {
+        use crate::partial::tests::{C1, C2};
+        let dir = scratch("cas-partial-twice");
+        let (a, b, cas) = (dir.join("a"), dir.join("b"), dir.join("cas"));
+        let folder = "Databento/OPRA.PILLAR/SPY.OPT/cbbo-1m";
+        for (root, symbols, condition) in [
+            (&a, json!([C1, C2]), Value::Null),
+            (
+                &b,
+                json!([C2]),
+                json!({ "state": "degraded", "reason": "x" }),
+            ),
+        ] {
+            let f = root.join(folder);
+            std::fs::create_dir_all(&f).unwrap();
+            std::fs::write(f.join("2026-10-02.dbn.zst"), b"the same day").unwrap();
+            let mut e = json!({ "file": "2026-10-02.dbn.zst", "coverage": { "kind": "contracts", "symbols": symbols, "window": [0, 1] } });
+            if !condition.is_null() {
+                e["condition"] = condition;
+            }
+            manifest::set_entry(&f, "2026-10-02", Some(e)).unwrap();
+        }
+        let sources = [
+            migrate::source(&format!("a={}", a.display())).unwrap(),
+            migrate::source(&format!("b={}", b.display())).unwrap(),
+        ];
+        let (p, _) = migrate::run(&sources, Some((&cas, "cas-1")), true, &mut |_| {}).unwrap();
+        assert_eq!(
+            p["manifests"]["day_conflicts"].as_array().unwrap().len(),
+            1,
+            "the plan counts it: {p}"
+        );
+        let (r, _) = migrate::run(&sources, Some((&cas, "cas-1")), false, &mut |_| {}).unwrap();
+        assert!(
+            r["conflicts"].as_array().unwrap().is_empty(),
+            "the day file is the same: {r}"
+        );
+        let s = store(&[("cas", &cas)], &dir.join("state.json"));
+        scanned(&s).await;
+        let addr = serve_plain(&s).await;
+        let (code, c) = get(&addr, COVERAGE.replace("2026-10-09", "2026-10-03").as_str()).await;
+        assert_eq!(code, 200, "{c}");
+        assert_eq!(c["missing_volumes"], json!([]), "{c}");
+        let day = &c["days"][0];
+        assert_eq!(
+            (day["day"].clone(), day["kind"].clone()),
+            (json!("2026-10-02"), json!("partial")),
+            "{c}"
+        );
+        assert_eq!(
+            day["coverage"]["symbols"],
+            json!([C2]),
+            "only what both hold: {c}"
+        );
+        assert_eq!(day["condition"]["state"], "degraded", "{c}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn files_are_listed_from_the_scan_and_refused_while_away() {
         let dir = scratch("files");

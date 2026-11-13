@@ -173,6 +173,31 @@ fn check(a: &Args) -> (Value, i32) {
         Some((first, rest)) => format!("{}/{rest}", first.to_ascii_lowercase()),
         None => n.to_owned(),
     };
+    // Built once (a lookup per file, not a scan of every name): each name,
+    // first folder folded, with what's bound there; and what was merged into
+    // each name (a manifest kept as it was).
+    let mut bound_at: std::collections::HashMap<String, Vec<(String, u64)>> =
+        std::collections::HashMap::new();
+    let mut merged_into: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    let mut pending_any: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_, i) in &indexes {
+        for (n, e) in &i.names {
+            bound_at
+                .entry(fold(n))
+                .or_default()
+                .push((e.sha256.clone(), e.size));
+        }
+        for (sha, w) in &i.pending {
+            pending_any.insert(sha.clone());
+            if let Some(n) = w
+                .strip_prefix("merged into ")
+                .and_then(|r| r.split(" (from ").next())
+            {
+                merged_into.entry(fold(n)).or_default().insert(sha.clone());
+            }
+        }
+    }
     // Each source, walked again and hashed: every file must be held.
     let mut against = Vec::new();
     for (src, root) in &a.against {
@@ -197,26 +222,13 @@ fn check(a: &Args) -> (Value, i32) {
                 }
             };
             let want = fold(&file.rel);
-            let bound = indexes.iter().any(|(_, i)| {
-                i.names
-                    .get(&file.rel)
-                    .is_some_and(|e| e.sha256 == sha && e.size == file.size)
-                    || i.names
-                        .iter()
-                        .any(|(n, e)| e.sha256 == sha && e.size == file.size && fold(n) == want)
-            });
-            // A manifest kept as it was, merged by day into the folder's
-            // manifest (store migrate-cas): held.
-            let merged = indexes.iter().any(|(_, i)| {
-                i.pending.get(&sha).is_some_and(|w| {
-                    w.strip_prefix("merged into ")
-                        .and_then(|r| r.split(" (from ").next())
-                        .is_some_and(|n| fold(n) == want)
-                })
-            });
+            let bound = bound_at
+                .get(&want)
+                .is_some_and(|v| v.iter().any(|(h, sz)| *h == sha && *sz == file.size));
+            let merged = merged_into.get(&want).is_some_and(|m| m.contains(&sha));
             if bound || merged {
                 held += 1;
-            } else if indexes.iter().any(|(_, i)| i.pending.contains_key(&sha)) {
+            } else if pending_any.contains(&sha) {
                 pending += 1;
                 f(
                     "S6",
@@ -240,10 +252,7 @@ fn check(a: &Args) -> (Value, i32) {
         // Every empty folder kept by its marker.
         for d in &w.empty_dirs {
             let want = fold(&format!("{d}/{}", tinytrader_cas::tree::EMPTY_FOLDER));
-            if !indexes
-                .iter()
-                .any(|(_, i)| i.names.keys().any(|n| fold(n) == want))
-            {
+            if !bound_at.contains_key(&want) {
                 f(
                     "S6",
                     src,

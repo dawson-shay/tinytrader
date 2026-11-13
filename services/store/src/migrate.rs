@@ -61,20 +61,6 @@ fn canonical(rel: &str) -> String {
     }
 }
 
-/// Whether `name` is a schema folder's manifest in the store layout
-/// (`<Provider>/<DATASET>[/<SYMBOL>]/<schema>/manifest.json`), not a batch's
-/// own (a provider's download folder, provenance).
-fn store_manifest(name: &str) -> bool {
-    let parts: Vec<&str> = name.split('/').collect();
-    let (pdir, dataset, last) = match parts.as_slice() {
-        [p, d, _, _, f] | [p, d, _, f] => (*p, *d, *f),
-        _ => return false,
-    };
-    last == crate::manifest::MANIFEST
-        && crate::catalog::provider_name(pdir).is_some()
-        && crate::catalog::is_dataset_name(dataset)
-}
-
 /// The extension an object keeps: the file's, from its first dot (so
 /// `2026-10-02.dbn.zst` keeps `dbn.zst`), or `bin`.
 fn ext_of(rel: &str) -> String {
@@ -216,6 +202,165 @@ pub fn run(
     let (mut conflicts, mut damaged, mut unrecorded) = (Vec::new(), Vec::new(), 0u64);
     let (mut duplicates, mut copied_bytes, mut kept_pending) = (0u64, 0u64, 0u64);
     let (mut manifest_merges, mut manifest_conflicts) = (Vec::new(), Vec::new());
+    // Schema folders whose manifest is on more than one drive (or already
+    // bound): their index and sidecars merged by day, before the files are
+    // copied (review of #160: Data and tt03 share folders, so this is the
+    // expected case, and a day that differs is merged conservatively, never
+    // a conflict that fails the volume). The names written, with their hash.
+    let mut merged_names: BTreeMap<String, String> = BTreeMap::new();
+    for (name, copies) in names.iter().filter(|(n, _)| {
+        crate::manifest::is_store_manifest(n)
+            && n.ends_with(&format!("/{}", crate::manifest::MANIFEST))
+    }) {
+        let folder = name
+            .trim_end_matches(&format!("/{}", crate::manifest::MANIFEST))
+            .to_owned();
+        let side = |day: &str| format!("{folder}/{}/{day}.json", crate::manifest::SIDECARS);
+        let current = index.names.get(name);
+        if copies.len() + usize::from(current.is_some()) < 2 {
+            continue;
+        }
+        // Each drive's days, full: a partial day's from its sidecar there.
+        let read =
+            |p: &Path| -> Option<Value> { serde_json::from_slice(&std::fs::read(p).ok()?).ok() };
+        let full = |source: &str,
+                    m: &Value,
+                    sidecar: &dyn Fn(&str) -> Option<Value>|
+         -> Result<BTreeMap<String, Value>, String> {
+            let mut out = BTreeMap::new();
+            for (day, e) in m["days"]
+                .as_object()
+                .ok_or_else(|| format!("{name} on {source}: not a manifest that can be read"))?
+            {
+                let stubbed = e["sidecar"].is_string()
+                    || (e["partial"] == true && e.get("coverage").is_none());
+                let entry = if stubbed {
+                    sidecar(day).ok_or_else(|| {
+                        format!(
+                            "{} on {source}: its partial day's entry can't be read",
+                            side(day)
+                        )
+                    })?
+                } else {
+                    e.clone()
+                };
+                out.insert(day.clone(), entry);
+            }
+            Ok(out)
+        };
+        let mut all: Vec<(String, BTreeMap<String, Value>)> = Vec::new();
+        let mut failed = false;
+        if let (Some(b), Some(v)) = (current, &vol) {
+            let bound = |n: &str| -> Option<Value> {
+                let e = index.names.get(n)?;
+                read(&v.object(&e.sha256, &e.ext)?)
+            };
+            match bound(name)
+                .ok_or_else(|| format!("{name}: its bound version {} can't be read", b.sha256))
+                .and_then(|m| full("bound", &m, &|d| bound(&side(d))))
+            {
+                Ok(d) => all.push(("bound".into(), d)),
+                Err(e) => {
+                    damaged.push(e);
+                    failed = true;
+                }
+            }
+        }
+        for c in copies {
+            let dir = c
+                .found
+                .path
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            let got = read(&c.found.path)
+                .ok_or_else(|| {
+                    format!(
+                        "{name} on {}: not a manifest that can be read",
+                        c.source.name
+                    )
+                })
+                .and_then(|m| {
+                    full(&c.source.name, &m, &|d| {
+                        read(
+                            &dir.join(crate::manifest::SIDECARS)
+                                .join(format!("{d}.json")),
+                        )
+                    })
+                });
+            match got {
+                Ok(d) => all.push((c.source.name.clone(), d)),
+                Err(e) => {
+                    damaged.push(e);
+                    failed = true;
+                }
+            }
+        }
+        if failed {
+            continue;
+        }
+        let (days, differed) = crate::manifest::merge_folder(&all);
+        // Listed only when the copies held different days or entries.
+        if all.iter().any(|(_, d)| *d != all[0].1) {
+            manifest_merges.push(
+                json!({ "name": name, "copies": all.iter().map(|(s, _)| s).collect::<Vec<_>>() }),
+            );
+        }
+        manifest_conflicts.extend(differed.iter().map(|d| json!({ "name": name, "day": d })));
+        let (index_v, sidecars) = crate::manifest::files_of(&days);
+        let mut files: Vec<(String, Value)> =
+            sidecars.into_iter().map(|(d, e)| (side(&d), e)).collect();
+        files.push((name.clone(), index_v));
+        for (n, content) in files {
+            let bytes = serde_json::to_vec_pretty(&content).unwrap_or_default();
+            let cur = index.names.get(&n);
+            let same = cur
+                .and_then(|e| vol.as_ref()?.object(&e.sha256, &e.ext))
+                .and_then(|p| read(&p))
+                .is_some_and(|b| b == content);
+            if plan {
+                if !same {
+                    to_read += 1;
+                }
+                merged_names.insert(n, String::new());
+                continue;
+            }
+            let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
+                continue;
+            };
+            if same {
+                merged_names.insert(n, cur.map(|e| e.sha256.clone()).unwrap_or_default());
+                continue;
+            }
+            match v.put(&bytes[..], "json", None) {
+                Ok(o) => {
+                    log.append(&Event::Bind {
+                        name: n.clone(),
+                        version: cur.map_or(1, |b| b.version + 1),
+                        sha256: o.sha256.clone(),
+                        size: o.size,
+                        ext: "json".into(),
+                        kind: "manifest".into(),
+                        source: format!(
+                            "merged from {}",
+                            all.iter()
+                                .map(|(s, _)| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                        previous: cur.map(|b| b.sha256.clone()),
+                        writer: WRITER.into(),
+                        at: now(),
+                    })?;
+                    bound += 1;
+                    merged_names.insert(n, o.sha256);
+                }
+                Err(e) => {
+                    damaged.push(format!("{n}: the merged manifest couldn't be written: {e}"))
+                }
+            }
+        }
+    }
     for (name, copies) in &names {
         let k = kind(name);
         let ext = ext_of(name);
@@ -251,122 +396,51 @@ pub fn run(
             let held = vol.as_ref().is_some_and(|v| v.object(sha, &ext).is_some());
             (same && held).then(|| sha.to_owned())
         };
-        // A schema folder's manifest, on several drives: merged by day
-        // (review of #160: Data and tt03 share folders, each with its own
-        // manifest, so differing copies are expected). Each copy is kept
-        // as it was, "merged into" the name.
-        if store_manifest(name) {
-            let mut parsed = Vec::new();
-            for c in copies {
-                match std::fs::read(&c.found.path)
-                    .ok()
-                    .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-                {
-                    Some(m) if m["days"].is_object() => parsed.push((c.source.name.clone(), m)),
-                    _ => damaged.push(format!(
-                        "{name} on {}: not a manifest that can be read; kept, not merged",
-                        c.source.name
-                    )),
-                }
+        // A folder's manifest files merged above: each drive's copy kept as
+        // it was, "merged into" the merged version.
+        if let Some(merged_sha) = merged_names.get(name) {
+            if plan {
+                continue;
             }
-            if parsed.len() == copies.len() {
-                let bound_m: Option<Value> = current
-                    .and_then(|b| vol.as_ref()?.object(&b.sha256, &b.ext))
-                    .and_then(|p| std::fs::read(p).ok())
-                    .and_then(|b| serde_json::from_slice(&b).ok());
-                let mut all = parsed.clone();
-                if let Some(b) = &bound_m {
-                    all.insert(0, ("bound".to_owned(), b.clone()));
-                }
-                let (merged, day_conflicts) = crate::manifest::merge_indexes(&all);
-                let distinct: std::collections::BTreeSet<String> =
-                    all.iter().map(|(_, m)| m.to_string()).collect();
-                if distinct.len() > 1 {
-                    manifest_merges.push(json!({ "name": name, "copies": all.iter().map(|(s, _)| s).collect::<Vec<_>>() }));
-                }
-                manifest_conflicts.extend(
-                    day_conflicts
-                        .iter()
-                        .map(|d| json!({ "name": name, "day": d })),
-                );
-                let changes = bound_m.as_ref() != Some(&merged);
-                if plan {
-                    if changes {
-                        to_read += 1;
-                        to_read_bytes += copies.iter().map(|c| c.found.size).sum::<u64>();
-                    } else {
-                        already += 1;
-                    }
-                    continue;
-                }
-                let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
-                    continue;
-                };
-                let bytes = serde_json::to_vec_pretty(&merged).unwrap_or_default();
-                let merged_sha = if changes {
-                    match v.put(&bytes[..], "json", None) {
-                        Ok(o) => {
-                            log.append(&Event::Bind {
-                                name: name.clone(),
-                                version: current.map_or(1, |b| b.version + 1),
+            let (Some(v), Some(log)) = (&vol, log.as_mut()) else {
+                continue;
+            };
+            // Bound already as it is on every drive, read before: there.
+            if current.is_some_and(|b| b.sha256 == *merged_sha)
+                && copies
+                    .iter()
+                    .all(|c| known(c).as_deref() == Some(merged_sha.as_str()))
+            {
+                already += 1;
+                continue;
+            }
+            for c in copies {
+                match v.put_file(&c.found.path, &ext, None) {
+                    Ok(o) => {
+                        if !o.existed {
+                            copied_bytes += o.size;
+                        }
+                        if o.sha256 != *merged_sha && !index.pending.contains_key(&o.sha256) {
+                            log.append(&Event::Pending {
                                 sha256: o.sha256.clone(),
-                                size: o.size,
-                                ext: "json".into(),
-                                kind: k.to_owned(),
-                                source: format!(
-                                    "merged from {}",
-                                    copies
-                                        .iter()
-                                        .map(|c| format!("{}:{name}", c.source.name))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ),
-                                previous: current.map(|b| b.sha256.clone()),
+                                ext: ext.clone(),
+                                for_: format!("merged into {name} (from {})", c.source.name),
                                 writer: WRITER.into(),
                                 at: now(),
                             })?;
-                            bound += 1;
-                            o.sha256
                         }
-                        Err(e) => {
-                            damaged.push(format!(
-                                "{name}: the merged manifest couldn't be written: {e}"
-                            ));
-                            continue;
-                        }
+                        receipts
+                            .get_mut(&c.source.name)
+                            .expect("each source has a receipt")["files"][&c.found.rel] = json!({
+                            "size": c.found.size, "mtime_ns": c.found.mtime_ns.to_string(),
+                            "dev": c.found.dev, "ino": c.found.ino, "ctime_ns": c.found.ctime_ns.to_string(),
+                            "sha256": o.sha256, "outcome": if o.sha256 == *merged_sha { "bound" } else { "merged" },
+                        });
                     }
-                } else {
-                    already += 1;
-                    current.map(|b| b.sha256.clone()).unwrap_or_default()
-                };
-                for c in copies {
-                    match v.put_file(&c.found.path, "json", None) {
-                        Ok(o) => {
-                            if !o.existed {
-                                copied_bytes += o.size;
-                            }
-                            if o.sha256 != merged_sha && !index.pending.contains_key(&o.sha256) {
-                                log.append(&Event::Pending {
-                                    sha256: o.sha256.clone(),
-                                    ext: "json".into(),
-                                    for_: format!("merged into {name} (from {})", c.source.name),
-                                    writer: WRITER.into(),
-                                    at: now(),
-                                })?;
-                            }
-                            receipts
-                                .get_mut(&c.source.name)
-                                .expect("each source has a receipt")["files"][&c.found.rel] = json!({
-                                "size": c.found.size, "mtime_ns": c.found.mtime_ns.to_string(),
-                                "dev": c.found.dev, "ino": c.found.ino, "ctime_ns": c.found.ctime_ns.to_string(),
-                                "sha256": o.sha256, "outcome": if o.sha256 == merged_sha { "bound" } else { "merged" },
-                            });
-                        }
-                        Err(e) => damaged.push(format!("{name} on {}: {e}", c.source.name)),
-                    }
+                    Err(e) => damaged.push(format!("{name} on {}: {e}", c.source.name)),
                 }
-                continue;
             }
+            continue;
         }
         if plan {
             let sizes: std::collections::BTreeSet<u64> =
@@ -874,7 +948,10 @@ mod tests {
         let m: Value =
             serde_json::from_slice(&fs::read(v.object(&e.sha256, &e.ext).unwrap()).unwrap())
                 .unwrap();
-        assert_eq!(m["days"]["2026-10-01"]["condition"]["state"], "unknown");
+        assert_eq!(
+            m["days"]["2026-10-01"]["condition"]["state"], "missing",
+            "the worse of degraded and missing"
+        );
         assert_eq!(m["days"]["2026-10-02"]["condition"]["state"], "degraded");
         assert_eq!(
             i.pending

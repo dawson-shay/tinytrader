@@ -295,6 +295,20 @@ has "$W/pair-coverage-before.json" '(.days | length) == 2' "two days in the tree
 expect 0 "$W/pair-against-b.json" "$FSCK_BIN" --json --min-copies 1 --against b="$PB" "$W/nas/pair"
 has "$W/pair-against-b.json" '.against[0].bound == .against[0].files' "every file of the lowercase drive held, its manifest merged"
 
+step "an object gone from the migrated volume: the store reports the volume missing (downloads hold), every scan"
+cp -R "$NAS" "$W/nas/gone"
+G=$(find "$W/nas/gone/cas/objects" -name "$SEVENTH.*" | head -1)
+[ -n "$G" ] || fail "no object of the seventh to remove"
+[ -n "$G" ] && { chmod u+w "$G"; rm -f "$G"; }
+start_store "gone=$W/nas/gone:ro:anydir"
+curl -s "$URL/batches/databento" >"$W/gone-batches-1.json"
+sleep 2
+curl -s "$URL/batches/databento" >"$W/gone-batches-2.json"
+stop_store
+has "$W/gone-batches-1.json" '.missing_volumes == ["gone"]' "the volume missing on the first scan"
+has "$W/gone-batches-2.json" '.missing_volumes == ["gone"]' "and on later scans"
+rm -rf "$W/nas/gone"
+
 step "a second copy: Data migrated to another volume; both checked together, two copies"
 expect 0 "$W/migrate-second.json" "$STORE_BIN" migrate-cas --to "$NAS2" --id second --from data="$D"
 expect 1 "$W/fsck-two.json" "$FSCK_BIN" --json --min-copies 2 "$NAS" "$NAS2"

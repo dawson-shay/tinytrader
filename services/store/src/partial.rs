@@ -155,6 +155,28 @@ impl Coverage {
         Self::of(self.pieces.iter().chain(&other.pieces).cloned().collect())
     }
 
+    /// What both hold: each pair of pieces' common contracts over their
+    /// common window.
+    #[must_use]
+    pub fn intersect(&self, other: &Self) -> Self {
+        let mut pieces = Vec::new();
+        for a in &self.pieces {
+            for b in &other.pieces {
+                let (start, end) = (a.start.max(b.start), a.end.min(b.end));
+                let symbols: BTreeSet<String> =
+                    a.symbols.intersection(&b.symbols).cloned().collect();
+                if start < end && !symbols.is_empty() {
+                    pieces.push(Piece {
+                        symbols,
+                        start,
+                        end,
+                    });
+                }
+            }
+        }
+        Self::of(pieces)
+    }
+
     /// The contracts held in both, over hours that overlap.
     #[must_use]
     pub fn overlap(&self, other: &Self) -> BTreeSet<String> {
