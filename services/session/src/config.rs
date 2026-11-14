@@ -182,6 +182,11 @@ pub struct Venue {
     /// The most futures contracts one opening order may trade (1 by default).
     #[serde(default)]
     pub max_future_qty: Option<u32>,
+    /// The gateway's `--allow-calendars`: covered calendars sized at their debit.
+    /// Its simulator pairs them only with `buying_power = "defined_risk_calendars"`
+    /// in `[venues.sim.venue_rules]`.
+    #[serde(default)]
+    pub allow_calendars: bool,
     /// The simulator's profile: the `--sim-script` keys (latency, fees, size cap,
     /// calendar, account).
     #[serde(default)]

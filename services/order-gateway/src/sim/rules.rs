@@ -22,6 +22,19 @@
 //!   approximates a broker's options buying power for defined-risk spreads, and
 //!   does not model margin on naked positions. Working orders count as if filled:
 //!   their legs in the positions, their debits as paid.
+//! - **Calendars paired** (`buying_power = "defined_risk_calendars"`): as
+//!   `defined_risk`, and a short option covered by a long of the same root, type and
+//!   strike that expires later (a calendar) is paired with it, so the pair needs
+//!   nothing beyond its debit, as the gateway's `--allow-calendars` sizes it. Each
+//!   long covers at most its own quantity, and a European root is never paired. The
+//!   requirement is the lower of the two ways, paired and by expiry alone, so
+//!   pairing never raises it.
+//!   - It needs `liquidate_same_day_shorts_at`: a paired short in a physically
+//!     settled root is bought back on its last day, before it can be assigned into
+//!     shares the debit didn't pay for. A short the rule can't buy back (no fresh
+//!     ask) still settles at the close, and early assignment isn't modelled (as
+//!     for every short).
+//!   - `defined_risk` keeps sizing by expiry alone, unchanged under this model.
 use super::{CENT, SimBroker};
 use crate::intent::Intent;
 use crate::safety::{et_day, et_ns, hhmm};
@@ -30,6 +43,9 @@ use std::collections::BTreeMap;
 /// Option legs `(call, strike, signed quantity)` by root and expiry.
 type Groups = BTreeMap<(String, i64), Vec<(bool, i64, i64)>>;
 
+/// Option symbols `(expiry, symbol)` by root, type (call) and strike.
+type Lines<'a> = BTreeMap<(&'a str, bool, i64), Vec<(i64, &'a str)>>;
+
 /// The rules of a profile.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct VenueRules {
@@ -37,6 +53,8 @@ pub(crate) struct VenueRules {
     pub(crate) no_same_day_opening_after: Option<i64>,
     pub(crate) liquidate_at: Option<i64>,
     pub(crate) defined_risk: bool,
+    /// `defined_risk_calendars`: calendars paired (with `defined_risk`).
+    pub(crate) calendars: bool,
 }
 
 impl VenueRules {
@@ -69,6 +87,68 @@ fn worst(legs: &[(bool, i64, i64)]) -> Option<i128> {
     let mut points: Vec<i64> = legs.iter().map(|l| l.1).collect();
     points.push(0);
     points.iter().map(|s| payoff(*s)).min().or(Some(0))
+}
+
+/// The worst loss at expiry of option positions (symbol, signed quantity), summed over
+/// expiries; the root of a position with no bound, as an error.
+fn requirement(all: &BTreeMap<&str, i64>) -> Result<i128, String> {
+    let mut groups: Groups = BTreeMap::new();
+    for (symbol, &q) in all {
+        if q == 0 {
+            continue;
+        }
+        if let (Some((root, call, strike)), Some((_, exp))) =
+            (super::expiry::contract(symbol), crate::intent::occ(symbol))
+        {
+            groups
+                .entry((root.to_owned(), exp))
+                .or_default()
+                .push((call, strike, q));
+        }
+    }
+    let mut required = 0_i128;
+    for ((root, _), legs) in &groups {
+        required += (-worst(legs).ok_or_else(|| root.clone())?).max(0);
+    }
+    Ok(required)
+}
+
+/// The positions with each calendar taken out: a short covered by longs of the same root,
+/// type and strike that expire later, each long covering at most its own quantity. Such a
+/// pair loses at most what was paid for it (an American long can be exercised to meet the
+/// short), so it needs nothing more. Shorts are covered latest first, as they have the
+/// fewest longs after them. European roots are left as they are.
+fn paired(mut all: BTreeMap<&str, i64>) -> BTreeMap<&str, i64> {
+    let mut lines: Lines = BTreeMap::new();
+    for (&symbol, _) in all.iter().filter(|(_, q)| **q != 0) {
+        if let (Some((root, call, strike)), Some((_, exp))) =
+            (super::expiry::contract(symbol), crate::intent::occ(symbol))
+            && !crate::intent::EUROPEAN_ROOTS.contains(&root)
+        {
+            lines
+                .entry((root, call, strike))
+                .or_default()
+                .push((exp, symbol));
+        }
+    }
+    for mut line in lines.into_values() {
+        line.sort_unstable();
+        for i in (0..line.len()).rev() {
+            for j in i + 1..line.len() {
+                let (short, long) = (all[line[i].1], all[line[j].1]);
+                if short >= 0 {
+                    break;
+                }
+                if long <= 0 || line[j].0 <= line[i].0 {
+                    continue;
+                }
+                let n = (-short).min(long);
+                *all.entry(line[i].1).or_default() += n;
+                *all.entry(line[j].1).or_default() -= n;
+            }
+        }
+    }
+    all
 }
 
 impl SimBroker {
@@ -151,27 +231,24 @@ impl SimBroker {
     /// The worst loss at expiry of the option positions, with `extra` added, summed
     /// over expiries; the root of a position with no bound, as an error.
     fn required(&self, extra: &[(String, i64)]) -> Result<i128, String> {
-        let mut groups: Groups = BTreeMap::new();
-        let all = self
+        let mut all: BTreeMap<&str, i64> = BTreeMap::new();
+        for (s, q) in self
             .pos
             .iter()
             .map(|(s, p)| (s.as_str(), p.0))
-            .chain(extra.iter().map(|(s, q)| (s.as_str(), *q)));
-        for (symbol, q) in all {
-            if let (Some((root, call, strike)), Some((_, exp))) =
-                (super::expiry::contract(symbol), crate::intent::occ(symbol))
-            {
-                groups
-                    .entry((root.to_owned(), exp))
-                    .or_default()
-                    .push((call, strike, q));
-            }
+            .chain(extra.iter().map(|(s, q)| (s.as_str(), *q)))
+        {
+            *all.entry(s).or_default() += q;
         }
-        let mut required = 0_i128;
-        for ((root, _), legs) in &groups {
-            required += (-worst(legs).ok_or_else(|| root.clone())?).max(0);
+        let by_expiry = requirement(&all);
+        if !self.s.venue.calendars {
+            return by_expiry;
         }
-        Ok(required)
+        match (by_expiry, requirement(&paired(all))) {
+            (Ok(a), Ok(b)) => Ok(a.min(b)),
+            (Ok(r), Err(_)) | (Err(_), Ok(r)) => Ok(r),
+            (Err(root), Err(_)) => Err(root),
+        }
     }
 
     /// Cash less the worst expiry loss of the option positions held.
@@ -261,10 +338,10 @@ impl SimBroker {
             .opt_s("liquidate_same_day_shorts_at", t(r.liquidate_at).as_deref())
             .s(
                 "buying_power",
-                if r.defined_risk {
-                    "defined_risk"
-                } else {
-                    "cash"
+                match (r.defined_risk, r.calendars) {
+                    (true, true) => "defined_risk_calendars",
+                    (true, false) => "defined_risk",
+                    _ => "cash",
                 },
             )
             .done()
@@ -341,7 +418,8 @@ impl SimBroker {
 
 #[cfg(test)]
 mod tests {
-    use super::worst;
+    use super::{paired, requirement, worst};
+    use std::collections::BTreeMap;
 
     const D: i64 = 1_000_000_000;
 
@@ -363,6 +441,82 @@ mod tests {
         // A naked short call has no bound; a long call can't lose at expiry.
         assert_eq!(worst(&[(true, 590 * D, -1)]), None);
         assert_eq!(worst(&[(true, 590 * D, 1)]), Some(0));
+    }
+
+    /// The requirement of positions, the lower of paired and by expiry alone, as
+    /// `SimBroker::required` takes it.
+    fn need(pos: &[(&'static str, i64)]) -> Result<i128, String> {
+        let all: BTreeMap<&str, i64> = pos.iter().copied().collect();
+        match (requirement(&all), requirement(&paired(all))) {
+            (Ok(a), Ok(b)) => Ok(a.min(b)),
+            (Ok(r), Err(_)) | (Err(_), Ok(r)) => Ok(r),
+            (Err(root), Err(_)) => Err(root),
+        }
+    }
+
+    #[test]
+    fn a_calendar_needs_only_its_debit() {
+        // A double calendar: 570 puts and 580 calls, sold on 5 Oct and bought on 12 Oct.
+        let double = [
+            ("SPY261005P00570000", -2),
+            ("SPY261012P00570000", 2),
+            ("SPY261005C00580000", -2),
+            ("SPY261012C00580000", 2),
+        ];
+        assert_eq!(need(&double), Ok(0));
+        // By expiry alone the front call is naked: no bound.
+        let all: BTreeMap<&str, i64> = double.iter().copied().collect();
+        assert_eq!(requirement(&all), Err("SPY".into()));
+        // One back for two fronts leaves a naked call.
+        assert_eq!(
+            need(&[("SPY261005C00580000", -2), ("SPY261012C00580000", 1)]),
+            Err("SPY".into())
+        );
+        // A later long covers one of two shorts, not both.
+        assert_eq!(
+            need(&[
+                ("SPY261005C00580000", -1),
+                ("SPY261012C00580000", -1),
+                ("SPY261019C00580000", 1),
+            ]),
+            Err("SPY".into())
+        );
+        // A diagonal is not paired: the front put is held to its strike.
+        assert_eq!(
+            need(&[("SPY261005P00570000", -1), ("SPY261012P00565000", 1)]),
+            Ok(570 * 100 * i128::from(D))
+        );
+        // Nor is a European root.
+        assert_eq!(
+            need(&[("SPXW261016C05800000", -1), ("SPXW261023C05800000", 1)]),
+            Err("SPXW".into())
+        );
+    }
+
+    #[test]
+    fn pairing_never_raises_the_requirement() {
+        // A 570/565 put debit spread on 12 Oct, and a 570 put sold on 5 Oct. Paired, the
+        // 12 Oct 570 put covers the front and leaves the 565 sold alone: 565 x 100. By
+        // expiry the front put needs 570 x 100 and the spread nothing; the lower is taken.
+        let pos = [
+            ("SPY261005P00570000", -1),
+            ("SPY261012P00570000", 1),
+            ("SPY261012P00565000", -1),
+        ];
+        let all: BTreeMap<&str, i64> = pos.iter().copied().collect();
+        assert_eq!(requirement(&all), Ok(570 * 100 * i128::from(D)));
+        assert_eq!(need(&pos), Ok(565 * 100 * i128::from(D)));
+        // A bear call spread on 12 Oct beside a front short call: pairing the front with
+        // the spread's long leaves the 575 naked, so the other way is kept.
+        let calls = [
+            ("SPY261005C00580000", -1),
+            ("SPY261005C00575000", 1),
+            ("SPY261012C00580000", 1),
+            ("SPY261012C00575000", -1),
+        ];
+        let all: BTreeMap<&str, i64> = calls.iter().copied().collect();
+        assert_eq!(requirement(&all), Ok(5 * 100 * i128::from(D)));
+        assert_eq!(need(&calls), Ok(5 * 100 * i128::from(D)));
     }
 
     /// A rule's time keeps its distance from the close: on a 13:00 early close,

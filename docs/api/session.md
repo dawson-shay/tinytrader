@@ -54,6 +54,8 @@ max_future_qty = 1                    # contracts per opening futures order
 max_notional = 2500                   # dollars per order
 max_open = 4
 allow_short = false
+allow_calendars = false               # covered calendars at their debit (the gateway's --allow-calendars);
+                                      # pair with venue_rules buying_power = "defined_risk_calendars"
 [venues.sim]                          # the simulator's profile: order-gateway.md §10's script keys
 latency_ms = 5
 fee_per_contract = "0.65"

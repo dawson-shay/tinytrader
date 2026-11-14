@@ -5,7 +5,7 @@ use crate::broker::{
     Broker, BrokerError, BrokerOrder, CancelResult, FlattenResult, OPEN_ORDERS_LIMIT, OrderRef,
     OrderUpdate, SubmitResult, Update, normalize_event, status_event, terminal,
 };
-use crate::intent::{Intent, hex, max_loss, occ};
+use crate::intent::{Intent, hex, max_loss_with, occ};
 use crate::journal::Journal;
 use crate::protocol::{
     Invalid, KillLevel, Obj, Op, arr, error_line, invalid, invalid_detail, quote, request_error,
@@ -1777,7 +1777,7 @@ impl<B: Broker> Session<B> {
         }
         // An opening intent is capped at what it can lose; a close is never checked.
         let loss = if opening && !intent.is_future() {
-            max_loss(intent).map(|m| m.cents)
+            max_loss_with(intent, p.allow_calendars).map(|m| m.cents)
         } else {
             Ok(0)
         };

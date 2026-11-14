@@ -397,11 +397,25 @@ impl Script {
                 r.opt_string("liquidate_same_day_shorts_at")?,
                 "venue_rules.liquidate_same_day_shorts_at",
             )?;
-            s.venue.defined_risk = match r.opt_string("buying_power")?.as_deref() {
-                None | Some("cash") => false,
-                Some("defined_risk") => true,
-                Some(_) => return Err(invalid("venue_rules.buying_power", "cash or defined_risk")),
-            };
+            (s.venue.defined_risk, s.venue.calendars) =
+                match r.opt_string("buying_power")?.as_deref() {
+                    None | Some("cash") => (false, false),
+                    Some("defined_risk") => (true, false),
+                    Some("defined_risk_calendars") => (true, true),
+                    Some(_) => {
+                        return Err(invalid(
+                            "venue_rules.buying_power",
+                            "cash, defined_risk or defined_risk_calendars",
+                        ));
+                    }
+                };
+            // A paired short must be closed before it can be assigned.
+            if s.venue.calendars && s.venue.liquidate_at.is_none() {
+                return Err(invalid(
+                    "venue_rules.buying_power",
+                    "defined_risk_calendars only with liquidate_same_day_shorts_at, so a paired short is bought back before it can be assigned",
+                ));
+            }
             r.finish()?;
         }
         if let Some(q) = f.take("queue") {

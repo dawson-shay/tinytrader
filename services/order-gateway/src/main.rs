@@ -19,7 +19,7 @@ const HELP: &str = "order-gateway --account NAME --broker sim|alpaca-paper|alpac
     --client NAME,ROLE,PREFIX,TOKEN [--client ...]      (ROLE: trade|observe|admin)
     [--environment paper] [--credentials-file FILE | --credentials env] [--listen-any] [--allow-live]
     [--sim-script FILE] [--sim-quotes DBN_FILE|tcp:HOST:PORT|relay:HOST:PORT]
-    [--underlyings ROOT,..] [--any-underlying-client NAME ...] [--equities AAPL,..] [--allow-short]
+    [--underlyings ROOT,..] [--any-underlying-client NAME ...] [--equities AAPL,..] [--allow-short] [--allow-calendars]
     [--futures ES,MES,..] [--max-future-qty N]
     [--max-open N] [--max-legs N] [--max-notional DOLLARS]
     [--submits-per-min N] [--submits-per-day N] [--closes-per-min N] [--max-rejects N] [--budget N] [--min-options-level N]
@@ -86,6 +86,7 @@ fn parse(args: &[String]) -> Result<(Config, [Option<String>; 3]), String> {
     let mut o: BTreeMap<&str, &str> = BTreeMap::new();
     let (mut clients, mut stall, mut allow_short, mut listen_any, mut allow_live) =
         (Vec::new(), false, false, false, false);
+    let mut allow_calendars = false;
     let mut any_underlying: Vec<String> = Vec::new();
     let mut forbid_state: Vec<PathBuf> = Vec::new();
     // `--name=value` is the same as `--name value`.
@@ -101,6 +102,7 @@ fn parse(args: &[String]) -> Result<(Config, [Option<String>; 3]), String> {
         match k {
             "--test-stall-after-admitted" => stall = true,
             "--allow-short" => allow_short = true,
+            "--allow-calendars" => allow_calendars = true,
             "--listen-any" => listen_any = true,
             "--allow-live" => allow_live = true,
             "--client" => clients.push(it.next().ok_or("--client needs a value")?),
@@ -191,6 +193,7 @@ fn parse(args: &[String]) -> Result<(Config, [Option<String>; 3]), String> {
             s.split(',').map(String::from).collect()
         }),
         allow_short,
+        allow_calendars,
         futures: match take("--futures") {
             None => d.futures.clone(),
             Some(s) => {

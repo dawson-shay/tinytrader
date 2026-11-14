@@ -788,6 +788,103 @@ fn buying_power_refuses_what_cash_cant_cover() {
     gw.stop().unwrap();
 }
 
+/// Defined-risk buying power holds a calendar to its debit: the long of each type and
+/// strike that expires later covers the front short. A double calendar of two units at
+/// $2.40 ($480) fits in $500 of cash; three ($720) do not. By expiry alone the front 580
+/// call would be naked, with no bound.
+#[test]
+fn buying_power_holds_a_double_calendar_to_its_debit() {
+    // Paired under defined_risk_calendars (with the liquidation it needs).
+    double_calendar(
+        r#"{"buying_power":"defined_risk_calendars","liquidate_same_day_shorts_at":"15:45"}"#,
+        true,
+    );
+    // defined_risk sizes by expiry alone, as before this rule: the front call is
+    // naked, so the double calendar is refused.
+    double_calendar(r#"{"buying_power":"defined_risk"}"#, false);
+}
+
+/// A double calendar on $500, under `rules`: paired, 3 are refused and 2 taken at
+/// their debit; not paired, even one is refused.
+fn double_calendar(rules: &str, paired: bool) {
+    const LEGS: [&str; 4] = [
+        "SPY261005P00570000",
+        "SPY261012P00570000",
+        "SPY261005C00580000",
+        "SPY261012C00580000",
+    ];
+    let (sim, feed) = SimBroker::fed(
+        &format!(
+            r#"{{"account":{{"cash":"500.00"}},"venue_rules":{rules},"expiry":{{"settle":false}}}}"#
+        ),
+        r#"{"source":"session","run":"test"}"#,
+    )
+    .unwrap();
+    let mut cfg = config(root(&format!("fed-bp-double-calendar-{paired}")));
+    cfg.profile.allow_calendars = true;
+    let gw = start(cfg, sim).unwrap();
+    let clock = gw.clock();
+    let mut c = Conn::open(&gw, "reactor", None);
+    for (iid, sym) in (1..).zip(LEGS) {
+        let raw = format!("{:<6}{}", &sym[..3], &sym[3..]);
+        let m = SymbolMappingMsg::new(
+            iid,
+            T0 - S,
+            SType::Parent,
+            "SPY.OPT",
+            SType::RawSymbol,
+            &raw,
+            0,
+            0,
+        )
+        .unwrap();
+        feed.push(T0 - S, RecordRef::from(&m)).unwrap();
+    }
+    for iid in 1..=4 {
+        cbbo(&feed, iid, T0, 300, 310);
+    }
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    let double = |cid: &str, qty: u32| {
+        combo(
+            cid,
+            &[
+                (LEGS[0], 1, "sell", "open"),
+                (LEGS[1], 1, "buy", "open"),
+                (LEGS[2], 1, "sell", "open"),
+                (LEGS[3], 1, "buy", "open"),
+            ],
+            qty,
+            "2.40",
+        )
+    };
+    let r = c.submit("r1", &double("wse-three", 3));
+    assert_eq!(r["code"], "sim_insufficient_buying_power", "{r}");
+    let r = c.submit("r2", &double("wse-two", 2));
+    if !paired {
+        assert_eq!(r["code"], "sim_insufficient_buying_power", "{r}");
+        gw.stop().unwrap();
+        return;
+    }
+    assert_eq!(r["outcome"], "accepted", "{r}");
+    // Working, its debit is held as paid and nothing more: $500 - $480.
+    let (a, _) = c.req("account", "r3", "");
+    assert_eq!(a["account"]["buying_power"], "20.00", "{a}");
+    gw.stop().unwrap();
+}
+
+/// Pairing calendars needs the liquidation rule: without it a paired short could be
+/// assigned into shares its debit didn't pay for.
+#[test]
+fn calendars_need_the_liquidation_rule() {
+    let e = SimBroker::fed(
+        r#"{"account":{"cash":"500.00"},"venue_rules":{"buying_power":"defined_risk_calendars"}}"#,
+        r#"{"source":"session","run":"test"}"#,
+    )
+    .err()
+    .unwrap();
+    assert!(e.contains("liquidate_same_day_shorts_at"), "{e}");
+}
+
 /// fill_on = "next_quote" for a combo: one leg's new quote isn't enough; every leg
 /// must have quoted since the order activated.
 #[test]
@@ -1175,5 +1272,76 @@ fn resolve_lookups_keep_their_spacing_after_a_jump() {
     let res: Vec<_> = seen.iter().filter(|v| v["kind"] == "resolution").collect();
     assert_eq!(res.len(), 1, "{seen:?}");
     assert_eq!(res[0]["outcome"], "absent_after", "{seen:?}");
+    gw.stop().unwrap();
+}
+
+/// A paired calendar's short is bought back on its last day at the venue's time,
+/// so it is never assigned into shares its debit didn't pay for: past the close,
+/// with settlement on, only the later longs are held, and no SPY shares.
+#[test]
+fn a_paired_calendars_short_is_bought_back_before_it_can_be_assigned() {
+    const FRONT: &str = "SPY261005C00580000";
+    const BACK: &str = "SPY261012C00580000";
+    let (sim, feed) = SimBroker::fed(
+        r#"{"account":{"cash":"500.00"},"venue_rules":{"buying_power":"defined_risk_calendars","liquidate_same_day_shorts_at":"15:45"}}"#,
+        r#"{"source":"session","run":"test"}"#,
+    )
+    .unwrap();
+    let mut cfg = config(root("fed-calendar-assignment"));
+    cfg.profile.allow_calendars = true;
+    let gw = start(cfg, sim).unwrap();
+    let clock = gw.clock();
+    let mut c = Conn::open(&gw, "reactor", None);
+    for (iid, sym) in [(1, FRONT), (2, BACK)] {
+        let raw = format!("{:<6}{}", &sym[..3], &sym[3..]);
+        let m = SymbolMappingMsg::new(
+            iid,
+            T0 - S,
+            SType::Parent,
+            "SPY.OPT",
+            SType::RawSymbol,
+            &raw,
+            0,
+            0,
+        )
+        .unwrap();
+        feed.push(T0 - S, RecordRef::from(&m)).unwrap();
+    }
+    cbbo(&feed, 1, T0, 300, 310);
+    cbbo(&feed, 2, T0, 400, 410);
+    clock.advance("reactor", 0, T0, WAIT).unwrap();
+    let cal = combo(
+        "wse-cal",
+        &[(FRONT, 1, "sell", "open"), (BACK, 1, "buy", "open")],
+        1,
+        "1.20",
+    );
+    assert_eq!(c.submit("r1", &cal)["outcome"], "accepted");
+    cbbo(&feed, 1, T0 + 60 * S, 300, 310);
+    cbbo(&feed, 2, T0 + 60 * S, 400, 410);
+    clock.advance("reactor", 1, T0 + 60 * S, WAIT).unwrap();
+    assert_eq!(fill(&mut c, "wse-cal")["kind"], "order");
+    // In the money by the afternoon: the front short would be assigned at the close.
+    cbbo(&feed, 1, T0 + 5 * H + 44 * 60 * S, 900, 920);
+    cbbo(&feed, 2, T0 + 5 * H + 44 * 60 * S, 1000, 1020);
+    clock
+        .advance("reactor", 1, T0 + 5 * H + 46 * 60 * S, WAIT)
+        .unwrap();
+    let f = c.until(|v| v["kind"] == "foreign_fill").pop().unwrap();
+    assert_eq!(
+        (f["symbol"].as_str(), f["side"].as_str()),
+        (Some(FRONT), Some("buy")),
+        "{f}"
+    );
+    // Past the close, and the front's settlement.
+    clock.advance("reactor", 1, T0 + 8 * H, WAIT).unwrap();
+    let (r, _) = c.req("positions", "r2", "");
+    let held: Vec<(&str, i64)> = r["positions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| (p["symbol"].as_str().unwrap(), p["qty"].as_i64().unwrap()))
+        .collect();
+    assert_eq!(held, [(BACK, 1)], "no assignment, no shares: {r}");
     gw.stop().unwrap();
 }

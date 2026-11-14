@@ -282,9 +282,12 @@ fn loopback_only_and_state_root_refusals() {
     );
     let bulk = std::path::PathBuf::from("/srv/bulk");
     assert!(
-        check_state_under(std::path::Path::new("/srv/bulk/gw"), std::slice::from_ref(&bulk))
-            .unwrap_err()
-            .contains("/srv/bulk")
+        check_state_under(
+            std::path::Path::new("/srv/bulk/gw"),
+            std::slice::from_ref(&bulk)
+        )
+        .unwrap_err()
+        .contains("/srv/bulk")
     );
     assert!(check_state_under(std::path::Path::new("/srv/state/gw"), &[bulk]).is_ok());
     assert!(check_paths("[::1]:7601".parse().unwrap(), tmp).is_ok());
